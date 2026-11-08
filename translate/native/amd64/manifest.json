@@ -1,0 +1,15 @@
+{
+  "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+  "files": {
+    "../tls.c": "a9bbd5c504404aee14165e821b05ec3524ebbcf9d3f089a723b4666253fab402",
+    "thunk.S": "3d0a849e06a90ac2a9edf37646ca791af6b9b6fdf790fabf02c12325ec6f0004",
+    "thunk.bin": "4b290f7d3a63bb5ed16cfc75f468e0acd59e91302590fd64e31e88d73faa311a",
+    "tls.bin": "cd411dbc1fb92490284afee9f2639a6873247ac6ae64fa4e4bf527ea13707f80"
+  },
+  "flags": [
+    "-target",
+    "x86_64-apple-macos11",
+    "-O2",
+    "-c"
+  ]
+}

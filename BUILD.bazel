@@ -1,0 +1,34 @@
+alias(
+    name = "bao",
+    actual = "//cmd/bao:bao",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "verify",
+    actual = "//cmd/bao-verify:bao-verify",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "native",
+    actual = "//cmd/bao-native:bao-native",
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        "//cmd/bao:bao_test",
+        "//cmd/bao-verify:verify_test",
+        "//cmd/bao-release:release_test",
+        "//ar:ar_test",
+        "//internal/ar:ar_test",
+        "//bindings:bindings_test",
+        "//linuxelf:linuxelf_test",
+        "//pecoff:pecoff_test",
+        "//toolchain:toolchain_test",
+        "//translate:translate_test",
+        "//verify:verify_test",
+    ],
+)

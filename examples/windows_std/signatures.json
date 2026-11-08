@@ -1,0 +1,1 @@
+{"schema":1,"abi":"c","functions":[{"name":"Run","symbol":"bao_windows_std_run","params":[],"result":"uint64"},{"name":"Check","symbol":"bao_windows_std_check","params":[],"result":"uint64"},{"name":"Counts","symbol":"bao_windows_std_counts","params":["uint64"],"result":"uint64"}]}

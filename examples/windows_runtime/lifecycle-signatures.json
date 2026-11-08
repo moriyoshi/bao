@@ -1,0 +1,12 @@
+{
+  "schema":1,"abi":"c","functions":[
+    {"name":"Run","symbol":"bao_windows_lifecycle_run","params":[],"result":"uint64"},
+    {"name":"State","symbol":"bao_windows_lifecycle_state","params":[],"result":"uint64"},
+    {"name":"Drops","symbol":"bao_windows_tls_drops","params":[],"result":"uint64"},
+    {"name":"Detaches","symbol":"bao_windows_tls_detaches","params":[],"result":"uint64"},
+    {"name":"Events","symbol":"bao_windows_process_events","params":[],"result":"uint64"},
+    {"name":"AlignedAddress","symbol":"bao_windows_tls_address","params":[],"result":"uint64"},
+    {"name":"Exceptions","symbol":"bao_windows_exception_run","params":[],"result":"uint64"},
+    {"name":"Weak","symbol":"bao_windows_weak_run","params":[],"result":"uint64"}
+  ]
+}

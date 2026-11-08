@@ -1,0 +1,31 @@
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync/atomic"
+    "unsafe"
+    "bao-bindings-check/native"
+)
+
+func main() {
+    runtime.LockOSThread()
+    defer runtime.UnlockOSThread()
+    if native.BaoScalarTlsNext()!=42 || native.BaoScalarTlsNext()!=43 {panic("TLS")}
+    if native.BaoScalarInts(1,-2,3,-4,5,-6,7,-8,9,-10)!=-55 {panic("integer argument spills")}
+    if native.BaoScalarFloats(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18)!=2109 {panic("float argument spills")}
+    if native.BaoScalarMixed(-1,2,3,4,5,6,7,8,9,10,11,12)!=76 {panic("mixed arguments")}
+    if native.BaoScalarNarrow(-1,2,-3,4,-5,6,-7,8,-9,10,-123,456,-789,1011)!=560 {panic("narrow stack packing")}
+    if native.BaoScalarU32(0xf1234567)!=0xf1234567 {panic("uint32 extension")}
+    x:=uint64(41)
+    if native.BaoScalarPointer(unsafe.Pointer(&x))!=unsafe.Pointer(&x)||x!=42 {panic("pointer/result/lifetime")}
+    var started uint32
+    var ran atomic.Bool
+    done:=make(chan struct{})
+    go func(){ for atomic.LoadUint32(&started)==0{runtime.Gosched()};ran.Store(true);close(done) }()
+    if native.BaoScalarWait(50000,unsafe.Pointer(&started))!=42 || !ran.Load(){panic("native call blocked Go scheduler")}
+    <-done
+    native.TLSFinalizeCurrentThread()
+    if native.TLSLiveBlocks()!=0||native.TLSDestroyedBlocks()!=1{panic("TLS cleanup")}
+    fmt.Println("PASS: typed scalars, integer/FP spills, mixed/narrow packing, pointers, uint32, TLS, scheduler; no purego module")
+}

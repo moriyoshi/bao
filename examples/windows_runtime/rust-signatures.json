@@ -1,0 +1,1 @@
+{"schema":1,"abi":"c","functions":[{"name":"BaoWindowsRustRun","symbol":"bao_windows_rust_run","params":["uint64"],"result":"uint64"}]}

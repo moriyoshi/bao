@@ -1,0 +1,10 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+go_library(
+    name = "pecoff",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    embedsrcs = glob(["native/*/*.bin", "native/LICENSE-BAO.txt"]),
+    importpath = "github.com/moriyoshi/bao/pecoff",
+    visibility = ["//visibility:public"],
+    deps = ["//internal/ar"],
+)
+go_test(name = "pecoff_test", srcs = glob(["*_test.go"]), data = glob(["native/**"]), embed = [":pecoff"], deps = ["//internal/ar"])

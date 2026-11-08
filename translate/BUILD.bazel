@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "translate",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    embedsrcs = ["native/thunk.bin", "native/tls.bin", "native/amd64/thunk.bin", "native/amd64/tls.bin"],
+    importpath = "github.com/moriyoshi/bao/translate",
+    visibility = ["//visibility:public"],
+    deps = ["//internal/ar"],
+)
+
+go_test(
+    name = "translate_test",
+    srcs = glob(["*_test.go"]),
+    data = glob(["native/*", "native/amd64/*"]),
+    embed = [":translate"],
+    deps = ["//internal/ar"],
+)

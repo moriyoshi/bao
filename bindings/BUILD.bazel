@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "bindings",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    embedsrcs = glob(["bootstrap/*"]),
+    importpath = "github.com/moriyoshi/bao/bindings",
+    visibility = ["//visibility:public"],
+    deps = ["//internal/ar", "//pecoff"],
+)
+
+go_test(
+    name = "bindings_test",
+    srcs = glob(["*_test.go"]),
+    data = glob(["testdata/**"]),
+    embed = [":bindings"],
+    deps = ["//internal/ar"],
+)

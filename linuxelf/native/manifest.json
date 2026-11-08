@@ -1,0 +1,16 @@
+{
+  "compiler": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "flags": [
+    "-O2",
+    "-fPIC",
+    "-fno-omit-frame-pointer",
+    "-mno-outline-atomics",
+    "-c"
+  ],
+  "target": "aarch64-linux-gnu",
+  "files": {
+    "tls.c": "50b516922dd08c77a52e9490117cae19275b982a2c98c3ea614df0a817d1a7df",
+    "thunk.S": "fdc998d9a42b12cf3e49ec059739682a675587fd1d8cfbae552e83a98efdcdbe",
+    "runtime.bin": "d4ee9daa74f4407bf8235266b5dad352732ded4353b2a790810ffe6d55804abe"
+  }
+}

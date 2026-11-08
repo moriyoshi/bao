@@ -1,0 +1,16 @@
+[package]
+name = "bao_windows_runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+debug = 2
+codegen-units = 1

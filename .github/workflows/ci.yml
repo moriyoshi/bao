@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run all checks even if an identical successful result is cached
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      force:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: ${{ matrix.suite }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: unit
+            runner: ubuntu-26.04
+          - suite: darwin-arm64
+            runner: macos-26
+          - suite: darwin-amd64
+            runner: macos-26-intel
+          - suite: linux-arm64
+            runner: ubuntu-26.04-arm
+          - suite: linux-amd64
+            runner: ubuntu-26.04
+          - suite: windows-amd64
+            runner: windows-2025
+            goarch: amd64
+          - suite: windows-arm64
+            runner: windows-11-vs2026-arm
+            goarch: arm64
+    env:
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Address the exact CI inputs
+        id: inputs
+        run: bash ci/cache.sh fingerprint "$SUITE" >> "$GITHUB_OUTPUT"
+      - name: Restore an exact successful result
+        id: cache
+        if: github.event_name != 'pull_request' && !inputs.force && steps.inputs.outputs.cacheable == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .work/ci-result/${{ matrix.suite }}
+          key: ${{ steps.inputs.outputs.key }}
+      - name: Validate the restored result
+        id: result
+        env:
+          RESTORED: ${{ steps.cache.outputs.cache-hit }}
+          EXPECTED_KEY: ${{ steps.inputs.outputs.key }}
+        run: |
+          if [[ "$RESTORED" == true ]] && bash ci/cache.sh validate "$SUITE" "$EXPECTED_KEY"; then
+            echo 'hit=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'hit=false' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        if: steps.result.outputs.hit != 'true' && !startsWith(matrix.suite, 'windows-')
+        with:
+          bazelisk-version: 1.27.0
+          bazelisk-cache: true
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.result.outputs.hit != 'true' && startsWith(matrix.suite, 'windows-')
+        with:
+          go-version: 1.26.10
+          architecture: ${{ matrix.goarch }}
+          cache: false
+      - name: Select the native VC toolset
+        if: steps.result.outputs.hit != 'true' && startsWith(matrix.suite, 'windows-')
+        shell: pwsh
+        run: |
+          ./ci/windows-env-test.ps1
+          ./ci/windows-env.ps1
+      - name: Install matching native LLVM-MinGW compiler and C++ runtimes
+        if: steps.result.outputs.hit != 'true' && startsWith(matrix.suite, 'windows-')
+        shell: pwsh
+        run: ./ci/windows-llvm.ps1
+      - name: Execute CI (Windows suites use native VMs and installed compilers)
+        if: steps.result.outputs.hit != 'true'
+        run: bash ci/check.sh "$SUITE"
+      - name: Record success after every check passed
+        if: steps.result.outputs.hit != 'true'
+        env:
+          EXPECTED_KEY: ${{ steps.inputs.outputs.key }}
+        run: bash ci/cache.sh record "$SUITE" "$EXPECTED_KEY"
+      - name: Cache a successful result from a trusted ref
+        if: steps.result.outputs.hit != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.inputs.outputs.cacheable == 'true' && github.event_name != 'pull_request' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/'))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .work/ci-result/${{ matrix.suite }}
+          key: ${{ steps.inputs.outputs.key }}
+      - name: Report cache coverage
+        if: success()
+        env:
+          HIT: ${{ steps.result.outputs.hit }}
+          KEY: ${{ steps.inputs.outputs.key }}
+          TREE: ${{ steps.inputs.outputs.tree }}
+        run: |
+          printf '### %s CI\n\nSource tree: `%s`\n\nExact result cache hit: `%s`\n\nKey: `%s`\n' "$SUITE" "$TREE" "$HIT" "$KEY" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$HIT" == true ]]; then
+            bash ci/cache.sh validate "$SUITE" "$KEY" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ci-${{ matrix.suite }}
+          path: |
+            .work/ci-result/${{ matrix.suite }}/
+            .work/ci-evidence/${{ matrix.suite }}/
+            .work/verify-*/*.log
+            .work/verify-*/*.json
+          if-no-files-found: warn
+          retention-days: 14

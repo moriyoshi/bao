@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "linuxelf",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    embedsrcs = glob(["native/**/*.bin"]),
+    importpath = "github.com/moriyoshi/bao/linuxelf",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "linuxelf_test",
+    srcs = glob(["*_test.go"]),
+    data = glob(["native/**"]),
+    embed = [":linuxelf"],
+)

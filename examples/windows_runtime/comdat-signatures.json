@@ -1,0 +1,6 @@
+{"schema":1,"abi":"c","functions":[
+  {"name":"A","symbol":"bao_windows_comdat_a","params":[],"result":"uint64"},
+  {"name":"B","symbol":"bao_windows_comdat_b","params":[],"result":"uint64"},
+  {"name":"Check","symbol":"bao_windows_comdat_check","params":[],"result":"uint64"},
+  {"name":"State","symbol":"bao_windows_comdat_state","params":[],"result":"uint64"}
+]}

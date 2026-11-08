@@ -1,0 +1,100 @@
+{
+  "license": "Apache-2.0 (authored fixtures)",
+  "purpose": "Original optimized C/C++ and Rust compiler products with source-level DWARF, no native compiler required by unit tests",
+  "tools": {
+    "macho_c": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "elf_c": "gcc/g++ (Debian 14.2.0-19) 14.2.0, Linux arm64",
+    "elf_image": "bao-cross-investigation:20261108 sha256:24a552d0ae99460f8b786bd14a919e251b02d4a4f0c61660fa2db585e2828d3d"
+  },
+  "commands": {
+    "c_macho.bin": [
+      "clang",
+      "-target",
+      "arm64-apple-macos11",
+      "-O2",
+      "-gdwarf-4",
+      "-fdebug-prefix-map=<Bao>=/bao-fixture",
+      "-c",
+      "infer.c"
+    ],
+    "cpp_macho.bin": [
+      "clang++",
+      "-target",
+      "arm64-apple-macos11",
+      "-O2",
+      "-gdwarf-4",
+      "-fdebug-prefix-map=<Bao>=/bao-fixture",
+      "-c",
+      "infer.cpp"
+    ],
+    "cc_macho.bin": [
+      "clang",
+      "-target",
+      "x86_64-apple-macos11",
+      "-O2",
+      "-gdwarf-4",
+      "-fdebug-prefix-map=<Bao>=/bao-fixture",
+      "-c",
+      "infer_callconv.c"
+    ],
+    "rust_macho.bin": [
+      "rustc",
+      "--crate-type",
+      "lib",
+      "--emit=obj",
+      "--edition=2024",
+      "-O",
+      "-g",
+      "-Ccodegen-units=1",
+      "--remap-path-prefix",
+      "<Bao>=/bao-fixture",
+      "infer.rs"
+    ],
+    "c_elf.bin": [
+      "gcc",
+      "-O2",
+      "-gdwarf-4",
+      "-c",
+      "/fixtures/infer.c"
+    ],
+    "cpp_elf.bin": [
+      "g++",
+      "-O2",
+      "-gdwarf-4",
+      "-c",
+      "/fixtures/infer.cpp"
+    ],
+    "rust_elf.bin": [
+      "rustc",
+      "--crate-type",
+      "lib",
+      "--emit=obj",
+      "--edition=2024",
+      "-O",
+      "-g",
+      "-Ccodegen-units=1",
+      "/fixtures/infer.rs"
+    ],
+    "c_no_debug_elf.bin": [
+      "gcc",
+      "-O2",
+      "-c",
+      "/fixtures/infer.c"
+    ]
+  },
+  "files": {
+    "c_elf.bin": "d8495daf7e6ac1d4400672592ac640d2053da2013d67769ab600208c0c6da285",
+    "c_macho.bin": "e46027fdf1dfa0de7618e7c29e85f61274f44bfbf123c743a655ca7b699f9975",
+    "c_no_debug_elf.bin": "9302aeff45e7956c20f5c80d7b590ebbe69b406330e7668145383c22612e65e1",
+    "cc_macho.bin": "99a92f31ed58e98f69ff80ca7fb60f35719ed272f33056aaa558de5c481733d3",
+    "cpp_elf.bin": "285450fcfc673aa9f1290d08c6d7ff9b868f39ab583666b890c5daeef062a6c1",
+    "cpp_macho.bin": "756c25d0012efefccc01f6e6720aee195bf0e1ad799b4e9425aadecd198da9dc",
+    "infer.c": "89dba43f805613d3a2cb647a9d79b30c5cbe70f490a2f4a06d74b086fd9ed19f",
+    "infer.cpp": "36fb743f6eb1e3cb9b8d0e5cdd2e3603c61bc7a6a3f68fa18f2eb9d2ae002e09",
+    "infer.rs": "612c255cb4ff82e0a1344abfe18121b8d96a2377a6537cc9f71fc8aa70dd4aec",
+    "infer_callconv.c": "d6d109b2aeda7ef4215bb8f411f9363c1c16db4e4607458a66ca99fe4277ab4d",
+    "rust_elf.bin": "107cad01d60b664e17042a7eb2e110458588744d92f83650b131d21a50e7f2d6",
+    "rust_macho.bin": "01cc7a1dc8b8cb88d786dc82f20f7aee2df8b4369848a36e02c87efeb6ce5a37"
+  }
+}

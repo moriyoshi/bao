@@ -1,0 +1,31 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+load("//release:targets.bzl", "release_binaries")
+
+release_binaries()
+
+go_library(
+    name = "bao_lib",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    importpath = "github.com/moriyoshi/bao/cmd/bao",
+    deps = [
+        "//bindings",
+        "//internal/ar",
+        "//linuxelf",
+        "//pecoff",
+        "//toolchain",
+        "//translate",
+        "//verify",
+    ],
+)
+
+go_binary(
+    name = "bao",
+    embed = [":bao_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "bao_test",
+    srcs = glob(["*_test.go"]),
+    embed = [":bao_lib"],
+)

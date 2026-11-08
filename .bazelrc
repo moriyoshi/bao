@@ -1,0 +1,3 @@
+build --show_result=10
+test --test_output=errors
+build --@rules_go//go/config:pure

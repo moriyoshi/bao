@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "verify",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    importpath = "github.com/moriyoshi/bao/verify",
+    visibility = ["//visibility:public"],
+    deps = ["//internal/ar"],
+)
+
+go_test(
+    name = "verify_test",
+    srcs = glob(["*_test.go"]),
+    embed = [":verify"],
+)

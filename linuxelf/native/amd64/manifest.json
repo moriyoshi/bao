@@ -1,0 +1,14 @@
+{
+  "compiler": "gcc (GCC) 14.4.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "files": {
+    "../tls.c": "50b516922dd08c77a52e9490117cae19275b982a2c98c3ea614df0a817d1a7df",
+    "runtime.bin": "a13ae5de96aa775116854346fbd3e726b80d536b04777a752ba9d33d60c4c3f8"
+  },
+  "flags": [
+    "-O2",
+    "-fPIC",
+    "-fno-omit-frame-pointer",
+    "-c"
+  ],
+  "target": "linux/amd64"
+}

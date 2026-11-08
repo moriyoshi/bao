@@ -1,0 +1,14 @@
+{
+  "target": "loong64",
+  "compiler": "loongarch64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0\n",
+  "flags": [
+    "-O2",
+    "-fPIC",
+    "-fno-omit-frame-pointer",
+    "-c"
+  ],
+  "files": {
+    "../tls.c": "50b516922dd08c77a52e9490117cae19275b982a2c98c3ea614df0a817d1a7df",
+    "runtime.bin": "2c37479ac4bf8b43f1656f693ff0f0a82709acaac2c83dae42cd99c14aba6a4a"
+  }
+}

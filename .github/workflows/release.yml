@@ -1,0 +1,271 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the selected tag after all checks (false is a dry run)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  source:
+    needs: metadata
+    runs-on: ubuntu-26.04
+    timeout-minutes: 95
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - name: Wait for concurrent default-branch CI to populate its result cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.metadata.outputs.commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash ci/await-source.sh "$COMMIT" "$DEFAULT_BRANCH"
+
+  ci:
+    needs: source
+    uses: ./.github/workflows/ci.yml
+
+  metadata:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      commit: ${{ steps.metadata.outputs.commit }}
+      epoch: ${{ steps.metadata.outputs.epoch }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and validate the immutable release input
+        id: metadata
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$REF_TYPE" == tag ]] || { echo 'Select an existing v-tag for manual runs'; exit 1; }
+          bash release/metadata.sh "$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      BAO_RELEASE_VERSION: ${{ needs.metadata.outputs.tag }}
+      BAO_RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}
+      SOURCE_DATE_EPOCH: ${{ needs.metadata.outputs.epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-version: 1.27.0
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Build and package six CLI hosts
+        run: bash release/build.sh .work/dist
+      - name: Smoke test the Linux amd64 archive
+        run: |
+          (cd .work/dist && sha256sum -c SHA256SUMS)
+          mkdir .work/smoke
+          tar -xzf ".work/dist/bao_${BAO_RELEASE_VERSION}_linux_amd64.tar.gz" -C .work/smoke
+          bash release/smoke.sh "$PWD/.work/smoke/bao_${BAO_RELEASE_VERSION}_linux_amd64/bao" "$BAO_RELEASE_VERSION" "$BAO_RELEASE_COMMIT"
+      - name: Attest the archives and release metadata (including rehearsals)
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: .work/dist/SHA256SUMS
+      - name: Include the offline provenance bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" .work/dist/provenance.sigstore.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: .work/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  darwin:
+    needs: [metadata, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TAG: ${{ needs.metadata.outputs.tag }}
+      COMMIT: ${{ needs.metadata.outputs.commit }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-version: 1.27.0
+          bazelisk-cache: true
+          repository-cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: .work/dist
+      - name: Exercise the packaged CLI and native consumers
+        run: |
+          (cd .work/dist && shasum -a 256 -c SHA256SUMS)
+          mkdir .work/smoke
+          tar -xzf ".work/dist/bao_${TAG}_darwin_${ARCH}.tar.gz" -C .work/smoke
+          binary="$PWD/.work/smoke/bao_${TAG}_darwin_${ARCH}/bao"
+          bash release/smoke.sh "$binary" "$TAG" "$COMMIT"
+          mkdir -p .work/results
+          bazel run --lockfile_mode=error //:verify -- -bao "$binary" -suite release-smoke -target "darwin/$ARCH" -evidence .work/results/packaged-smoke
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: verification-darwin-${{ matrix.arch }}
+          path: |
+            .work/results/
+            .work/verify-*/*.log
+            .work/verify-*/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux:
+    needs: [metadata, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+          - arch: amd64
+            runner: ubuntu-26.04
+    env:
+      TAG: ${{ needs.metadata.outputs.tag }}
+      COMMIT: ${{ needs.metadata.outputs.commit }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-version: 1.27.0
+          bazelisk-cache: true
+          repository-cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: .work/dist
+      - name: Smoke test the Linux archive
+        run: |
+          (cd .work/dist && sha256sum -c SHA256SUMS)
+          mkdir .work/smoke
+          tar -xzf ".work/dist/bao_${TAG}_linux_${ARCH}.tar.gz" -C .work/smoke
+          bash release/smoke.sh "$PWD/.work/smoke/bao_${TAG}_linux_${ARCH}/bao" "$TAG" "$COMMIT"
+          echo "LINUX_BAO=$PWD/.work/smoke/bao_${TAG}_linux_${ARCH}/bao" >> "$GITHUB_ENV"
+      - name: Translate, link and execute with the packaged CLI
+        run: |
+          mkdir -p .work/results
+          docker build --platform "linux/$ARCH" -f testdata/toolchains/linux-cpp.Dockerfile -t bao-release-cpp .
+          bazel run --lockfile_mode=error //:verify -- -bao "$LINUX_BAO" -suite release-smoke -target "linux/$ARCH" -image bao-release-cpp -evidence .work/results/packaged-smoke
+      - name: Cross compilers and emulated LoongArch/PowerPC consumers
+        if: matrix.arch == 'arm64'
+        run: |
+          docker build --platform linux/arm64 -f testdata/toolchains/linux-cross.Dockerfile -t bao-release-cross .
+          for arch in loong64 ppc64le; do
+            mkdir ".work/smoke/$arch"
+            tar -xzf ".work/dist/bao_${TAG}_linux_${arch}.tar.gz" -C ".work/smoke/$arch"
+            qemu=qemu-loongarch64
+            if [[ $arch == ppc64le ]]; then qemu=qemu-ppc64le; fi
+            docker run --rm --network none --read-only -v "$PWD/.work/smoke/$arch:/smoke:ro" --entrypoint "/usr/bin/$qemu" bao-release-cross "/smoke/bao_${TAG}_linux_${arch}/bao" version -json | jq -e --arg tag "$TAG" --arg commit "$COMMIT" '.version == $tag and .commit == $commit and .built_with == "go1.26.10"'
+            binary="$PWD/.work/smoke/$arch/bao_${TAG}_linux_${arch}/bao"
+            bazel run --lockfile_mode=error //:verify -- -bao "$binary" -suite release-smoke -target "linux/$arch" -image bao-release-cross -evidence ".work/results/packaged-smoke-$arch"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: verification-linux-${{ matrix.arch }}
+          path: |
+            .work/results/
+            .work/verify-*/*.log
+            .work/verify-*/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    needs: [ci, metadata, build, darwin, linux]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      COMMIT: ${{ needs.metadata.outputs.commit }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+      - name: Check tag stability and publish complete assets
+        run: |
+          # Dereference annotated tags too. No checkout or repository scripts
+          # execute in this job, which is the only contents-write job.
+          object=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG")
+          type=$(jq -r .object.type <<< "$object")
+          sha=$(jq -r .object.sha <<< "$object")
+          while [[ $type == tag ]]; do
+            object=$(gh api "repos/$GH_REPO/git/tags/$sha")
+            type=$(jq -r .object.type <<< "$object")
+            sha=$(jq -r .object.sha <<< "$object")
+          done
+          [[ $type == commit && $sha == "$COMMIT" ]] || { echo 'Release tag moved'; exit 1; }
+          (cd dist && sha256sum -c SHA256SUMS)
+          [[ -s dist/provenance.sigstore.json ]]
+          args=(--repo "$GH_REPO" --verify-tag --draft --generate-notes --title "$TAG")
+          if [[ $PRERELEASE == true ]]; then args+=(--prerelease --latest=false); fi
+          # Existing drafts/releases are deliberately not updated or clobbered.
+          gh release create "$TAG" "${args[@]}" dist/*
+          gh release edit "$TAG" --repo "$GH_REPO" --draft=false

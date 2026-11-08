@@ -1,0 +1,7 @@
+paths:
+  .github/workflows/*.yml:
+    ignore:
+      # actionlint 1.7.12 predates these official GitHub-hosted runner labels.
+      # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+      - '^label "ubuntu-26\.04(-arm)?" is unknown\.'
+      - '^label "windows-11-vs2026-arm" is unknown\.'

@@ -1,0 +1,4 @@
+# Keep text byte-identical across checkouts, including embedded bootstrap sources
+# and compiler fixtures whose SHA-256 provenance is checked. Preserve binary data.
+* text=auto eol=lf
+*.bin binary

@@ -1,0 +1,27 @@
+// Shared consumer copied into a fresh module for each Rust static library.
+package main
+
+import (
+	"bao-example-check/native"
+	"fmt"
+	"runtime"
+
+	"github.com/ebitengine/purego"
+)
+
+func main() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var run func() uint64
+	purego.RegisterFunc(&run, native.SymbolAddr0())
+	if got := run(); got != 42 {
+		panic(fmt.Sprintf("%s: native check returned %d", exampleName, got))
+	}
+	native.TLSFinalizeCurrentThread()
+	checkFinalized()
+	if live := native.TLSLiveBlocks(); live != 0 {
+		panic(fmt.Sprintf("%s: native TLS blocks still live: %d", exampleName, live))
+	}
+	fmt.Printf("PASS: %s; native result=42; TLS live=%d freed=%d\n",
+		exampleName, native.TLSLiveBlocks(), native.TLSDestroyedBlocks())
+}

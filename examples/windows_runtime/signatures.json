@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "abi": "c",
+  "functions": [
+    {"name":"BaoWindowsRun","symbol":"bao_windows_run","params":["uint64"],"result":"uint64"},
+    {"name":"BaoWindowsCppRun","symbol":"bao_windows_cpp_run","params":[],"result":"uint64"},
+    {"name":"BaoScalarInts","symbol":"bao_scalar_ints","params":["int32","int32","int32","int32","int32","int32","int32","int32","int32","int32"],"result":"int64"},
+    {"name":"BaoScalarFloats","symbol":"bao_scalar_floats","params":["float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32","float32"],"result":"float64"},
+    {"name":"BaoScalarMixed","symbol":"bao_scalar_mixed","params":["int8","float32","uint16","float64","int32","float32","uint32","float64","int64","float32","uint64","float64"],"result":"float64"},
+    {"name":"BaoScalarNarrow","symbol":"bao_scalar_narrow","params":["int8","int8","int8","int8","int8","int8","int8","int8","int8","int8","int16","uint16","int32","uint32"],"result":"int64"},
+    {"name":"BaoScalarPointer","symbol":"bao_scalar_pointer","params":["pointer"],"result":"pointer"},
+    {"name":"BaoScalarWait","symbol":"bao_scalar_wait","params":["uint64","pointer"],"result":"uint64"},
+    {"name":"BaoScalarU32","symbol":"bao_scalar_u32","params":["uint32"],"result":"uint64"}
+  ]
+}

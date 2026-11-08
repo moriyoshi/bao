@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = [
+    "core_foundation", "core_graphics", "core_text", "security",
+    "image_io", "foundation", "accelerate", "rust_runtime",
+]
+
+[profile.release]
+panic = "unwind"

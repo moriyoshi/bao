@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "release_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/moriyoshi/bao/cmd/bao-release",
+)
+
+go_binary(
+    name = "bao-release",
+    embed = [":release_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "release_test",
+    srcs = ["ci_test.go", "main_test.go", "metadata_test.go"],
+    data = ["//ci:await-source.sh", "//ci:cache.sh", "//release:metadata.sh"],
+    embed = [":release_lib"],
+)

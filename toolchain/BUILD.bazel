@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "toolchain",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    importpath = "github.com/moriyoshi/bao/toolchain",
+    visibility = ["//visibility:public"],
+    deps = ["//internal/ar", "//pecoff"],
+)
+
+go_test(
+    name = "toolchain_test",
+    srcs = glob(["*_test.go"]),
+    embed = [":toolchain"],
+)

@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "verify_lib",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    importpath = "github.com/moriyoshi/bao/cmd/bao-verify",
+    deps = ["//verify"],
+)
+
+go_binary(
+    name = "bao-verify",
+    embed = [":verify_lib"],
+    args = [
+        "-bao", "$(rlocationpath //cmd/bao:bao)",
+        "-go", "$(rlocationpath @rules_go//go)",
+    ],
+    data = ["//cmd/bao:bao", "@rules_go//go"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "verify_test",
+    srcs = glob(["*_test.go"]),
+    data = ["@rules_go//go"],
+    embed = [":verify_lib"],
+    env = {"BAO_VERIFY_TEST_GO": "$(rlocationpath @rules_go//go)"},
+)
+

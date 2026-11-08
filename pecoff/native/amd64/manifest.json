@@ -1,0 +1,16 @@
+{
+  "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+  "files": {
+    "../runtime.c": "090820a7f1ad325d229e326f8290a09e35e1808d748cd5dcf1fa16e5c35fe0b9",
+    "runtime.bin": "0926c8d39081db9b446733146afd996c946abfb291faacf80ad6ca54448997df"
+  },
+  "flags": [
+    "--target=x86_64-pc-windows-msvc",
+    "-O2",
+    "-ffreestanding",
+    "-fno-builtin",
+    "-fno-stack-protector",
+    "-funwind-tables"
+  ],
+  "target": "windows/amd64"
+}
