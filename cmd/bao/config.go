@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,12 +13,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/moriyoshi/bao/toolchain"
 	"github.com/moriyoshi/bao/verify"
 )
 
-// buildSettings is the -settings file. Every field mirrors a command-line flag.
+// buildConfig is the -config file. Every field mirrors a command-line flag.
 // Paths are relative to the file and may use ${VAR}; an unset variable fails.
-type buildSettings struct {
+type buildConfig struct {
 	Schema               int             `json:"schema"`
 	Target               string          `json:"target"`
 	Package              string          `json:"package"`
@@ -34,19 +37,19 @@ type buildSettings struct {
 		Locked       *bool  `json:"locked"`
 	} `json:"cargo"`
 	Darwin *struct {
-		platformLinkSettings
+		platformLinkConfig
 		SDK    string `json:"sdk"`
 		MinOS  string `json:"min_os"`
 		Linker string `json:"ld"`
 	} `json:"darwin"`
 	Linux *struct {
-		platformLinkSettings
+		platformLinkConfig
 		Sysroot         string   `json:"sysroot"`
 		Linker          string   `json:"ld"`
 		SystemLibraries []string `json:"system_libraries"`
 	} `json:"linux"`
 	Windows *struct {
-		platformLinkSettings
+		platformLinkConfig
 		Imports          map[string]string `json:"imports"`
 		ImportLibraries  []string          `json:"import_libraries"`
 		CXXRuntime       string            `json:"cxx_runtime"`
@@ -55,44 +58,58 @@ type buildSettings struct {
 	} `json:"windows"`
 }
 
-// platformLinkSettings adds to the common link settings for one platform.
-type platformLinkSettings struct {
+// platformLinkConfig adds to the common link config for one platform.
+type platformLinkConfig struct {
 	LinkArchives         []string `json:"link_archives"`
 	LinkNotices          []string `json:"link_notices"`
 	RequireStaticRuntime *bool    `json:"require_static_runtime"`
 }
 
-var settingsVariable = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+// defaultConfigFile applies from the working directory unless -config is given.
+const defaultConfigFile = ".bao.config.json"
 
-// applySettings fills flags the command line left unset and returns the
+var configVariable = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// applyConfig fills flags the command line left unset and returns the
 // positional arguments. A flag given on the command line replaces its setting,
 // including every entry of a repeatable flag.
-func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
+func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string, error) {
 	positional := fs.Args()
-	if o.settings == "" {
-		return positional, nil
-	}
-	data, err := os.ReadFile(o.settings)
-	if err != nil {
-		return nil, err
-	}
-	var s buildSettings
-	if err := verify.Decode(data, &s); err != nil {
-		return nil, usage("-settings %s: %v", o.settings, err)
-	}
-	if s.Schema != 1 {
-		return nil, usage("-settings %s: unsupported schema %d; expected 1", o.settings, s.Schema)
-	}
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
-	dir, err := filepath.Abs(filepath.Dir(o.settings))
+	// An unreadable default file is reported below instead of being skipped.
+	if _, err := os.Stat(defaultConfigFile); !visited["config"] && !errors.Is(err, os.ErrNotExist) {
+		o.config = defaultConfigFile
+		fmt.Fprintf(stderr, "Using config from %s\n", defaultConfigFile)
+	}
+	if o.config == "" {
+		return positional, nil
+	}
+	data, err := os.ReadFile(o.config)
 	if err != nil {
 		return nil, err
 	}
+	var s buildConfig
+	if err := verify.Decode(data, &s); err != nil {
+		return nil, usage("-config %s: %v", o.config, err)
+	}
+	if s.Schema != 1 {
+		return nil, usage("-config %s: unsupported schema %d; expected 1", o.config, s.Schema)
+	}
+	dir, err := filepath.Abs(filepath.Dir(o.config))
+	if err != nil {
+		return nil, err
+	}
+	// Target variables take precedence over the environment. The input decides
+	// an auto target, so they are unavailable until the target is known.
+	var targetVariables map[string]string
 	path := func(value string) (string, error) {
 		var missing string
-		value = settingsVariable.ReplaceAllStringFunc(value, func(match string) string {
-			name := settingsVariable.FindStringSubmatch(match)[1]
+		value = configVariable.ReplaceAllStringFunc(value, func(match string) string {
+			name := configVariable.FindStringSubmatch(match)[1]
+			if expanded, ok := targetVariables[name]; ok {
+				return expanded
+			}
 			expanded, ok := os.LookupEnv(name)
 			if !ok {
 				missing = name
@@ -100,7 +117,10 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 			return expanded
 		})
 		if missing != "" {
-			return "", usage("-settings %s: environment variable %s is not set", o.settings, missing)
+			if strings.HasPrefix(missing, "BAO_") && targetVariables == nil {
+				return "", usage("-config %s: %s is not available in input, which decides the target", o.config, missing)
+			}
+			return "", usage("-config %s: environment variable %s is not set", o.config, missing)
 		}
 		if value != "" && !filepath.IsAbs(value) {
 			value = filepath.Join(dir, value)
@@ -112,11 +132,11 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 			return nil
 		}
 		if fs.Lookup(name) == nil {
-			return usage("-settings %s: the -%s setting does not apply to bao %s", o.settings, name, fs.Name())
+			return usage("-config %s: the -%s setting does not apply to bao %s", o.config, name, fs.Name())
 		}
 		for _, value := range values {
 			if err := fs.Set(name, value); err != nil {
-				return usage("-settings %s: -%s: %v", o.settings, name, err)
+				return usage("-config %s: -%s: %v", o.config, name, err)
 			}
 		}
 		return nil
@@ -149,7 +169,7 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 	}
 	// A linker may be a bare command found on PATH.
 	setLinker := func(value string) error {
-		if strings.ContainsRune(value, filepath.Separator) || settingsVariable.MatchString(value) {
+		if strings.ContainsRune(value, filepath.Separator) || configVariable.MatchString(value) {
 			return setPaths("ld", value)
 		}
 		return setText("ld", value)
@@ -161,11 +181,18 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 		}
 		positional = []string{input}
 		if s.Cargo != nil && s.Cargo.ManifestPath != "" {
-			return nil, usage("-settings %s: set input or cargo.manifest_path, not both", o.settings)
+			return nil, usage("-config %s: set input or cargo.manifest_path, not both", o.config)
 		}
 	}
+	if err := setText("target", s.Target); err != nil {
+		return nil, err
+	}
+	target, err := configTarget(o.target, positional)
+	if err != nil {
+		return nil, err
+	}
+	targetVariables = configTargetVariables(target)
 	steps := []func() error{
-		func() error { return setText("target", s.Target) },
 		func() error { return setText("package", s.Package) },
 		func() error { return set("symbol", s.Symbols...) },
 		func() error { return setBool("strip-debug", s.StripDebug) },
@@ -188,16 +215,12 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 		}
 	}
 	if !visited["bindings"] {
-		if err := o.applySettingsBindings(s.Bindings, path); err != nil {
+		if err := o.applyConfigBindings(s.Bindings, path); err != nil {
 			return nil, err
 		}
 	}
 	// Only the section for this target applies, so one file can serve several.
-	target, err := settingsTarget(o.target, positional)
-	if err != nil {
-		return nil, err
-	}
-	link := func(l platformLinkSettings) []func() error {
+	link := func(l platformLinkConfig) []func() error {
 		return []func() error{
 			func() error { return setPaths("link-archive", l.LinkArchives...) },
 			func() error { return setPaths("link-notice", l.LinkNotices...) },
@@ -205,21 +228,21 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 		}
 	}
 	switch {
-	case strings.HasPrefix(target, "darwin/") && s.Darwin != nil:
+	case strings.HasPrefix(target.Name, "darwin/") && s.Darwin != nil:
 		steps = []func() error{
 			func() error { return setPaths("sdk", s.Darwin.SDK) },
 			func() error { return setText("min-os", s.Darwin.MinOS) },
 			func() error { return setLinker(s.Darwin.Linker) },
 		}
-		steps = append(steps, link(s.Darwin.platformLinkSettings)...)
-	case strings.HasPrefix(target, "linux/") && s.Linux != nil:
+		steps = append(steps, link(s.Darwin.platformLinkConfig)...)
+	case strings.HasPrefix(target.Name, "linux/") && s.Linux != nil:
 		steps = []func() error{
 			func() error { return setPaths("sysroot", s.Linux.Sysroot) },
 			func() error { return setLinker(s.Linux.Linker) },
 			func() error { return set("linux-system-library", s.Linux.SystemLibraries...) },
 		}
-		steps = append(steps, link(s.Linux.platformLinkSettings)...)
-	case strings.HasPrefix(target, "windows/") && s.Windows != nil:
+		steps = append(steps, link(s.Linux.platformLinkConfig)...)
+	case strings.HasPrefix(target.Name, "windows/") && s.Windows != nil:
 		imports := make([]string, 0, len(s.Windows.Imports))
 		for name, dll := range s.Windows.Imports {
 			imports = append(imports, name+"="+dll)
@@ -237,7 +260,7 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 				return set("windows-max-data-alignment", strconv.FormatUint(uint64(*s.Windows.MaxDataAlignment), 10))
 			},
 		}
-		steps = append(steps, link(s.Windows.platformLinkSettings)...)
+		steps = append(steps, link(s.Windows.platformLinkConfig)...)
 	default:
 		steps = nil
 	}
@@ -249,8 +272,8 @@ func (o *nativeFlags) applySettings(fs *flag.FlagSet) ([]string, error) {
 	return positional, nil
 }
 
-// applySettingsBindings accepts a manifest path, "dwarf", or an inline manifest.
-func (o *nativeFlags) applySettingsBindings(raw json.RawMessage, path func(string) (string, error)) error {
+// applyConfigBindings accepts a manifest path, "dwarf", or an inline manifest.
+func (o *nativeFlags) applyConfigBindings(raw json.RawMessage, path func(string) (string, error)) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -271,9 +294,16 @@ func (o *nativeFlags) applySettingsBindings(raw json.RawMessage, path func(strin
 	return nil
 }
 
-// settingsTarget selects the platform section the way the command resolves its
-// target: a native input decides, while Cargo builds use the requested target.
-func settingsTarget(requested string, positional []string) (string, error) {
+// configTargetVariables names the build target for paths in a config file.
+func configTargetVariables(target toolchain.Target) map[string]string {
+	goos, goarch, _ := strings.Cut(target.Name, "/")
+	cpu, _, _ := strings.Cut(target.RustTriple, "-")
+	return map[string]string{"BAO_GOOS": goos, "BAO_GOARCH": goarch, "BAO_CPU": cpu}
+}
+
+// configTarget resolves the target the way the command does: a native input
+// decides, while Cargo builds use the requested target or the host.
+func configTarget(requested string, positional []string) (toolchain.Target, error) {
 	input := ""
 	if len(positional) == 1 {
 		input = positional[0]
@@ -282,11 +312,15 @@ func settingsTarget(requested string, positional []string) (string, error) {
 		}
 	}
 	if requested != "auto" {
-		return requested, nil
+		target, err := toolchain.ParseTarget(requested)
+		if err != nil {
+			return target, usage("%v", err)
+		}
+		return target, nil
 	}
 	target, _, err := resolveTarget(requested, input)
 	if err != nil {
-		return "", fmt.Errorf("-settings: %w", err)
+		return target, fmt.Errorf("-config: %w", err)
 	}
-	return target.Name, nil
+	return target, nil
 }

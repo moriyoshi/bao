@@ -1187,13 +1187,13 @@ the manifest. It exits non-zero on a failure. Library hints on Linux are advice:
 binding still requires `-linux-system-library`. `-trace` reads each stage's
 artifacts, so the translator stage it names is labeled as an inference.
 
-### Settings files
+### Config files
 
 `bao build` and `bao translate` can read their options from a JSON file instead
 of the command line:
 
 ```sh
-bao build -settings bao.json -target windows/amd64 -o ./native native.lib
+bao build -config bao.json -target windows/amd64 -o ./native native.lib
 ```
 
 ```json
@@ -1231,11 +1231,19 @@ section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.
 
 Only the section for the build's target applies, and its link inputs follow the
-common ones. Paths are relative to the settings file and may use `${VAR}`; an
-unset variable is an error. A flag given on the command line replaces that whole
+common ones. Paths are relative to the config file and may use `${VAR}`; an
+unset variable is an error. `${BAO_GOOS}`, `${BAO_GOARCH}` and `${BAO_CPU}` name
+the build target, with `${BAO_CPU}` being `x86_64`, `aarch64` and so on, so
+`${LLVM_MINGW}/${BAO_CPU}-w64-mingw32/lib/libuser32.a` serves both architectures.
+They are not available in `input`, which can decide the target. A flag given on the command line replaces that whole
 setting, including every entry of a repeatable flag. Unknown or duplicate keys
 are errors, as is a setting the command cannot use. `-o` and the diagnostics
-flags stay on the command line. Bao does not look for a settings file on its own.
+flags stay on the command line.
+
+Without `-config`, Bao uses `.bao.config.json` from the working directory if it
+exists and notes this on stderr. Parent directories are not searched. Use
+`-config ''` to run without it. The file can name a linker through `ld`, so
+review it before building in a checkout you do not trust.
 
 ### Other commands
 

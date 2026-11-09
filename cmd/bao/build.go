@@ -29,7 +29,7 @@ type nativeFlags struct {
 	windowsImportLibraries            symbolFlags
 	windowsMaxDataAlignment           uint
 	linuxSystemLibraries              symbolFlags
-	settings                          string
+	config                            string
 	inlineBindings                    []byte
 	diagnostics                       diagnosticFlags
 	diagnosticCommand                 string
@@ -39,7 +39,7 @@ type nativeFlags struct {
 }
 
 func (o *nativeFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&o.settings, "settings", "", "JSON file supplying these options, including bindings; a flag given on the command line replaces its setting")
+	fs.StringVar(&o.config, "config", "", "JSON file supplying these options, including bindings; defaults to .bao.config.json in the working directory if it exists, and empty disables that; a flag given on the command line replaces its setting")
 	fs.StringVar(&o.target, "target", "auto", "GOOS/GOARCH; auto detects native inputs, uses host for Cargo")
 	fs.StringVar(&o.output, "o", "", "new generated Go package directory (required)")
 	fs.StringVar(&o.pkg, "package", "native", "generated Go package name")
@@ -212,7 +212,7 @@ func translateNative(ctx context.Context, args []string, stdout, stderr io.Write
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
-	positional, err := o.applySettings(fs)
+	positional, err := o.applyConfig(fs, stderr)
 	if err != nil {
 		return err
 	}
@@ -294,7 +294,7 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
-	positional, err := o.applySettings(fs)
+	positional, err := o.applyConfig(fs, stderr)
 	if err != nil {
 		return err
 	}

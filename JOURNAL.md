@@ -3957,3 +3957,34 @@ not yet written.
 
 Added the "Settings files" section to README.md, which the previous entry recorded
 as not yet written. Documentation only; no behavior changed.
+
+## 2026-11-09: Default settings file
+
+Supersedes the "no auto-discovery" decision in the settings file entry, at the
+user's request. Without `-settings`, `bao build` and `bao translate` use
+`.bao.config.json` from the working directory if it exists. Parent directories
+are not searched. A stderr line names the file because it changes the build, and
+`-settings ''` opts out. An unreadable or invalid default file is an error rather
+than being skipped.
+
+A settings file can set `ld`, so building in an untrusted checkout with an
+explicit archive input can now run a linker that checkout names. Previously only
+Cargo inputs ran code from the checkout. `go test ./...` passed; the behavior is
+covered by `TestDefaultSettingsFile`.
+
+## 2026-11-09: Rename -settings to -config
+
+Renamed the flag to `-config` to match the `.bao.config.json` default. It was
+unreleased, so no `-settings` alias exists. Earlier entries keep the old name.
+`bao build` and `bao translate` behavior is otherwise unchanged.
+
+## 2026-11-09: Target variables in config files
+
+Added `${BAO_GOOS}`, `${BAO_GOARCH}` and `${BAO_CPU}` to config-file paths, so a
+file can name per-architecture toolchain directories without a caller-set
+variable. They take precedence over the environment. `BAO_CPU` is the first field
+of the target's Rust triple. They are rejected in `input`, because an `auto` target
+is detected from that file.
+
+Chose this over per-architecture override sections, which would need merge rules
+that nothing requires yet: gpui-go's only per-architecture difference is a path.
