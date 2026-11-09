@@ -122,7 +122,9 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 			}
 			return "", usage("-config %s: environment variable %s is not set", o.config, missing)
 		}
-		if value != "" && !filepath.IsAbs(value) {
+		// A rooted path such as /opt/x is not absolute on Windows, but it is
+		// also not relative to this file.
+		if value != "" && !filepath.IsAbs(value) && !os.IsPathSeparator(value[0]) {
 			value = filepath.Join(dir, value)
 		}
 		return value, nil
@@ -169,7 +171,7 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 	}
 	// A linker may be a bare command found on PATH.
 	setLinker := func(value string) error {
-		if strings.ContainsRune(value, filepath.Separator) || configVariable.MatchString(value) {
+		if strings.ContainsAny(value, "/"+string(filepath.Separator)) || configVariable.MatchString(value) {
 			return setPaths("ld", value)
 		}
 		return setText("ld", value)

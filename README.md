@@ -956,6 +956,14 @@ Data, ordinal and wrong-machine records grant nothing. Import records inside the
 native input or a `-link-archive` still grant no DLL binding. Each named library
 is recorded by name and SHA-256 in `bao-manifest.json`.
 
+Generated packages look up each system function when the package initializes. If
+a function or its DLL is missing, the program still starts, and only a call to
+that function prints its name to stderr and exits with status 2. That call cannot
+be recovered from, because Go cannot unwind native frames. Functions that depend
+on an activated assembly need it in the consumer: `TaskDialogIndirect`, for
+example, requires a Common-Controls 6.0 application manifest. Imported data is
+still resolved at startup and fails there, because it has no call to intercept.
+
 Go's PE reader cannot provide data alignment above 32 bytes, so a section
 requesting more fails by default. `-windows-max-data-alignment 32` links
 read-only data sections at 32 bytes instead; writable data and code still fail.

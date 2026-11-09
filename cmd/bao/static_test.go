@@ -180,3 +180,60 @@ func TestFinalizeRuntimeBindingIsRejectedBeforeOutput(t *testing.T) {
 		t.Fatal("binding collision published output")
 	}
 }
+
+// importingCOFF defines answer, which calls the undefined MaybeMissing.
+func importingCOFF() []byte {
+	data := make([]byte, 112)
+	binary.LittleEndian.PutUint16(data, 0x8664)
+	binary.LittleEndian.PutUint16(data[2:], 1)
+	binary.LittleEndian.PutUint32(data[8:], 76)
+	binary.LittleEndian.PutUint32(data[12:], 2)
+	copy(data[20:], ".text")
+	binary.LittleEndian.PutUint32(data[36:], 6)
+	binary.LittleEndian.PutUint32(data[40:], 60)
+	binary.LittleEndian.PutUint32(data[44:], 66)
+	binary.LittleEndian.PutUint16(data[52:], 1)
+	binary.LittleEndian.PutUint32(data[56:], 0x60500020)
+	copy(data[60:], []byte{0xe8, 0, 0, 0, 0, 0xc3})
+	binary.LittleEndian.PutUint32(data[66:], 1)
+	binary.LittleEndian.PutUint32(data[70:], 1)
+	binary.LittleEndian.PutUint16(data[74:], 4)
+	copy(data[76:84], "answer")
+	binary.LittleEndian.PutUint16(data[88:], 1)
+	binary.LittleEndian.PutUint16(data[90:], 0x20)
+	data[92] = 2
+	binary.LittleEndian.PutUint32(data[98:], 4)
+	data[110] = 2
+	strings := append(binary.LittleEndian.AppendUint32(nil, 17), "MaybeMissing\x00"...)
+	return append(data, strings...)
+}
+
+func TestWindowsFunctionImportsResolveAtCallTime(t *testing.T) {
+	dir := t.TempDir()
+	o := importingCOFF()
+	input := filepath.Join(dir, "leaf.obj")
+	if err := os.WriteFile(input, o, 0644); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(dir, "native")
+	var stdout, stderr strings.Builder
+	if err := run([]string{"translate", "-target", "windows/amd64", "-symbol", "answer", "-windows-import", "MaybeMissing=optional.dll", "-o", output, input}, &stdout, &stderr); err != nil {
+		t.Fatalf("%v %s", err, stderr.String())
+	}
+	source, err := os.ReadFile(filepath.Join(output, "symbols_windows_amd64.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if !strings.Contains(text, `baoResolveImport("optional.dll", "MaybeMissing")`) {
+		t.Fatalf("import is not resolved through the fallback:\n%s", text)
+	}
+	if strings.Contains(text, `NewProc("MaybeMissing").Addr()`) {
+		t.Fatal("function import is still resolved eagerly")
+	}
+	for _, want := range []string{"proc.Find() == nil", "syscall.NewCallback", "is unavailable on this system", "syscall.Exit(2)"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated fallback lacks %q", want)
+		}
+	}
+}

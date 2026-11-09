@@ -3988,3 +3988,78 @@ is detected from that file.
 
 Chose this over per-architecture override sections, which would need merge rules
 that nothing requires yet: gpui-go's only per-architecture difference is a path.
+
+## 2026-11-09: Correction: Windows checks under Wine, and rooted config paths
+
+Corrects the two earlier 2026-11-09 entries that say no Wine was available and that
+no Windows binary ran. That was wrong: only `which wine` was checked. A Wine 11.21
+install and an arm64 Wine image recipe already existed under `.work/`, as recorded
+in the 2026-11-08 Windows entries. These are Wine results, not native Windows.
+
+CI run 42585174002 failed on windows-amd64 and windows-arm64 in four config tests.
+On Windows `filepath.IsAbs("/root")` is false, so a rooted path was joined onto the
+config file's directory. `applyConfig` now leaves rooted paths alone, and the
+linker path check also recognizes `/`. Negative control under Wine 11.21 on
+macOS/Rosetta: a windows/amd64 test binary from 46e719e fails the same four tests.
+With the fix, the config tests and all of cmd/bao pass under Wine.
+
+GPUI headless smoke under Wine, windows/amd64 (Wine 11.21) and windows/arm64 (Wine
+10.0~repack-6, image bao-wine-arm64:20261108 rebuilt from the recorded Dockerfile
+and left in place), from the flag-built packages:
+- Unmodified: exit 2 on both. Generated init panics resolving
+  RegOpenKeyTransactedW, because it resolves every import eagerly.
+- An import probe found 2 of 421 amd64 imports unresolved (RegOpenKeyTransactedW,
+  TaskDialogIndirect) and 2 of 395 arm64 imports (RegOpenKeyTransactedW,
+  icu.dll u_strlen).
+- With only those names stubbed to zero in a scratch copy of the generated package:
+  `-smoke` exit 0 at GOMAXPROCS 1 and 4 on both architectures.
+
+The stubs were never in the repository. RegOpenKeyTransactedW and icu.dll are
+expected to exist on current Windows, so those are Wine gaps. TaskDialogIndirect
+is documented as requiring comctl32 v6, which needs an application manifest that a
+plain Go executable lacks, so eager resolution may panic on native Windows too.
+This was not tested natively. Unresolved: whether a missing export should fail
+at startup or only when called.
+
+## 2026-11-09: Wine export tables for the two unresolved GPUI imports
+
+Refines the previous entry. Under Wine 11.21 x86_64-windows, both DLLs load, and
+the export tables of its builtin DLLs show:
+
+- advapi32.dll (589 exports) has RegCreateKeyTransactedW but no
+  RegOpenKeyTransactedW, so that lookup fails regardless of activation context.
+- comctl32.dll (114 exports, default v5 assembly) has no TaskDialogIndirect. With
+  an external Common-Controls 6.0 manifest beside the probe executable, the
+  import resolves and only RegOpenKeyTransactedW remains unresolved. Without the
+  manifest both fail again. This is the same manifest dependence native Windows
+  documents; native Windows itself was not tested.
+
+The arm64 export tables were not read: bao-wine-arm64:20261108 was no longer in
+the local Docker image store when this check ran.
+
+## 2026-11-09: Windows function imports fail when called
+
+Resolves the question left open two entries back, at the user's direction.
+Generated Windows init looked up every function import eagerly and panicked on the
+first missing one, so an import a program never calls could stop it from starting.
+`baoResolveImport` now stores a `syscall.NewCallback` fallback when a function or
+its DLL is missing. A call prints the name to stderr and exits with status 2. It
+is not a Go panic, because Go cannot unwind native frames. Data imports still
+resolve at startup; a code stub cannot stand in for data.
+
+A missing import cannot be reported at build time, because what is missing depends
+on the system running the program.
+
+Wine results, not native Windows. windows/amd64 used Wine 11.21 on macOS/Rosetta;
+windows/arm64 used Wine 10.0~repack-6 in bao-wine-arm64:20261108, rebuilt from the
+recorded Dockerfile. Go 1.26.10:
+- Unmodified GPUI package from the hosted archives, without the scratch stubs of
+  the earlier entry: `-smoke` exit 0 at GOMAXPROCS 1 and 4 on both architectures.
+  The negative control is the earlier eager package, which exits 2 in init.
+- Fixture from a clang-compiled library, linked and run on both architectures: no
+  call, exit 0; a present import returns normally; a missing export and a missing
+  DLL each print the import's name and exit 2.
+
+The `bao_fixed_` names in the bindings assembly change with the generated source
+and are stable between runs. Native windows-2025 and windows-11-arm runs remain
+pending.

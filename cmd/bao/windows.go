@@ -143,9 +143,24 @@ func Shutdown(){shutdownMutex.Lock();defer shutdownMutex.Unlock();if shutdownDon
 	if p.Arch == "arm64" && len(p.Unwind) > 0 {
 		src.WriteString("var nativeFunctionTable uintptr\nfunc unwindAddressMerged()uintptr{return nativeFunctionTable}\n")
 	}
+	// A missing export must not stop programs that never call it. Native frames
+	// cannot be unwound by a Go panic, so a call reports the name and exits.
+	src.WriteString(`
+func baoResolveImport(dll, name string) uintptr {
+	proc := syscall.NewLazyDLL(dll).NewProc(name)
+	if proc.Find() == nil {
+		return proc.Addr()
+	}
+	return syscall.NewCallback(func() uintptr {
+		print("native import ", name, " from ", dll, " is unavailable on this system\n")
+		syscall.Exit(2)
+		return 0
+	})
+}
+`)
 	src.WriteString("var registerFunctionTable = func(table uintptr,count uintptr,base uintptr) { r,_,_:=syscall.NewLazyDLL(\"kernel32.dll\").NewProc(\"RtlAddFunctionTable\").Call(table,count,base);if r==0{panic(\"native Windows unwind registration failed\")} }\nvar callConstructor=func(address uintptr){syscall.SyscallN(address)}\nfunc init(){\n")
 	for i, im := range p.Imports {
-		fmt.Fprintf(&src, "*(*uintptr)(unsafe.Pointer(functionImportAddress%d()))=syscall.NewLazyDLL(%q).NewProc(%q).Addr()\n", i, im.DLL, im.Name)
+		fmt.Fprintf(&src, "*(*uintptr)(unsafe.Pointer(functionImportAddress%d()))=baoResolveImport(%q,%q)\n", i, im.DLL, im.Name)
 	}
 	for i, im := range p.DataImports {
 		fmt.Fprintf(&src, "*(*uintptr)(unsafe.Pointer(dataImportAddress%d()+%d))=syscall.NewLazyDLL(%q).NewProc(%q).Addr()+%d\n", i, im.Offset, im.DLL, im.Name, im.Addend)
