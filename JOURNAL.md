@@ -3921,3 +3921,39 @@ earlier entry plus the handoff's -link-archive set:
 No Windows execution occurred. Neither the arm64 host nor the Intel Mac has Wine.
 Issue 2's completion criterion, release:smoke on windows-2025 and windows-11-arm,
 remains unmet until those hosted runners execute it.
+
+## 2026-11-09: Settings file for build and translate
+
+`bao build` command lines had grown large (gpui-go's Windows build needs 26
+import libraries plus link inputs and notices). Added `-settings FILE` to `build`
+and `translate`, in `cmd/bao/settings.go`. Decisions:
+
+- JSON with `schema: 1`, decoded with `verify.Decode`, so unknown keys, duplicate
+  keys and trailing values fail. There is no auto-discovery: a file changes what
+  is built, so it must be named.
+- Settings go through the existing flags with `flag.Set`, so validation stays in
+  one place. A flag given on the command line replaces that whole setting, even
+  for repeatable flags, because order matters (first import library wins).
+- `bindings` is a manifest path, `dwarf`, or an inline manifest. Inline manifests
+  use the same `bindings.Parse` as files.
+- Paths are relative to the settings file. `${VAR}` expands in paths and an unset
+  variable fails. `darwin`, `linux` and `windows` sections apply only to their
+  target, and each section's link inputs follow the common ones. A setting a
+  command cannot use is an error rather than being ignored.
+- `-o` and the diagnostics flags stay on the command line.
+
+Verification on macOS 26.5.2 arm64, Go 1.26.10, LLVM-MinGW 20261104 and the hosted
+archives from run 42562229131. One 3.3 KB settings file, with inline bindings and
+`${MINGW}` for the per-architecture prefix, was used for both Windows targets:
+translation exit 0, and all 688 amd64 and 674 arm64 generated files byte-identical
+to the earlier flag-driven builds, including bao-build.json. Negative control: an
+unset variable fails before translation. This is translation only; the Windows
+smoke remains unrun, as recorded in the previous entry. `go test ./...` passed.
+
+The README was open in an editor during this work, so its settings section is
+not yet written.
+
+## 2026-11-09: README settings section
+
+Added the "Settings files" section to README.md, which the previous entry recorded
+as not yet written. Documentation only; no behavior changed.

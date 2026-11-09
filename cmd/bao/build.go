@@ -29,6 +29,8 @@ type nativeFlags struct {
 	windowsImportLibraries            symbolFlags
 	windowsMaxDataAlignment           uint
 	linuxSystemLibraries              symbolFlags
+	settings                          string
+	inlineBindings                    []byte
 	diagnostics                       diagnosticFlags
 	diagnosticCommand                 string
 	diagnosticSource                  string
@@ -37,6 +39,7 @@ type nativeFlags struct {
 }
 
 func (o *nativeFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&o.settings, "settings", "", "JSON file supplying these options, including bindings; a flag given on the command line replaces its setting")
 	fs.StringVar(&o.target, "target", "auto", "GOOS/GOARCH; auto detects native inputs, uses host for Cargo")
 	fs.StringVar(&o.output, "o", "", "new generated Go package directory (required)")
 	fs.StringVar(&o.pkg, "package", "native", "generated Go package name")
@@ -75,7 +78,7 @@ func (o *nativeFlags) validate() error {
 	if o.bindings == "dwarf" && len(o.symbols) == 0 {
 		return usage("-bindings dwarf requires selected C ABI exports with -symbol")
 	}
-	if o.bindings != "" && o.bindings != "dwarf" {
+	if o.bindings != "" && o.bindings != "dwarf" || o.inlineBindings != nil {
 		return o.resolveBindings("", nil)
 	}
 	return nil
@@ -209,16 +212,20 @@ func translateNative(ctx context.Context, args []string, stdout, stderr io.Write
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
+	positional, err := o.applySettings(fs)
+	if err != nil {
+		return err
+	}
 	if err := o.validate(); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || *format != "elf" {
+	if len(positional) != 1 || *format != "elf" {
 		return usage("translate requires one combined object and -format elf; use build for archives, probe-tls for Mach-O diagnostics")
 	}
 	if err := requireNewOutput(o.output); err != nil {
 		return err
 	}
-	target, archive, err := resolveTarget(o.target, fs.Arg(0))
+	target, archive, err := resolveTarget(o.target, positional[0])
 	if err != nil {
 		return err
 	}
@@ -232,11 +239,11 @@ func translateNative(ctx context.Context, args []string, stdout, stderr io.Write
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	inputBytes, err := os.ReadFile(fs.Arg(0))
+	inputBytes, err := os.ReadFile(positional[0])
 	if err != nil {
 		return err
 	}
-	if err = o.resolveBindings(fs.Arg(0), inputBytes); err != nil {
+	if err = o.resolveBindings(positional[0], inputBytes); err != nil {
 		return err
 	}
 	work, err := os.MkdirTemp(filepath.Dir(o.output), ".bao-translate-")
@@ -245,7 +252,7 @@ func translateNative(ctx context.Context, args []string, stdout, stderr io.Write
 	}
 	defer os.RemoveAll(work)
 	staged := filepath.Join(work, "package")
-	if err := generateNative(o, target, fs.Arg(0), staged, stdout, stderr); err != nil {
+	if err := generateNative(o, target, positional[0], staged, stdout, stderr); err != nil {
 		return err
 	}
 	if err = toolchain.Publish(staged, o.output); err != nil {
@@ -287,15 +294,19 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
+	positional, err := o.applySettings(fs)
+	if err != nil {
+		return err
+	}
 	if err := o.validate(); err != nil {
 		return err
 	}
-	if fs.NArg() > 1 || (fs.NArg() == 1 && *manifest != "") {
+	if len(positional) > 1 || (len(positional) == 1 && *manifest != "") {
 		return usage("build accepts one input or -manifest-path, not both")
 	}
 	input := ""
-	if fs.NArg() == 1 {
-		input = fs.Arg(0)
+	if len(positional) == 1 {
+		input = positional[0]
 		if stat, err := os.Stat(input); err == nil && stat.IsDir() {
 			*manifest, input = filepath.Join(input, "Cargo.toml"), ""
 		} else if filepath.Base(input) == "Cargo.toml" {

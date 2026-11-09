@@ -1187,6 +1187,56 @@ the manifest. It exits non-zero on a failure. Library hints on Linux are advice:
 binding still requires `-linux-system-library`. `-trace` reads each stage's
 artifacts, so the translator stage it names is labeled as an inference.
 
+### Settings files
+
+`bao build` and `bao translate` can read their options from a JSON file instead
+of the command line:
+
+```sh
+bao build -settings bao.json -target windows/amd64 -o ./native native.lib
+```
+
+```json
+{
+  "schema": 1,
+  "package": "native",
+  "symbols": ["native_add"],
+  "bindings": {
+    "schema": 1,
+    "abi": "c",
+    "functions": [
+      {"name": "Add", "symbol": "native_add", "params": ["int64", "int64"], "result": "int64"}
+    ]
+  },
+  "linux": {
+    "sysroot": "${SYSROOT}",
+    "system_libraries": ["libxcb.so.1"]
+  },
+  "windows": {
+    "cxx_runtime": "libc++",
+    "max_data_alignment": 32,
+    "link_archives": ["${MINGW}/lib/libunwind.a"],
+    "import_libraries": ["${MINGW}/lib/libuser32.a"]
+  }
+}
+```
+
+`bindings` is an inline manifest, a manifest path, or `dwarf`. Other top-level
+keys are `target`, `input`, `strip_debug`, `link_archives`, `link_notices`,
+`require_static_runtime` and `cargo` (`manifest_path`, `package`, `offline`,
+`locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
+`sysroot`, `ld` and `system_libraries`; `windows` takes `imports`,
+`import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
+section also accepts `link_archives`, `link_notices` and
+`require_static_runtime`.
+
+Only the section for the build's target applies, and its link inputs follow the
+common ones. Paths are relative to the settings file and may use `${VAR}`; an
+unset variable is an error. A flag given on the command line replaces that whole
+setting, including every entry of a repeatable flag. Unknown or duplicate keys
+are errors, as is a setting the command cannot use. `-o` and the diagnostics
+flags stay on the command line. Bao does not look for a settings file on its own.
+
 ### Other commands
 
 `bao inspect INPUT` reads ordinary BSD/GNU archives or Mach-O objects without

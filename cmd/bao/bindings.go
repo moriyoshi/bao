@@ -19,7 +19,7 @@ import (
 )
 
 func (o *nativeFlags) resolveBindings(name string, input []byte) error {
-	if o.bindings == "" {
+	if o.bindings == "" && o.inlineBindings == nil {
 		return nil
 	}
 	if o.signatures != nil {
@@ -27,7 +27,9 @@ func (o *nativeFlags) resolveBindings(name string, input []byte) error {
 	}
 	var m bindings.Manifest
 	var err error
-	if o.bindings == "dwarf" {
+	if o.inlineBindings != nil {
+		m, err = bindings.Parse(bytes.NewReader(o.inlineBindings))
+	} else if o.bindings == "dwarf" {
 		if len(o.symbols) == 0 {
 			return usage("-bindings dwarf requires selected C ABI exports with -symbol")
 		}
