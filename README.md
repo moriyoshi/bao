@@ -836,6 +836,11 @@ The consumer needs Go, optional PureGo for runtime binding mode, and compatible 
 neither the producer sysroot nor a native compiler. See
 [using generated Go packages](#using-generated-go-packages) for consumer builds.
 
+Imports normally resolve against the glibc and C++ runtime libraries. Name other
+sysroot libraries with `-linux-system-library libxcb.so.1` (repeatable). Each
+must exist in the sysroot, and it cannot replace a symbol the standard set
+already exports. The consumer machine must provide the same library.
+
 This path targets glibc/AArch64 and one combined native image. Other native TLS
 models, TLS-template relocations, native IFUNC definitions, preinit arrays,
 static musl and arbitrary shared-library inputs are not supported. Other
@@ -940,8 +945,25 @@ static/debug Microsoft CRT requests remain unsupported.
 Use `-windows-cxx-runtime libc++` for LLVM-MinGW, or the default mapping for
 MSVC/MinGW GCC. Dynamic C++ packages need the matching Microsoft runtime DLLs
 or GNU C++/unwinder DLLs. Additional system functions require explicit
-`-windows-import Function=system.dll` mappings. `-windows-crt ucrt` (default)
+`-windows-import Function=system.dll` mappings or a producer-named
+`-windows-import-library PATH` (repeatable). `-windows-crt ucrt` (default)
 or `-windows-crt msvcrt` must match the native toolchain.
+
+An import library such as LLVM-MinGW's `libuser32.a` supplies by-name
+IMPORT_CODE records for names that are otherwise unbound. The first listed
+library wins; `-windows-import` and Bao's built-in bindings take precedence.
+Data, ordinal and wrong-machine records grant nothing. Import records inside the
+native input or a `-link-archive` still grant no DLL binding. Each named library
+is recorded by name and SHA-256 in `bao-manifest.json`.
+
+Go's PE reader cannot provide data alignment above 32 bytes, so a section
+requesting more fails by default. `-windows-max-data-alignment 32` links
+read-only data sections at 32 bytes instead; writable data and code still fail.
+This is an opt-in compromise: it breaks the alignment the native code declared,
+so use it only when that code does not depend on the extra alignment, as with
+tables aligned for cache behavior. Capped sections are listed under
+`windows_capped_alignments` in `bao-manifest.json`, and the generated runtime
+check enforces the applied value.
 
 For GNU Rust std, the checked Rust 1.99.1 targets are
 `x86_64-pc-windows-gnu` and `aarch64-pc-windows-gnullvm`, using
@@ -1125,6 +1147,45 @@ name references are byte offsets bounded by the filename table; duplicate tables
 are rejected. Thin archives are rejected without reading their external members.
 Ownership, mode and timestamp fields and symbol-index contents are not decoded
 or validated. This is a structural archive parser, not artifact authentication.
+
+### Diagnostics
+
+`build`, `translate` and `inspect` accept these flags; `doctor` accepts them for
+its toolchain checks. They collect errors rather than only logging more: `-v`
+keeps going within a stage and reports everything found there.
+
+| Flag | Effect |
+| --- | --- |
+| `-v` | One line per stage with limits and headroom |
+| `-vv` | Adds the symbols behind each number |
+| `-trace SYMBOL` | SYMBOL's state at each stage; repeatable |
+| `-report FILE` | Findings as JSON, for CI artifacts |
+| `-assume-consumer net,crypto/x509` | Counts libraries those dependencies add |
+
+```text
+limits OK sections 25 / 65,279 (headroom 65,254)
+imports FAIL 43 unresolved: xkb 29, xcb 14
+imports HINT -linux-system-library libxcb.so.1 would satisfy 14
+functions SKIPPED generation failed; no objects to measure
+stopped: 1 failures; no package written
+```
+
+Diagnostics go only to stderr or the report file, and they do not change the exit
+code or generated objects. Unresolved imports are listed together on every
+platform, with or without `-v`. A stage that did not run prints `SKIPPED` with
+the reason. A clean report means no known limit was exceeded; it does not verify
+execution. The findfunc density is a prediction from object layout.
+
+Findings have stable IDs: `BAO-ELF-SECTIONS`, `BAO-MACHO-SECTIONS`,
+`BAO-COFF-SECTIONS`, `BAO-GO-FINDFUNC`, `BAO-MACHO-ORDINAL`,
+`BAO-MACHO-FLAT-BIND`, `BAO-IMPORT-MISSING`, `BAO-COFF-ALIGNMENT-CAPPED` and
+`BAO-GENERATE`.
+
+`bao inspect -v -manifest bao-manifest.json ./program` reads a built Mach-O
+executable, reports flat-namespace binds, and compares each bind's dylib with
+the manifest. It exits non-zero on a failure. Library hints on Linux are advice:
+binding still requires `-linux-system-library`. `-trace` reads each stage's
+artifacts, so the translator stage it names is labeled as an inference.
 
 ### Other commands
 

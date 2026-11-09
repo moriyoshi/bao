@@ -121,6 +121,58 @@ func (m *objectImage) indexAMD64SectionReferences(namespace string, oi int) erro
 	return nil
 }
 
+// localizeAMD64GOTReferences gives X86_64_RELOC_GOT references to native-defined
+// symbols an image-private pointer slot. Only a MOV can become an LEA; Go's
+// linker keeps other GOT forms (CMP, ADD, LSDA fields) and binds the entry by
+// name, which dyld cannot resolve because the definition is not exported.
+// Personality GOT fields in __eh_frame are lowered by PrepareRuntimeMetadata.
+func (m *objectImage) localizeAMD64GOTReferences(namespace string) (int, error) {
+	if m.cpu != macho.CpuAmd64 {
+		return 0, nil
+	}
+	gotIndex := -1
+	slots := make(map[uint32]uint32)
+	for si := 0; si < len(m.sections); si++ {
+		if si == gotIndex || m.sections[si].name == "__eh_frame" {
+			continue
+		}
+		for ri := range m.sections[si].relocs {
+			r := m.sections[si].relocs[ri]
+			if r.Type != 4 || !r.Extern {
+				continue
+			}
+			if int(r.Value) >= len(m.symbols) || !r.Pcrel || r.Len != 2 {
+				return 0, fmt.Errorf("unsupported amd64 GOT relocation")
+			}
+			if m.symbols[r.Value].Sect == 0 {
+				continue
+			}
+			if gotIndex < 0 {
+				if len(m.sections) >= 255 {
+					return 0, fmt.Errorf("too many native sections for a local GOT")
+				}
+				gotIndex = len(m.sections)
+				m.sections = append(m.sections, imageSection{name: "__bao_local_got", seg: "__DATA", addr: (m.end() + 7) &^ 7, align: 3})
+			}
+			slot, ok := slots[r.Value]
+			if !ok {
+				g := &m.sections[gotIndex]
+				slot = uint32(len(m.symbols))
+				m.symbols = append(m.symbols, macho.Symbol{Name: fmt.Sprintf("_%slocal_got_%d", namespace, len(slots)), Type: 0xe, Sect: uint8(gotIndex + 1), Value: g.addr + g.size})
+				g.relocs = append(g.relocs, macho.Reloc{Addr: uint32(g.size), Value: r.Value, Extern: true, Len: 3})
+				g.data = append(g.data, make([]byte, 8)...)
+				g.size += 8
+				slots[r.Value] = slot
+			}
+			// The implicit addend already follows SIGNED's convention, so only
+			// the relocation kind and target change.
+			m.sections[si].relocs[ri].Type = 1
+			m.sections[si].relocs[ri].Value = slot
+		}
+	}
+	return len(slots), nil
+}
+
 func (m *objectImage) amd64ELFRelocations(si int, data []byte, indices []uint32) ([]byte, error) {
 	s := m.sections[si]
 	var out bytes.Buffer

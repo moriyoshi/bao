@@ -26,6 +26,12 @@ type nativeFlags struct {
 	signatures                        *bindings.Manifest
 	stripDebug                        bool
 	windowsImports                    symbolFlags
+	windowsImportLibraries            symbolFlags
+	windowsMaxDataAlignment           uint
+	linuxSystemLibraries              symbolFlags
+	diagnostics                       diagnosticFlags
+	diagnosticCommand                 string
+	diagnosticSource                  string
 	windowsCXXRuntime                 string
 	windowsCRT                        string
 }
@@ -38,8 +44,12 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&o.sysroot, "sysroot", "", "target Linux glibc sysroot; defaults to / on a matching native Linux host")
 	fs.Var(&o.symbols, "symbol", "native C ABI export without Mach-O's extra underscore; repeatable, accessor order is preserved")
 	fs.Var(&o.windowsImports, "windows-import", "explicit Windows system import SYMBOL=DLL.dll; repeatable")
+	fs.Var(&o.windowsImportLibraries, "windows-import-library", "short-import library naming system DLL functions, such as libuser32.a; repeatable, first match wins, never overrides -windows-import or built-in bindings")
+	fs.UintVar(&o.windowsMaxDataAlignment, "windows-max-data-alignment", 0, "link read-only data requesting more alignment at this value; only 32 is supported, and capped sections are recorded in the manifest")
+	fs.Var(&o.linuxSystemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
 	fs.StringVar(&o.windowsCRT, "windows-crt", "ucrt", "Windows system C runtime: ucrt or msvcrt; match the producer toolchain")
+	o.diagnostics.register(fs)
 	fs.BoolVar(&o.asJSON, "json", false, "print the generated package result as JSON")
 	fs.StringVar(&o.bindings, "bindings", "", "signature manifest JSON, or dwarf to infer selected C ABI exports; omission uses purego")
 	fs.BoolVar(&o.stripDebug, "strip-debug", true, "strip native debug data after inference; preserve unwind/exception metadata and original input")
@@ -91,14 +101,20 @@ func resolveTarget(requested, input string) (toolchain.Target, bool, error) {
 }
 
 func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Target, run toolchain.RunFunc) error {
+	if o.windowsMaxDataAlignment != 0 && o.windowsMaxDataAlignment != 32 {
+		return usage("-windows-max-data-alignment supports only 32")
+	}
+	if len(o.linuxSystemLibraries) > 0 && !strings.HasPrefix(target.Name, "linux/") {
+		return usage("-linux-system-library requires a Linux target")
+	}
 	if strings.HasPrefix(target.Name, "windows/") {
 		if o.sdk != "" || o.sysroot != "" {
 			return usage("Windows COFF uses system DLL imports; -sdk/-sysroot do not apply")
 		}
 		return nil
 	}
-	if len(o.windowsImports) > 0 || o.windowsCXXRuntime != "auto" && o.windowsCXXRuntime != "" || o.windowsCRT != "" && o.windowsCRT != "ucrt" {
-		return usage("-windows-import/-windows-cxx-runtime/-windows-crt requires a Windows target")
+	if len(o.windowsImports) > 0 || len(o.windowsImportLibraries) > 0 || o.windowsMaxDataAlignment != 0 || o.windowsCXXRuntime != "auto" && o.windowsCXXRuntime != "" || o.windowsCRT != "" && o.windowsCRT != "ucrt" {
+		return usage("-windows-import/-windows-import-library/-windows-max-data-alignment/-windows-cxx-runtime/-windows-crt requires a Windows target")
 	}
 	if strings.HasPrefix(target.Name, "darwin/") {
 		if o.sysroot != "" {
@@ -136,7 +152,12 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 }
 
 func generateNative(o nativeFlags, target toolchain.Target, input, output string, stdout, stderr io.Writer) error {
-	return generateWithBindings(o, target, input, output, stdout, stderr)
+	d := o.diagnostics.begin(o.diagnosticCommand, target, input, o.diagnosticSource, stderr)
+	if d != nil {
+		d.sysroot = o.sysroot
+	}
+	err := generateWithBindings(o, target, input, output, stdout, stderr)
+	return d.finish(err, output)
 }
 
 func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output string, stdout, stderr io.Writer) error {
@@ -145,6 +166,9 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 		args = append(args, "-symbol", name)
 	}
 	if strings.HasPrefix(target.Name, "linux/") {
+		for _, name := range o.linuxSystemLibraries {
+			args = append(args, "-linux-system-library", name)
+		}
 		return translateELF(append(args, "-sysroot", o.sysroot, input), stderr)
 	}
 	return runLegacy(append([]string{"translate"}, append(args, "-sdk", o.sdk, input)...), stdout, stderr)
@@ -179,7 +203,7 @@ func showPackage(o nativeFlags, target toolchain.Target, stdout io.Writer) error
 
 func translateNative(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := newFlags("translate", "translate [options] combined.o", "Translate an already-combined native object into a Go package. No native compiler/linker is invoked.")
-	var o nativeFlags
+	o := nativeFlags{diagnosticCommand: "translate"}
 	o.register(fs)
 	format := fs.String("format", "elf", "linker input container; only elf preserves native alignment")
 	if err := parseFlags(fs, args, stdout); err != nil {
@@ -386,6 +410,7 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	staged := filepath.Join(work, "package")
+	o.diagnosticSource = nativeInput
 	if err := generateNative(o, target, combined, staged, stdout, stderr); err != nil {
 		return err
 	}

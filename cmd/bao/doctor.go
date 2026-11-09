@@ -28,6 +28,8 @@ func doctor(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	sysroot := fs.String("sysroot", "", "target Linux glibc sysroot; / on a native Linux producer")
 	linker := fs.String("ld", "", "native/cross linker executable")
 	asJSON := fs.Bool("json", false, "print structured checks; exit 1 if any prerequisite is missing")
+	var diag diagnosticFlags
+	diag.register(fs)
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
@@ -104,6 +106,30 @@ func doctor(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	check("system-imports", err, o.sdk+o.sysroot)
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if diag.enabled() {
+		d := newDiagnosticSession(diag, "doctor", target.Name, "", stderr)
+		for _, c := range result.Checks {
+			status := "OK"
+			if !c.OK {
+				status = "FAIL"
+			}
+			d.stage(c.Name, status, c.Detail, nil, nil)
+		}
+		if strings.HasPrefix(target.Name, "linux/") {
+			if libraries, err := linuxelf.SearchableLibraries(o.sysroot, strings.TrimPrefix(target.Name, "linux/")); err != nil {
+				d.skip("library-search", err.Error())
+			} else {
+				d.stage("library-search", "OK", fmt.Sprintf("%d shared objects searchable: %s", len(libraries), strings.Join(libraries, ", ")), nil, nil)
+			}
+		} else {
+			d.skip("library-search", "only Linux sysroots are enumerated")
+		}
+		d.report.Result = fmt.Sprintf("finished: ready=%v; execution not verified", result.Ready)
+		if d.printing() {
+			fmt.Fprintln(stderr, d.report.Result)
+		}
+		d.close()
 	}
 	if *asJSON {
 		if err := writeJSON(stdout, result); err != nil {

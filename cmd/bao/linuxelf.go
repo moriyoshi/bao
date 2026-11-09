@@ -22,6 +22,8 @@ func translateELF(args []string, stderr io.Writer) error {
 	sysroot := fs.String("sysroot", "", "Linux target glibc sysroot (ELF shared libraries)")
 	var symbols symbolFlags
 	fs.Var(&symbols, "symbol", "native external symbol, repeatable")
+	var systemLibraries symbolFlags
+	fs.Var(&systemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
@@ -40,7 +42,7 @@ func translateELF(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	p, err := linuxelf.Translate(input, *sysroot, symbols)
+	p, err := linuxelf.TranslateWithOptions(input, *sysroot, symbols, linuxelf.Options{SystemLibraries: systemLibraries})
 	if err != nil {
 		return err
 	}

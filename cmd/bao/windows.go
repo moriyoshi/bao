@@ -38,7 +38,17 @@ func generateWindows(o nativeFlags, target toolchain.Target, input, output strin
 		}
 		imports[name] = dll
 	}
-	p, err := pecoff.Translate(b, pecoff.Options{Symbols: o.symbols, Imports: imports, StripDebug: o.stripDebug, CXXRuntime: o.windowsCXXRuntime, CRT: o.windowsCRT})
+	var importLibraries [][]byte
+	var importLibraryRecords []map[string]string
+	for _, path := range o.windowsImportLibraries {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		importLibraries = append(importLibraries, data)
+		importLibraryRecords = append(importLibraryRecords, map[string]string{"name": filepath.Base(path), "sha256": fmt.Sprintf("%x", sha256.Sum256(data))})
+	}
+	p, err := pecoff.Translate(b, pecoff.Options{Symbols: o.symbols, Imports: imports, StripDebug: o.stripDebug, CXXRuntime: o.windowsCXXRuntime, CRT: o.windowsCRT, ImportLibraries: importLibraries, MaxDataAlignment: uint32(o.windowsMaxDataAlignment)})
 	if err != nil {
 		return err
 	}
@@ -221,6 +231,13 @@ registerFunctionTable(unwindAddressMerged(),uintptr(len(functionRecords)),base)
 		}
 	}
 	manifest := map[string]any{"target": target.Name, "profile": "Windows COFF; C ABI exports, CRT/TLS and native unwinding", "namespace": p.Namespace, "artifacts": artifacts, "imports": p.Imports, "data_imports": p.DataImports, "constructors": p.Constructors, "unwind_tables": p.Unwind, "tls": p.TLS, "crt_lifecycle": p.Runtime, "boundaries": "explicit quiescent Shutdown; exceptions remain in native code; declared system/runtime DLLs must be installed; GNU Rust std uses bundled matching unwind/CRT wrapper archives; managed FLS keys stay inside this image"}
+	if len(importLibraryRecords) != 0 {
+		manifest["windows_import_libraries"] = importLibraryRecords
+	}
+	if len(p.CappedAlignments) != 0 {
+		manifest["windows_capped_alignments"] = p.CappedAlignments
+		fmt.Fprintf(stderr, "linked %d read-only sections below their requested alignment; see windows_capped_alignments in bao-manifest.json\n", len(p.CappedAlignments))
+	}
 	for name, data := range map[string]any{"bao-manifest.json": manifest, "bao-debug.json": map[string]any{"stripped": o.stripDebug, "removed_sections": p.RemovedDebugSections, "original_sha256": fmt.Sprintf("%x", sha256.Sum256(b)), "runtime_unwind_preserved": true}} {
 		buf, err := json.MarshalIndent(data, "", "  ")
 		if err != nil {

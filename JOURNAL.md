@@ -3812,3 +3812,112 @@ cgo-enabled example has no separate cgo dependency. The replay command is in
 `.work/readme-walkthrough/native-replay/commands.sh`; it requires a fresh
 working directory and Bao/Go on PATH. No signing or cross-platform execution
 was performed. `git diff --check -- README.md JOURNAL.md` passed.
+
+## 2026-11-09: gpui-go handoff: amd64 GOT binds, Windows imports, Linux libraries, diagnostics
+
+Handoff input: gpui-go `.agents-workspace/tmp/release-pipeline/bao-handoff/HANDOFF.md`,
+issues 1, 2 and 4, then a requested diagnostics feature. Inputs were the real
+GPUI archives from that evidence directory and hosted run 42562229131. Toolchain:
+Go 1.26.10, Rust 1.99.1 archives, LLVM-MinGW 20261104, macOS 26.5.2 arm64 host.
+
+Issue 1, darwin/amd64 launch abort. The handoff's theory of a missing section was
+wrong: the boundary symbols were already defined. Go's amd64 adddynrel rewrites
+GOTPCREL to LEA only for a MOV. Other forms (CMP, ADD) reach AddGotSym, which on
+Darwin binds the defined symbol by name, and dyld aborts. The binary had four
+such flat-namespace binds, including two bytes crate vtables, so a fix limited to
+boundary symbols would have moved the abort. New pass
+`localizeAMD64GOTReferences` gives X86_64_RELOC_GOT references to native-defined
+symbols a private slot in `__bao_local_got`. `__eh_frame` personality fields and
+undefined imports are unchanged.
+
+Verification, regenerated from the real archive and overlaid on a scratch copy of
+the evidence module, so gpui-go's Darwin import rewrite stayed in place:
+- Negative control, pre-fix binary: native execution on an Intel i9-9880H, macOS
+  26.6.2 (macbook-pro-2.local): dyld abort, exit 134. Same abort under Rosetta.
+- Fixed binary: zero flat-namespace binds. `-smoke` exit 0 under Rosetta, and
+  natively on the Intel Mac at GOMAXPROCS 1 and 4.
+- darwin/arm64 regeneration: all three .syso byte-identical to the evidence.
+Hosted macos-15-intel was not run.
+
+Issue 2, Windows translation. Three separate causes:
+- `SysFreeString` was reached by `jne` (0F 85 rel32), which the direct-branch
+  check missed. Jcc now counts; a RIP-relative ModRM cannot be 0x80-0x8f, so the
+  guard against data references holds. LEA and MOV remain rejected.
+- The handoff's 40 names were an undercount, since errors arrived one at a time.
+  Collecting them showed 237 on amd64 and 238 on arm64. A catalog was rejected.
+  `-windows-import-library` takes producer-named short-import libraries. This
+  keeps the earlier decision that import records in native inputs grant nothing;
+  `TestEmbeddedImportDoesNotAuthorizeDLL` still passes.
+- Go reported findfunc bucket overflow (344 and 261 functions). New
+  `foldTextAliases` folds Rust/Itanium and local aliases, like the Darwin pass,
+  leaving 15 aliases from about 6,900.
+
+STILL BLOCKED in the repository: three read-only sections per architecture
+request 64-byte alignment, above the recorded 32-byte limit, and Go's PE path
+cannot request more. The limit was not changed. Only a scratch copy with the
+limit lowered got further: translation and successful linkage of the gpui-go
+counter for windows/amd64 and windows/arm64. Neither binary was executed; no
+Windows host or Wine was available. Issue 2's completion criterion
+(release:smoke on windows-2025 and windows-11-arm) is not met.
+
+Library set used for that link, for both architectures: kernel32 user32 gdi32
+ole32 oleaut32 shell32 shcore dwmapi imm32 propsys uxtheme advapi32 ws2_32
+userenv bcrypt ntdll d3d11 dxgi d3dcompiler_47 dwrite dcomp comctl32 ktmw32
+uiautomationcore windowsapp ucrtbase.
+
+Issue 4, `-linux-system-library`. Native execution in an Ubuntu 24.04 arm64
+container, using the evidence prelinked object (pl/combined.o): `-smoke` exit 0 at
+GOMAXPROCS 1 and 4. Controls: no flag gives 43 unresolved names; a nonexistent
+library gives `missing target library`. linux/amd64 was not run. Of the five
+libraries in gpui-go's patch, the object directly needs three: libxcb.so.1,
+libxkbcommon.so.0 and libxkbcommon-x11.so.0.
+
+Diagnostics. `-v`, `-vv`, `-trace`, `-report` and `-assume-consumer` on build,
+translate, inspect and doctor, in `cmd/bao/diagnostics.go`. Checks:
+- Plain and -v builds of the darwin/amd64 archive: 36 of 38 files byte-identical.
+  bao-build.json and bao-debug.json differ the same way between two plain runs
+  (random temp paths in the linker commands), which predates this work.
+  Plain and -v Windows failure: both exit 1, no package.
+- `inspect -v` on the pre-fix amd64 binary reports 4 flat-namespace binds. The
+  fixed binary reports none, with 792 manifest imports compared.
+- Ordinal corruption, true positive: an unconsolidated darwin/arm64 package with
+  a consumer importing net has 16 dylibs. Native execution aborts in dyld, and
+  `inspect -vv` names 53 binds, for example `_class_addIvar` at ordinal 0.
+- An early version compared the wrong manifest keys and reported a false OK with
+  1 import. It now reads the published keys, and an empty comparison is SKIPPED.
+
+Not implemented: `verified-build -v` findfunc classification; relocation tracing
+for COFF objects; final-bind checks for ELF and PE executables. `-trace` reads
+artifacts between stages rather than hooks inside each translator pass, so
+boundary synthesis and alias folding are labeled inferences. Handoff issues 3,
+5 and 6 were not addressed.
+
+Commands: `go test ./...`; scratch reproduction under `.work/handoff-20261109/`.
+
+## 2026-11-09: Opt-in Windows data alignment cap
+
+Supersedes the "STILL BLOCKED" result in the earlier 2026-11-09 gpui-go handoff
+entry. The 32-byte data limit and the recorded decision to fail above it remain the
+default. At the user's direction, `-windows-max-data-alignment 32` links read-only
+data sections requesting more at 32 bytes. Writable data, code and other values
+still fail. The generated runtime check uses the applied value. Capped sections
+appear in `windows_capped_alignments` in bao-manifest.json, on stderr, and as
+`BAO-COFF-ALIGNMENT-CAPPED` (WARN) in diagnostics.
+
+GPUI has three such sections on each architecture, all 64-byte requests. On arm64
+they are the pxfm EXP2FT table, zmij STATIC_DATA and utf_types UTF8_DATA; the
+amd64 archive merges them under `.rdata`. Whether any code relies on 64-byte
+alignment was not audited; the expected purpose is cache behavior.
+
+Verification on macOS 26.5.2 arm64 with Go 1.26.10, LLVM-MinGW 20261104 and the
+hosted archives from run 42562229131, using the 26 import libraries listed in the
+earlier entry plus the handoff's -link-archive set:
+- Negative control, no flag: exit 1 on both architectures, no package.
+- With the flag: translation exit 0; 677 amd64 and 663 arm64 objects. They are
+  byte-identical to the earlier scratch probe.
+- Successful linkage of gpui-go examples/counter (gpui, gpui_prebuilt,
+  gpui_headless, CGO_ENABLED=0): PE32+ x86-64 and PE32+ AArch64 executables.
+
+No Windows execution occurred. Neither the arm64 host nor the Intel Mac has Wine.
+Issue 2's completion criterion, release:smoke on windows-2025 and windows-11-arm,
+remains unmet until those hosted runners execute it.

@@ -187,6 +187,9 @@ func LowerTLSKeeping(o Object, keepSymbols []string) (TLSProbe, error) {
 	if err != nil {
 		return result, err
 	}
+	if _, err = m.localizeAMD64GOTReferences(result.Namespace); err != nil {
+		return result, err
+	}
 	result.LocalSymbolsRenamed = m.uniquifyLocals(result.Namespace)
 	data, err := m.encode()
 	if err != nil {

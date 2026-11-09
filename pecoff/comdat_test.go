@@ -226,3 +226,32 @@ func TestCOMDATUnwindSelection(t *testing.T) {
 		t.Fatal("losing COMDAT unwind records survived aggregation")
 	}
 }
+
+func TestFoldTextAliasesKeepsExportsAndRetargets(t *testing.T) {
+	a := fixture(pe.IMAGE_FILE_MACHINE_AMD64)
+	a.addSymbol("_RNvAlias", 1, 0)
+	a.addSymbol("_ZNalias", 1, 0)
+	a.addSymbol("c_api_alias", 1, 0)
+	a.addSymbol("_RNvOther", 1, 8)
+	a.sections[0].relocs = []pe.Reloc{{VirtualAddress: 4, Type: 4, SymbolTableIndex: 1}, {VirtualAddress: 8, Type: 4, SymbolTableIndex: 4}}
+	b := fixture(pe.IMAGE_FILE_MACHINE_AMD64)
+	b.names[0] = "second"
+	b.addSymbol("_RNvAlias", 0, 0)
+	b.sections[0].relocs = []pe.Reloc{{VirtualAddress: 4, Type: 4, SymbolTableIndex: 1}}
+	objects := []*object{a, b}
+	if n := foldTextAliases(objects, map[int]bool{0: true, 1: true}, map[string]bool{"example": true}); n != 2 {
+		t.Fatalf("folded %d", n)
+	}
+	if a.sections[0].relocs[0].SymbolTableIndex != 0 || a.sections[0].relocs[1].SymbolTableIndex != 4 {
+		t.Fatalf("relocations %+v", a.sections[0].relocs)
+	}
+	if a.symbols[1].SectionNumber != 0 || a.symbols[2].SectionNumber != 0 {
+		t.Fatal("aliases remain text definitions")
+	}
+	if a.symbols[0].SectionNumber != 1 || a.symbols[3].SectionNumber != 1 || a.symbols[4].SectionNumber != 1 {
+		t.Fatal("export, C API name, or distinct address was folded")
+	}
+	if b.names[1] != "example" {
+		t.Fatalf("cross-object reference %q", b.names[1])
+	}
+}

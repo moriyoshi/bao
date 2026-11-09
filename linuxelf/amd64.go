@@ -100,6 +100,7 @@ func (p *Plan) bindAMD64(images []*image, index map[string]string) error {
 	sort.Strings(names)
 	imports, missing := map[string]Import{}, map[string]bool{}
 	needed := p.requiredLibraries(images, index)
+	var unresolved []string
 	for _, name := range names {
 		library := index[name]
 		if weak[name] && !strong[name] && !needed[library] {
@@ -113,11 +114,15 @@ func (p *Plan) bindAMD64(images []*image, index map[string]string) error {
 				p.WeakZero = append(p.WeakZero, name)
 				continue
 			}
-			return fmt.Errorf("target sysroot does not export %s", name)
+			unresolved = append(unresolved, name)
+			continue
 		}
 		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: name, Library: library}
 		imports[name] = b
 		p.Imports = append(p.Imports, b)
+	}
+	if len(unresolved) != 0 {
+		return &UnresolvedError{Names: unresolved}
 	}
 	for oi, m := range images {
 		zeroCell, zeroCall := uint32(0), uint32(0)

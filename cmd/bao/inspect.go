@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"debug/elf"
+	"debug/macho"
 	"debug/pe"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -12,17 +14,60 @@ import (
 	"github.com/moriyoshi/bao/toolchain"
 )
 
+// inspectExecutable handles a built Mach-O program; other inputs fall through.
+func inspectExecutable(flags diagnosticFlags, path, manifest string, out io.Writer) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	f, err := macho.NewFile(bytes.NewReader(data))
+	if err != nil || f.Type != macho.TypeExec {
+		return false, nil
+	}
+	defer f.Close()
+	d := newDiagnosticSession(flags, "inspect", "darwin/executable", path, out)
+	if err := d.checkExecutable(f, data, manifest); err != nil {
+		return true, err
+	}
+	failures := d.failures()
+	d.report.Result = fmt.Sprintf("finished: %d failures; execution not verified", failures)
+	if d.printing() {
+		fmt.Fprintln(out, d.report.Result)
+	}
+	d.close()
+	if failures != 0 {
+		return true, fmt.Errorf("executable bind check found %d failures", failures)
+	}
+	return true, nil
+}
+
 func inspectNative(args []string, stdout, stderr io.Writer) error {
 	fs := newFlags("inspect", "inspect INPUT", "Inspect a Darwin object/archive, Linux ELF object, or Windows COFF object/archive. Reports do not prove a successful translation or execution.")
+	var diag diagnosticFlags
+	diag.register(fs)
+	manifest := fs.String("manifest", "", "bao-manifest.json to compare with a built executable's binds; requires -v")
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
 		return usage("inspect requires one input object or archive")
 	}
+	if diag.enabled() {
+		if handled, err := inspectExecutable(diag, fs.Arg(0), *manifest, stderr); handled {
+			return err
+		}
+	}
 	target, archive, err := toolchain.Detect(fs.Arg(0))
 	if err != nil {
 		return err
+	}
+	if d := diag.begin("inspect", target, fs.Arg(0), "", stderr); d != nil {
+		d.skip("generate", "inspect does not translate")
+		d.report.Result = "finished: input limits only; translation and execution not verified"
+		if d.printing() {
+			fmt.Fprintln(stderr, d.report.Result)
+		}
+		d.close()
 	}
 	if strings.HasPrefix(target.Name, "darwin/") {
 		return runLegacy(append([]string{"inspect"}, args...), stdout, stderr)

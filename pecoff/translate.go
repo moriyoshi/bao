@@ -8,7 +8,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"go/token"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/moriyoshi/bao/internal/ar"
@@ -20,12 +22,25 @@ type Options struct {
 	StripDebug bool
 	CXXRuntime string
 	CRT        string
+	// ImportLibraries are producer-named short-import libraries. Their IMPORT_CODE
+	// records fill names that neither Imports nor the built-in catalog bind.
+	// Import records embedded in native inputs never grant a binding.
+	ImportLibraries [][]byte
+	// MaxDataAlignment, when 32, lets read-only data sections requesting more
+	// than Go's PE reader can provide link at 32 bytes. Zero rejects them.
+	MaxDataAlignment uint32
 }
 type Import struct{ Local, Name, DLL string }
 type Table struct {
 	Symbol string
 	Count  int
 	Order  string
+}
+
+// CappedAlignment records a section linked below its requested alignment.
+type CappedAlignment struct {
+	Section            string `json:"section"`
+	Requested, Applied uint32
 }
 type Alignment struct {
 	Symbol string
@@ -40,6 +55,8 @@ type Plan struct {
 	UnwindRoots                   []Table
 	RemovedDebugSections          int
 	Alignments                    []Alignment
+	TextAliasesFolded             int
+	CappedAlignments              []CappedAlignment
 	Runtime                       bool
 	TLS                           TLSPlan
 	CInitializers                 []Table
@@ -286,6 +303,22 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 	default:
 		return nil, fmt.Errorf("unsupported Windows C++ runtime %q", opts.CXXRuntime)
 	}
+	if opts.MaxDataAlignment != 0 && opts.MaxDataAlignment != 32 {
+		return nil, fmt.Errorf("unsupported Windows maximum data alignment %d; only 32 is supported", opts.MaxDataAlignment)
+	}
+	libraryFunctions := map[string]bool{}
+	for i, library := range opts.ImportLibraries {
+		functions, err := importLibraryFunctions(library, objects[0].machine)
+		if err != nil {
+			return nil, fmt.Errorf("Windows import library %d: %w", i, err)
+		}
+		for name, dll := range functions {
+			if _, bound := imports[name]; !bound {
+				imports[name] = dll
+				libraryFunctions[name] = true
+			}
+		}
+	}
 	for n, d := range opts.Imports {
 		if !token.IsIdentifier(n) || !validDLL(d) {
 			return nil, fmt.Errorf("invalid Windows system import %q=%q", n, d)
@@ -315,7 +348,7 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 		}
 		selectedCount := len(queue)
 		needed = map[string]bool{}
-		var importError error
+		var unresolved ImportError
 		mismatches := map[string]string{}
 		strongScanned := map[int]bool{}
 		for qi := 0; qi < len(queue); qi++ {
@@ -406,16 +439,21 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 					}
 					base := strings.TrimPrefix(name, "__imp_")
 					if _, ok := imports[base]; !ok {
-						importError = fmt.Errorf("undefined Windows native symbol %q: supply an explicit system DLL mapping or a compatible native definition; CRT/TLS runtime support is not implicit", name)
+						unresolved.Undefined = append(unresolved.Undefined, name)
 						continue
 					}
 					directCall := p.Arch == "arm64" && r.Type == 3
 					if p.Arch == "amd64" && r.Type >= 4 && r.Type <= 9 && r.VirtualAddress > 0 && int(r.VirtualAddress) <= len(sec.data) {
 						opcode := sec.data[r.VirtualAddress-1]
 						directCall = opcode == 0xe8 || opcode == 0xe9
+						// A tail call can also be a near Jcc (0F 8x rel32). A RIP-relative
+						// ModRM byte is never in 0x80-0x8f, so this cannot be a data access.
+						if r.VirtualAddress > 1 && sec.data[r.VirtualAddress-2] == 0x0f && opcode&0xf0 == 0x80 {
+							directCall = true
+						}
 					}
-					if !strings.HasPrefix(name, "__imp_") && s.Type != 0x20 && !directCall && !knownFunctionImport(base) && !knownDataImport(base) {
-						importError = fmt.Errorf("bare Windows import %q must be a function; use an explicit dllimport declaration for IAT references", name)
+					if !strings.HasPrefix(name, "__imp_") && s.Type != 0x20 && !directCall && !libraryFunctions[base] && !knownFunctionImport(base) && !knownDataImport(base) {
+						unresolved.Bare = append(unresolved.Bare, name)
 						continue
 					}
 					needed[name] = true
@@ -425,8 +463,9 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 		if len(queue) != selectedCount {
 			continue
 		}
-		if importError != nil {
-			return nil, importError
+		if unresolved.any() {
+			unresolved.normalize()
+			return nil, &unresolved
 		}
 		break
 	}
@@ -488,6 +527,11 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 	if err := prepareTLS(objects, selected, p); err != nil {
 		return nil, err
 	}
+	exportNames := make(map[string]bool, len(opts.Symbols))
+	for _, name := range opts.Symbols {
+		exportNames[name] = true
+	}
+	p.TextAliasesFolded = foldTextAliases(objects, selected, exportNames)
 	for oi, o := range objects {
 		if !selected[oi] {
 			continue
@@ -557,8 +601,12 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 			if s.flags&pe.IMAGE_SCN_CNT_CODE != 0 {
 				limit = 16
 			}
+			if alignment > limit && opts.MaxDataAlignment == limit && s.flags&(pe.IMAGE_SCN_CNT_CODE|pe.IMAGE_SCN_MEM_EXECUTE|pe.IMAGE_SCN_MEM_WRITE) == 0 {
+				p.CappedAlignments = append(p.CappedAlignments, CappedAlignment{s.name, alignment, limit})
+				alignment = limit
+			}
 			if alignment > limit {
-				return nil, fmt.Errorf("COFF section %s requests alignment %d beyond the checked stock-Go profile %d", s.name, alignment, limit)
+				return nil, fmt.Errorf("COFF section %s requests alignment %d beyond the checked stock-Go profile %d; -windows-max-data-alignment 32 accepts this for read-only data only", s.name, alignment, limit)
 			}
 			if s.flags&pe.IMAGE_SCN_CNT_CODE == 0 && !(p.Arch == "amd64" && (s.name == ".pdata" || s.name == ".xdata")) {
 				// Go 1.26.10 infers data alignment up to 32 from section size.
@@ -715,6 +763,83 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 		return p.Terminators[i].Order < p.Terminators[j].Order
 	})
 	return p, nil
+}
+
+// importLibraryFunctions reads a short-import library for one machine. Only
+// by-name IMPORT_CODE records count: a data export cannot be reached through a
+// code stub, and ordinal or undecorated forms need a name this model lacks.
+func importLibraryFunctions(library []byte, machine uint16) (map[string]string, error) {
+	members, err := ar.Parse(library)
+	if err != nil {
+		return nil, err
+	}
+	functions := map[string]string{}
+	records := 0
+	for _, m := range members {
+		d := m.Data
+		if len(d) < 20 || binary.LittleEndian.Uint16(d) != 0 || binary.LittleEndian.Uint16(d[2:]) != 0xffff || binary.LittleEndian.Uint16(d[6:]) != machine {
+			continue
+		}
+		size := binary.LittleEndian.Uint32(d[12:])
+		if uint64(size) > uint64(len(d)-20) {
+			return nil, fmt.Errorf("member %q: truncated import record", m.Name)
+		}
+		fields := bytes.SplitN(d[20:20+size], []byte{0}, 3)
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("member %q: malformed import record", m.Name)
+		}
+		records++
+		kind := binary.LittleEndian.Uint16(d[18:])
+		name, dll := string(fields[0]), string(fields[1])
+		if kind&3 != 0 || kind>>2&7 != 1 || !token.IsIdentifier(name) || !validDLL(dll) {
+			continue
+		}
+		if _, ok := functions[name]; !ok {
+			functions[name] = strings.ToLower(dll)
+		}
+	}
+	if records == 0 {
+		return nil, fmt.Errorf("no short import records for machine %#x", machine)
+	}
+	return functions, nil
+}
+
+// ImportError lists every native reference that has no binding. Resolution
+// finishes the selected object set first, so one run reports all of them.
+type ImportError struct {
+	Undefined []string // no native definition and no system DLL mapping
+	Bare      []string // mapped, but not provably a function reference
+}
+
+func (e *ImportError) any() bool { return len(e.Undefined)+len(e.Bare) != 0 }
+
+func (e *ImportError) normalize() {
+	for _, names := range []*[]string{&e.Undefined, &e.Bare} {
+		sort.Strings(*names)
+		*names = slices.Compact(*names)
+	}
+}
+
+func (e *ImportError) Error() string {
+	var parts []string
+	quote := func(names []string) string {
+		quoted := make([]string, len(names))
+		for i, name := range names {
+			quoted[i] = strconv.Quote(name)
+		}
+		return strings.Join(quoted, ", ")
+	}
+	switch len(e.Undefined) {
+	case 0:
+	case 1:
+		parts = append(parts, "undefined Windows native symbol "+quote(e.Undefined)+": supply an explicit system DLL mapping or a compatible native definition; CRT/TLS runtime support is not implicit")
+	default:
+		parts = append(parts, fmt.Sprintf("%d undefined Windows native symbols: %s: supply explicit system DLL mappings or compatible native definitions; CRT/TLS runtime support is not implicit", len(e.Undefined), quote(e.Undefined)))
+	}
+	if len(e.Bare) != 0 {
+		parts = append(parts, "bare Windows import "+quote(e.Bare)+" must be a function; use an explicit dllimport declaration for IAT references")
+	}
+	return strings.Join(parts, "; ")
 }
 
 func validDLL(d string) bool {

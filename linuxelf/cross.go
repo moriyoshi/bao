@@ -466,6 +466,7 @@ func (p *Plan) bindCross(images []*image, index map[string]string) error {
 	bindings := map[string]Import{}
 	missing := map[string]bool{}
 	needed := p.requiredLibraries(images, index)
+	var unresolved []string
 	for _, n := range names {
 		lib := index[n]
 		if weak[n] && !strong[n] && !needed[lib] {
@@ -479,11 +480,15 @@ func (p *Plan) bindCross(images []*image, index map[string]string) error {
 				p.WeakZero = append(p.WeakZero, n)
 				continue
 			}
-			return fmt.Errorf("target sysroot does not export %s", n)
+			unresolved = append(unresolved, n)
+			continue
 		}
 		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: n, Library: lib}
 		bindings[n] = b
 		p.Imports = append(p.Imports, b)
+	}
+	if len(unresolved) != 0 {
+		return &UnresolvedError{Names: unresolved}
 	}
 	for oi, m := range images {
 		for si := range m.sections {

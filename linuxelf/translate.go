@@ -119,12 +119,39 @@ func ValidateSysrootTarget(root, arch string) error {
 	return err
 }
 
-func systemSymbolsMachine(root string, machine elf.Machine) (map[string]string, error) {
+// validSystemLibrary accepts a shared-object file name, never a path.
+func validSystemLibrary(name string) bool {
+	if len(name) > 128 || !strings.Contains(name, ".so") || strings.HasPrefix(name, "-") || strings.Contains(name, "..") {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == '+') {
+			return false
+		}
+	}
+	return true
+}
+
+func systemSymbolsMachine(root string, machine elf.Machine, extra ...string) (map[string]string, error) {
 	if root == "" {
 		return nil, fmt.Errorf("-sysroot containing Linux arm64 glibc libraries is required")
 	}
+	required := map[string]bool{"libc.so.6": true, "libgcc_s.so.1": true}
+	seen := map[string]bool{}
+	for _, name := range extra {
+		if !validSystemLibrary(name) {
+			return nil, fmt.Errorf("invalid Linux system library %q: use a shared-object file name such as libfoo.so.1", name)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate Linux system library %s", name)
+		}
+		seen[name] = true
+		required[name] = true
+	}
 	index := map[string]string{}
-	for _, name := range []string{"libc.so.6", "libm.so.6", "libgcc_s.so.1", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libstdc++.so.6", "ld64.so.2", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1", "ld-linux-loongarch-lp64d.so.1"} {
+	// The glibc/C++ runtime set stays first: an extra library cannot replace one
+	// of its symbols, because the first exporter of a name wins below.
+	for _, name := range append([]string{"libc.so.6", "libm.so.6", "libgcc_s.so.1", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libstdc++.so.6", "ld64.so.2", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1", "ld-linux-loongarch-lp64d.so.1"}, extra...) {
 		var path string
 		for _, dir := range []string{"lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu", "lib/loongarch64-linux-gnu", "usr/lib/loongarch64-linux-gnu", "lib/powerpc64le-linux-gnu", "usr/lib/powerpc64le-linux-gnu", "lib64", "lib", "usr/lib64", "usr/lib"} {
 			candidate := filepath.Join(root, dir, name)
@@ -134,7 +161,7 @@ func systemSymbolsMachine(root string, machine elf.Machine) (map[string]string, 
 			}
 		}
 		if path == "" {
-			if name == "libc.so.6" || name == "libgcc_s.so.1" {
+			if required[name] {
 				return nil, fmt.Errorf("missing target library %s", name)
 			}
 			continue
@@ -166,7 +193,120 @@ func systemSymbolsMachine(root string, machine elf.Machine) (map[string]string, 
 	return index, nil
 }
 
+// sysrootObjects lists shared objects in a sysroot's library directories for one
+// machine, in search order. A base name found earlier hides later copies.
+func sysrootObjects(root string, machine elf.Machine) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, dir := range []string{"lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu", "lib/loongarch64-linux-gnu", "usr/lib/loongarch64-linux-gnu", "lib/powerpc64le-linux-gnu", "usr/lib/powerpc64le-linux-gnu", "lib64", "lib", "usr/lib64", "usr/lib"} {
+		matches, err := filepath.Glob(filepath.Join(root, dir, "*.so.*"))
+		if err != nil {
+			return nil, err
+		}
+		sort.Strings(matches)
+		for _, path := range matches {
+			base := filepath.Base(path)
+			if seen[base] {
+				continue
+			}
+			f, err := elf.Open(path)
+			if err != nil {
+				continue
+			}
+			ok := f.Machine == machine && f.Type == elf.ET_DYN
+			f.Close()
+			if ok {
+				seen[base] = true
+				out = append(out, path)
+			}
+		}
+	}
+	return out, nil
+}
+
+func linuxMachine(arch string) (elf.Machine, error) {
+	machine := map[string]elf.Machine{"arm64": elf.EM_AARCH64, "amd64": elf.EM_X86_64, "loong64": elf.EM_LOONGARCH, "ppc64le": elf.EM_PPC64}[arch]
+	if machine == elf.EM_NONE {
+		return machine, fmt.Errorf("unsupported Linux architecture %s", arch)
+	}
+	return machine, nil
+}
+
+// SearchableLibraries names every shared object Exporters would examine.
+func SearchableLibraries(root, arch string) ([]string, error) {
+	machine, err := linuxMachine(arch)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := sysrootObjects(root, machine)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(paths))
+	for i, path := range paths {
+		names[i] = filepath.Base(path)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// Exporters finds which sysroot shared objects export each name. It is advisory
+// and never adds a library to a translation; that takes -linux-system-library.
+func Exporters(root, arch string, names []string) (map[string][]string, error) {
+	machine, err := linuxMachine(arch)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := sysrootObjects(root, machine)
+	if err != nil {
+		return nil, err
+	}
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	out := map[string][]string{}
+	for _, path := range paths {
+		f, err := elf.Open(path)
+		if err != nil {
+			continue
+		}
+		syms, err := f.DynamicSymbols()
+		f.Close()
+		if err != nil {
+			continue
+		}
+		for _, s := range syms {
+			if s.Section != elf.SHN_UNDEF && elf.ST_BIND(s.Info) != elf.STB_LOCAL && wanted[s.Name] {
+				out[s.Name] = append(out[s.Name], filepath.Base(path))
+			}
+		}
+	}
+	return out, nil
+}
+
+// UnresolvedError lists every import absent from the searched sysroot libraries.
+type UnresolvedError struct{ Names []string }
+
+func (e *UnresolvedError) Error() string {
+	if len(e.Names) == 1 {
+		return "target sysroot does not export " + e.Names[0]
+	}
+	return fmt.Sprintf("target sysroot does not export %d symbols: %s", len(e.Names), strings.Join(e.Names, ", "))
+}
+
+// Options configures TranslateWithOptions.
+type Options struct {
+	// SystemLibraries names additional sysroot shared objects, such as
+	// libxcb.so.1, whose exports may satisfy native imports. Each must exist.
+	SystemLibraries []string
+}
+
 func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
+	return TranslateWithOptions(input, sysroot, exports, Options{})
+}
+
+func TranslateWithOptions(input []byte, sysroot string, exports []string, opts Options) (*Plan, error) {
 	main, err := parse(input)
 	if err != nil {
 		return nil, err
@@ -349,7 +489,7 @@ func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
 		p.Finalizers[i], p.Finalizers[j] = p.Finalizers[j], p.Finalizers[i]
 	}
 	sort.SliceStable(p.Finalizers, func(i, j int) bool { return p.Finalizers[i].Priority > p.Finalizers[j].Priority })
-	index, err := systemSymbolsMachine(sysroot, main.effectiveMachine())
+	index, err := systemSymbolsMachine(sysroot, main.effectiveMachine(), opts.SystemLibraries...)
 	if err != nil {
 		return nil, err
 	}
@@ -567,6 +707,7 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 	bindings := map[string]Import{}
 	missing := map[string]bool{}
 	needed := p.requiredLibraries(images, index)
+	var unresolved []string
 	for _, name := range names {
 		lib := index[name]
 		if weak[name] && !strong[name] && !needed[lib] {
@@ -580,11 +721,15 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 				p.WeakZero = append(p.WeakZero, name)
 				continue
 			}
-			return fmt.Errorf("target sysroot does not export %s", name)
+			unresolved = append(unresolved, name)
+			continue
 		}
 		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: name, Library: lib}
 		p.Imports = append(p.Imports, b)
 		bindings[name] = b
+	}
+	if len(unresolved) != 0 {
+		return &UnresolvedError{Names: unresolved}
 	}
 	for oi, m := range images {
 		for si := range m.sections {

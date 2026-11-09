@@ -151,6 +151,16 @@ func (p *TLSProbe) BindSystemImports(sdk string) error {
 	return p.bindSystemImports(index)
 }
 
+// UnresolvedError lists every import the macOS SDK does not export.
+type UnresolvedError struct{ Names []string }
+
+func (e *UnresolvedError) Error() string {
+	if len(e.Names) == 1 {
+		return fmt.Sprintf("system SDK does not export %s for macOS/arm64", e.Names[0])
+	}
+	return fmt.Sprintf("system SDK does not export %d symbols for macOS/arm64: %s", len(e.Names), strings.Join(e.Names, ", "))
+}
+
 func (p *TLSProbe) bindSystemImports(index map[string]string) error {
 	models := make([]*objectImage, len(p.Objects))
 	defined := make(map[string]bool)
@@ -179,14 +189,19 @@ func (p *TLSProbe) bindSystemImports(index map[string]string) error {
 	}
 	sort.Strings(names)
 	bindings := make(map[string]ImportBinding)
+	var unresolved []string
 	for i, name := range names {
 		lib, ok := index[name]
 		if !ok {
-			return fmt.Errorf("system SDK does not export %s for macOS/arm64", name)
+			unresolved = append(unresolved, name)
+			continue
 		}
 		binding := ImportBinding{Original: name, Local: fmt.Sprintf("%simport_%d", p.Namespace, i), Remote: strings.TrimPrefix(name, "_"), Library: lib}
 		bindings[name] = binding
 		p.Imports = append(p.Imports, binding)
+	}
+	if len(unresolved) != 0 {
+		return &UnresolvedError{Names: unresolved}
 	}
 	for oi, m := range models {
 		callSymbols := make(map[string]uint32)
