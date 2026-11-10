@@ -3,6 +3,7 @@ package linuxelf
 import (
 	"bytes"
 	"debug/elf"
+	"strings"
 	"testing"
 )
 
@@ -62,5 +63,45 @@ func TestStripELFFileSymbolWithoutDebugSections(t *testing.T) {
 	second, n, err := StripDebug(stripped)
 	if err != nil || n != 0 || !bytes.Equal(second, stripped) {
 		t.Fatal("file-symbol-only stripping is not idempotent", err)
+	}
+}
+
+func TestStripELFBitcodeKeepsDebugAndRuntime(t *testing.T) {
+	bitcode := []byte("BC\xc0\xdeEMBEDDED-LLVM-BITCODE")
+	m := &image{machine: elf.EM_AARCH64, sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 4, data: []byte{0xc0, 0x03, 0x5f, 0xd6}}, {name: ".llvmbc", typ: elf.SHT_PROGBITS, flags: elf.SectionFlag(0x80000000), align: 1, size: uint64(len(bitcode)), data: bitcode}, {name: ".llvmcmd", typ: elf.SHT_PROGBITS, flags: elf.SectionFlag(0x80000000), align: 1, size: 3, data: []byte("-O3")}, {name: ".debug_info", typ: elf.SHT_PROGBITS, align: 1, size: 5, data: []byte("DEBUG")}, {name: ".data", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8, size: 8, data: make([]byte, 8), relocs: []reloc{{off: 0, sym: 1, typ: elf.R_AARCH64(elf.R_AARCH64_ABS64)}}}}, symbols: []symbol{{}, {name: "native_fn", info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC), sect: 1, size: 4}, {name: "llvm.embedded.module", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_OBJECT), sect: 2, size: uint64(len(bitcode))}, {name: "source.c", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_FILE), sect: uint16(elf.SHN_ABS)}}}
+	original, err := m.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := bytes.Clone(original)
+	stripped, n, size, err := StripBitcode(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || size != uint64(len(bitcode)+3) || !bytes.Equal(original, before) || bytes.Contains(stripped, bitcode) {
+		t.Fatalf("bitcode count %d/%d, payload remained or original was mutated", n, size)
+	}
+	f, err := elf.NewFile(bytes.NewReader(stripped))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if f.Section(".llvmbc") != nil || f.Section(".llvmcmd") != nil || f.Section(".debug_info") == nil || f.Section(".data") == nil {
+		t.Fatal("bitcode/debug/runtime section distinction lost")
+	}
+	if !bytes.Contains(stripped, []byte("source.c")) || bytes.Contains(stripped, []byte("llvm.embedded.module")) {
+		t.Fatal("bitcode stripping changed non-bitcode symbols")
+	}
+	second, n, _, err := StripBitcode(stripped)
+	if err != nil || n != 0 || !bytes.Equal(second, stripped) {
+		t.Fatal("bitcode stripping is not idempotent", err)
+	}
+	m.sections[5].relocs[0].sym = 2
+	live, err := m.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := StripBitcode(live); err == nil || !strings.Contains(err.Error(), "LLVM bitcode") {
+		t.Fatal("runtime reference to bitcode was not rejected", err)
 	}
 }

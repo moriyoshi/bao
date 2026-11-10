@@ -70,16 +70,33 @@ func generateWithBindings(o nativeFlags, target toolchain.Target, input, output 
 		return err
 	}
 	translated := original
-	removed := 0
-	if o.stripDebug {
-		if strings.HasPrefix(target.Name, "darwin/") {
-			translated, removed, err = translate.StripDebug(original)
+	removed, bitcodeSections := 0, 0
+	bitcodeBytes := uint64(0)
+	darwin := strings.HasPrefix(target.Name, "darwin/")
+	if o.stripBitcode {
+		if darwin {
+			translated, bitcodeSections, bitcodeBytes, err = translate.StripBitcode(translated)
 		} else {
-			translated, removed, err = linuxelf.StripDebug(original)
+			translated, bitcodeSections, bitcodeBytes, err = linuxelf.StripBitcode(translated)
+		}
+		if err != nil {
+			return fmt.Errorf("strip embedded LLVM bitcode: %w", err)
+		}
+		if bitcodeSections != 0 {
+			fmt.Fprintf(stderr, "Dropped %d bytes of embedded LLVM bitcode from %d sections\n", bitcodeBytes, bitcodeSections)
+		}
+	}
+	if o.stripDebug {
+		if darwin {
+			translated, removed, err = translate.StripDebug(translated)
+		} else {
+			translated, removed, err = linuxelf.StripDebug(translated)
 		}
 		if err != nil {
 			return fmt.Errorf("strip native debug information: %w", err)
 		}
+	}
+	if o.stripDebug || bitcodeSections != 0 {
 		work, err := os.MkdirTemp(filepath.Dir(output), ".bao-strip-")
 		if err != nil {
 			return err
@@ -99,13 +116,16 @@ func generateWithBindings(o nativeFlags, target toolchain.Target, input, output 
 		}
 	}
 	debug := struct {
-		Stripped   bool   `json:"stripped"`
-		Sections   int    `json:"removed_sections"`
-		Symbols    int    `json:"removed_symbols"`
-		Original   string `json:"original_sha256"`
-		Translated string `json:"stripped_sha256"`
-		Unwind     bool   `json:"runtime_unwind_preserved"`
-	}{o.stripDebug, removed, max(0, nativeSymbolCount(original)-nativeSymbolCount(translated)), fmt.Sprintf("%x", sha256.Sum256(original)), fmt.Sprintf("%x", sha256.Sum256(translated)), true}
+		Stripped        bool   `json:"stripped"`
+		Sections        int    `json:"removed_sections"`
+		Symbols         int    `json:"removed_symbols"`
+		BitcodeStripped bool   `json:"bitcode_stripped"`
+		BitcodeSections int    `json:"removed_bitcode_sections"`
+		BitcodeBytes    uint64 `json:"removed_bitcode_bytes"`
+		Original        string `json:"original_sha256"`
+		Translated      string `json:"stripped_sha256"`
+		Unwind          bool   `json:"runtime_unwind_preserved"`
+	}{o.stripDebug, removed, max(0, nativeSymbolCount(original)-nativeSymbolCount(translated)), o.stripBitcode, bitcodeSections, bitcodeBytes, fmt.Sprintf("%x", sha256.Sum256(original)), fmt.Sprintf("%x", sha256.Sum256(translated)), true}
 	b, err := json.MarshalIndent(debug, "", "  ")
 	if err != nil {
 		return err

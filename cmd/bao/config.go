@@ -27,6 +27,7 @@ type buildConfig struct {
 	Symbols              []string        `json:"symbols"`
 	Bindings             json.RawMessage `json:"bindings"`
 	StripDebug           *bool           `json:"strip_debug"`
+	StripBitcode         *bool           `json:"strip_bitcode"`
 	LinkArchives         []string        `json:"link_archives"`
 	LinkNotices          []string        `json:"link_notices"`
 	RequireStaticRuntime *bool           `json:"require_static_runtime"`
@@ -198,6 +199,7 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 		func() error { return setText("package", s.Package) },
 		func() error { return set("symbol", s.Symbols...) },
 		func() error { return setBool("strip-debug", s.StripDebug) },
+		func() error { return setBool("strip-bitcode", s.StripBitcode) },
 		func() error { return setPaths("link-archive", s.LinkArchives...) },
 		func() error { return setPaths("link-notice", s.LinkNotices...) },
 		func() error { return setBool("require-static-runtime", s.RequireStaticRuntime) },

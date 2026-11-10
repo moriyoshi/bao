@@ -95,7 +95,7 @@ func generateWindows(o nativeFlags, target toolchain.Target, input, output strin
 		manifest["windows_capped_alignments"] = p.CappedAlignments
 		fmt.Fprintf(stderr, "linked %d read-only sections below their requested alignment; see windows_capped_alignments in bao-manifest.json\n", len(p.CappedAlignments))
 	}
-	for name, data := range map[string]any{"bao-manifest.json": manifest, "bao-debug.json": map[string]any{"stripped": o.stripDebug, "removed_sections": p.RemovedDebugSections, "original_sha256": fmt.Sprintf("%x", sha256.Sum256(b)), "runtime_unwind_preserved": true}} {
+	for name, data := range map[string]any{"bao-manifest.json": manifest, "bao-debug.json": map[string]any{"stripped": o.stripDebug, "removed_sections": p.RemovedDebugSections, "bitcode_stripped": true, "removed_bitcode_sections": p.RemovedBitcodeSections, "removed_bitcode_bytes": p.RemovedBitcodeBytes, "original_sha256": fmt.Sprintf("%x", sha256.Sum256(b)), "runtime_unwind_preserved": true}} {
 		buf, err := json.MarshalIndent(data, "", "  ")
 		if err != nil {
 			return err
@@ -103,6 +103,9 @@ func generateWindows(o nativeFlags, target toolchain.Target, input, output strin
 		if err = os.WriteFile(filepath.Join(output, name), append(buf, '\n'), 0644); err != nil {
 			return err
 		}
+	}
+	if p.RemovedBitcodeSections != 0 {
+		fmt.Fprintf(stderr, "Dropped %d bytes of embedded LLVM bitcode from %d sections\n", p.RemovedBitcodeBytes, p.RemovedBitcodeSections)
 	}
 	fmt.Fprintf(stderr, "translated %d Windows %s COFF objects; %d system imports, %d initializer tables, %d native unwind tables; verify execution on Windows separately\n", len(p.Objects), p.Arch, len(p.Imports), len(p.Constructors), len(p.Unwind))
 	return nil

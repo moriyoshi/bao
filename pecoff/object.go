@@ -89,24 +89,40 @@ func debugSection(s string) bool {
 // StripDebug removes debug payloads, file records and their unreferenced symbols.
 // Section numbering stays stable for associative COMDAT metadata.
 func StripDebug(input []byte) ([]byte, int, error) {
-	return strip(input, true)
+	b, r, err := strip(input, true)
+	return b, r.debug + r.bitcode, err
 }
 
-func strip(input []byte, debug bool) ([]byte, int, error) {
+func bitcodeSection(s string) bool {
+	return s == ".llvmbc" || s == ".llvmcmd"
+}
+
+type stripped struct {
+	debug, bitcode int
+	bitcodeBytes   uint64
+}
+
+func strip(input []byte, debug bool) ([]byte, stripped, error) {
+	var r stripped
 	o, err := parse(input)
 	if err != nil {
-		return nil, 0, err
+		return nil, r, err
 	}
 	removed := map[int16]bool{}
-	count := 0
 	for i, s := range o.sections {
-		// Linker-remove payloads (including Rust's embedded LLVM bitcode)
-		// have no runtime address, even when retaining debug information.
-		if debug && debugSection(s.name) || s.flags&imageSCNLinkRemove != 0 {
-			removed[int16(i+1)] = true
-			count++
-			o.sections[i] = section{name: ".bao.drop", flags: pe.IMAGE_SCN_MEM_DISCARDABLE}
+		// Linker-remove payloads, including Rust's embedded LLVM bitcode and
+		// its command line, have no runtime address. They are always dropped.
+		switch {
+		case bitcodeSection(s.name):
+			r.bitcode++
+			r.bitcodeBytes += uint64(s.size)
+		case debug && debugSection(s.name) || s.flags&imageSCNLinkRemove != 0:
+			r.debug++
+		default:
+			continue
 		}
+		removed[int16(i+1)] = true
+		o.sections[i] = section{name: ".bao.drop", flags: pe.IMAGE_SCN_MEM_DISCARDABLE}
 	}
 	remap := map[uint32]uint32{}
 	var syms []pe.COFFSymbol
@@ -124,17 +140,17 @@ func strip(input []byte, debug bool) ([]byte, int, error) {
 	}
 	for si := range o.sections {
 		for ri := range o.sections[si].relocs {
-			r := &o.sections[si].relocs[ri]
-			idx, ok := remap[r.SymbolTableIndex]
+			rel := &o.sections[si].relocs[ri]
+			idx, ok := remap[rel.SymbolTableIndex]
 			if !ok {
-				return nil, 0, fmt.Errorf("retained COFF relocation references discarded debug symbol")
+				return nil, r, fmt.Errorf("retained COFF relocation in %s references a discarded debug or LLVM bitcode symbol", o.sections[si].name)
 			}
-			r.SymbolTableIndex = idx
+			rel.SymbolTableIndex = idx
 		}
 	}
 	o.symbols, o.names = syms, names
 	b, err := o.encode()
-	return b, count, err
+	return b, r, err
 }
 
 // Go's COFF reader cannot represent associative COMDATs or repeated section

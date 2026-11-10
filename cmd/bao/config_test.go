@@ -41,14 +41,14 @@ func configFlags(t *testing.T, name, body string, args ...string) (*nativeFlags,
 }
 
 func TestConfigSelectOnlyTheTargetSection(t *testing.T) {
-	body := `{"schema":1,"package":"gen","symbols":["a","b"],"strip_debug":false,
+	body := `{"schema":1,"package":"gen","symbols":["a","b"],"strip_debug":false,"strip_bitcode":false,
 	"linux":{"sysroot":"/root","system_libraries":["libxcb.so.1"]},
 	"windows":{"imports":{"Zed":"z.dll","Abc":"a.dll"},"cxx_runtime":"libc++","crt":"msvcrt","max_data_alignment":32}}`
 	o, _, _, err := configFlags(t, "build", body, "-target", "windows/arm64")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.pkg != "gen" || o.stripDebug || strings.Join(o.symbols, ",") != "a,b" {
+	if o.pkg != "gen" || o.stripDebug || o.stripBitcode || strings.Join(o.symbols, ",") != "a,b" {
 		t.Fatalf("common config: %+v", o)
 	}
 	if strings.Join(o.windowsImports, ",") != "Abc=a.dll,Zed=z.dll" || o.windowsCXXRuntime != "libc++" || o.windowsCRT != "msvcrt" || o.windowsMaxDataAlignment != 32 {

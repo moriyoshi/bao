@@ -45,10 +45,24 @@ func TestLinkerRemovePayloadHasNoRuntimeAddress(t *testing.T) {
 		if bytes.Contains(p.Objects[0], []byte("BITCODE")) || len(p.Alignments) != 0 {
 			t.Fatal("nonruntime bitcode was retained or given an accessor")
 		}
+		if p.RemovedBitcodeSections != 1 || p.RemovedBitcodeBytes != 7 || p.RemovedDebugSections != 0 {
+			t.Fatal("bitcode removal was not reported separately", p.RemovedBitcodeSections, p.RemovedBitcodeBytes, p.RemovedDebugSections)
+		}
 		o.sections[0].relocs = []pe.Reloc{{Type: 1, SymbolTableIndex: 1}}
 		if _, err := Translate(encoded(t, o), Options{Symbols: []string{"example"}, StripDebug: debug}); err == nil {
 			t.Fatal("runtime reference into removed bitcode accepted")
 		}
+	}
+}
+func TestBitcodeSectionsDroppedWithoutLinkRemoveFlag(t *testing.T) {
+	o := fixture(pe.IMAGE_FILE_MACHINE_AMD64)
+	o.sections = append(o.sections, section{name: ".llvmbc", flags: pe.IMAGE_SCN_MEM_READ | pe.IMAGE_SCN_CNT_INITIALIZED_DATA, size: 7, data: []byte("BITCODE")}, section{name: ".llvmcmd", flags: pe.IMAGE_SCN_MEM_READ | pe.IMAGE_SCN_CNT_INITIALIZED_DATA, size: 7, data: []byte("CMDLINE")})
+	p, err := Translate(encoded(t, o), Options{Symbols: []string{"example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(p.Objects[0], []byte("BITCODE")) || bytes.Contains(p.Objects[0], []byte("CMDLINE")) || p.RemovedBitcodeSections != 2 || p.RemovedBitcodeBytes != 14 {
+		t.Fatal("unflagged embedded bitcode was retained or not reported")
 	}
 }
 func TestTLSImportAliasIsBounded(t *testing.T) {
