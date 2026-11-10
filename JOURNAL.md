@@ -4072,3 +4072,72 @@ each push to a branch with an open pull request started two identical runs. The
 and `workflow_call`. Branches without a pull request get no automatic run and
 can be checked with a manual dispatch. Commits landing on main are no longer
 built after merge; they are covered by the pull request run that preceded them.
+
+## 2026-11-10: Table-driven generated init for large native libraries
+
+gpui-go native-release run 42748259431 (bao 18c47c8, Go 1.26.10, windows-11-arm)
+failed in the smoke `go build` of the generated windows/arm64 package: "VirtualAlloc
+of 9193357312 bytes failed" in cmd/compile ssa prove (poset.aliasnodes) while
+compiling one function. The Windows generator wrote a straight-line init with one
+statement or if+panic per import, data import, section alignment and unwind root,
+one append per ARM64 unwind table, and one loop per initializer table. The prove
+pass is superlinear in the branches of one function. The Linux ELF generator
+(fixups, local fixups with an overflow check, FDE registration, init/fini tables)
+and the Darwin TLS generator (fixups, per-section FDE loops, constructor tables)
+had the same pattern.
+
+Change: per-entry native addresses are now file-local assembler tables
+(`DATA name<>+off(SB)/8, $symbol(SB)` plus one accessor), and constants (DLL and
+import names, alignments, counts, addends, .ctors reversal, FDE offsets) are
+package-level Go arrays. Init walks each kind with one loop and one panic site;
+ARM64 functionRecords is sized up front. Error messages, init order and the
+source spellings that bao-verify negative controls patch (`callConstructor(p)`,
+`callConstructor(fn)`, `registerFunctionTable(unwindAddress`,
+`registerFrame(unwindAddress`, `registerFrame(`) are kept. A Go table of
+accessor func values was rejected: each asm function referenced as a value gets
+a compiler ABI wrapper, and a 200,000-entry prototype peaked at 4.3 GB RSS
+against 40 MB for the data-table form (windows/arm64, go1.27.3).
+Darwin dynamic-import addresses stay accessor functions (one per distinct
+import), since they resolve through the linker's GOT. Generated Windows source
+generation moved to `windowsSource`, Linux to `linuxSource`, Darwin to
+`darwinSource`, so tests can feed synthetic plans.
+
+Tests (cmd/bao/tables_test.go): TestGeneratedCodeDoesNotGrowWithTables checks,
+for windows amd64/arm64, Linux and Darwin, that function bodies (statements and
+calls) and assembler TEXT counts are identical for 3 and 1000 entries per table,
+and that output is deterministic. Negative control: re-unrolling only the Windows
+alignment check makes it fail (IfStmt 13 vs 1010). TestLargeGeneratedPackagesCompile
+(skipped with -short) compiles 40,000 entries per table against a stub purego
+module and bounds go build peak RSS at 1.5 GiB; measured on macOS 26.5.2 arm64,
+go1.27.3: windows/amd64 368 MiB, windows/arm64 405 MiB, linux/amd64 171 MiB,
+darwin/arm64 147 MiB (cross builds, compile and asm only, no link).
+
+Real library, macOS 26.5.2 arm64, Go 1.26.10, LLVM-MinGW 20261104 aarch64 prefix,
+the gpui-native-v0.0.0-windows-arm64.lib artifact of run 42748259431 and
+dist/bao.config.json at gpui-go 0ef32f4:
+- New bao: 664 objects, 395 imports, 45,204 alignment entries, 652 unwind
+  tables, 3 constructor tables; 3,072-line Go file, 49,155-line assembler file.
+  Compile of the package from a cold cache: 2 s, 253 MB summed compile RSS
+  (watchdog script .work/large-tables/watch.sh). Linking a CGO_ENABLED=0 main
+  that imports it: 1.9 s, 425 MB peak; PE32+ AArch64.
+- Negative control, bao 18c47c8 on the same input: byte-identical syso objects,
+  183,056-line Go file; compile passed 8.1 GB RSS within 8 s and was killed.
+- That executable's init (imports, 45,204 alignment checks, unwind registration,
+  constructors) exited 0 under arm64 Wine 10.0~repack-6 (image
+  bao-wine-arm64:20261108 rebuilt from .work/windows-wine/Dockerfile). Negative
+  control: one alignment entry set to 1 << 40 panics "native COFF section
+  alignment". Emulated, not native Windows.
+
+bao-verify with bao and bao-verify built by Go 1.26.10 (artifacts under
+.work/large-tables/):
+- windows suite, clang driver, LLVM-MinGW 20261104: windows/amd64 under Wine
+  11.21 on macOS/Rosetta and windows/arm64 under the arm64 Wine image: PASS,
+  including constructor and unwind negative controls.
+- darwin/arm64 native: tls, cpp and darwin suites PASS.
+- linux/arm64 in Docker: linux and cpp suites PASS (cpp after pulling its pinned
+  gcc image, which the first attempt lacked).
+- `go test ./...` (go1.27.3), `CGO_ENABLED=0 go vet ./...`, Windows amd64/arm64
+  test compiles of cmd/bao, and git diff --check passed. Bazel was not run.
+
+Not checked: native windows-2025 and windows-11-arm execution, Linux amd64,
+loong64 and ppc64le execution, darwin/amd64. gpui-go must bump BAO_REVISION.

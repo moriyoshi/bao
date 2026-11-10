@@ -225,7 +225,7 @@ func TestWindowsFunctionImportsResolveAtCallTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	if !strings.Contains(text, `baoResolveImport("optional.dll", "MaybeMissing")`) {
+	if !strings.Contains(text, `{"optional.dll", "MaybeMissing"}`) || !strings.Contains(text, "baoResolveImport(functionImports[i].dll, functionImports[i].name)") {
 		t.Fatalf("import is not resolved through the fallback:\n%s", text)
 	}
 	if strings.Contains(text, `NewProc("MaybeMissing").Addr()`) {
