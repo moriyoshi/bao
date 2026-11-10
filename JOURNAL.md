@@ -4141,3 +4141,14 @@ bao-verify with bao and bao-verify built by Go 1.26.10 (artifacts under
 
 Not checked: native windows-2025 and windows-11-arm execution, Linux amd64,
 loong64 and ppc64le execution, darwin/amd64. gpui-go must bump BAO_REVISION.
+
+## 2026-11-10: Large-table compile test under Bazel
+
+Follows the previous entry, which did not run Bazel. CI run for PR 1 failed
+TestLargeGeneratedPackagesCompile on the Bazel unit, linux-amd64 and linux-arm64
+jobs: the test action has no HOME, so the nested go build had no build cache.
+The test now sets GOCACHE and GOPATH under its temporary directory when neither
+GOCACHE nor HOME is set. On macOS 26.5.2 arm64 with go1.27.3, the test binary
+run with HOME, GOCACHE and XDG_CACHE_HOME unset passed (17 s from a cold cache,
+peaks 142-402 MiB), and `bazel test //cmd/bao:bao_test` (Bazel 8.4.2, with
+-test.v and -test.run=LargeGenerated) passed with peaks 148-402 MiB.

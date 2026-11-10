@@ -193,6 +193,11 @@ func TestLargeGeneratedPackagesCompile(t *testing.T) {
 	write("go.mod", "module example.org/large\n\ngo 1.26\n\nrequire github.com/ebitengine/purego v0.0.0\n\nreplace github.com/ebitengine/purego => ./purego\n")
 	write("purego/go.mod", "module github.com/ebitengine/purego\n\ngo 1.26\n")
 	write("purego/purego.go", fakePurego)
+	// Bazel test actions have no HOME, so the go command has no default cache.
+	base := append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local")
+	if os.Getenv("GOCACHE") == "" && os.Getenv("HOME") == "" {
+		base = append(base, "GOCACHE="+filepath.Join(dir, "gocache"), "GOPATH="+filepath.Join(dir, "gopath"))
+	}
 	for _, pkg := range generatedPackages() {
 		t.Run(pkg.name, func(t *testing.T) {
 			source, asm, err := pkg.source(largeTableEntries)
@@ -201,7 +206,7 @@ func TestLargeGeneratedPackagesCompile(t *testing.T) {
 			}
 			write(filepath.Join(pkg.name, pkg.file+".go"), string(source))
 			write(filepath.Join(pkg.name, pkg.file+".s"), string(asm))
-			env := append(os.Environ(), "GOOS="+pkg.goos, "GOARCH="+pkg.goarch, "CGO_ENABLED=0", "GOWORK=off", "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local")
+			env := append(base[:len(base):len(base)], "GOOS="+pkg.goos, "GOARCH="+pkg.goarch)
 			build := func(args ...string) *os.ProcessState {
 				t.Helper()
 				cmd := exec.Command(goTool, append([]string{"build"}, args...)...)
