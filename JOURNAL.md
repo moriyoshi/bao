@@ -4063,3 +4063,12 @@ recorded Dockerfile. Go 1.26.10:
 The `bao_fixed_` names in the bindings assembly change with the generated source
 and are stable between runs. Native windows-2025 and windows-11-arm runs remain
 pending.
+
+## 2026-11-10: CI runs on pull requests only
+
+The CI workflow ran on `push` to every branch as well as on `pull_request`, so
+each push to a branch with an open pull request started two identical runs. The
+`push` trigger is removed; CI now starts on `pull_request`, `workflow_dispatch`
+and `workflow_call`. Branches without a pull request get no automatic run and
+can be checked with a manual dispatch. Commits landing on main are no longer
+built after merge; they are covered by the pull request run that preceded them.
