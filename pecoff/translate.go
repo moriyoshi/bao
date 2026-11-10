@@ -54,6 +54,8 @@ type Plan struct {
 	Constructors, Unwind          []Table
 	UnwindRoots                   []Table
 	RemovedDebugSections          int
+	RemovedBitcodeSections        int
+	RemovedBitcodeBytes           uint64
 	Alignments                    []Alignment
 	TextAliasesFolded             int
 	CappedAlignments              []CappedAlignment
@@ -551,7 +553,9 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 			if err != nil {
 				return nil, err
 			}
-			p.RemovedDebugSections += n
+			p.RemovedDebugSections += n.debug
+			p.RemovedBitcodeSections += n.bitcode
+			p.RemovedBitcodeBytes += n.bitcodeBytes
 		}
 		originalSymbols := len(o.symbols)
 		if err := o.normalizeSections(); err != nil {

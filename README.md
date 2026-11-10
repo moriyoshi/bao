@@ -818,6 +818,19 @@ by Go build flags. `-strip-debug=false` is available for diagnostics; retaining
 arbitrary native debug relocations is outside the checked translation profile.
 The low-level byte-preserving `pack` command retains its separate narrow profile.
 
+`build` and `translate` also default to `-strip-bitcode=true`, independently of
+`-strip-debug`. Bao drops embedded LLVM bitcode, which Go's linker never loads:
+the whole Mach-O `__LLVM` segment (`__bitcode`, `__cmdline`, `__asm`) and ELF
+`.llvmbc`/`.llvmcmd`, with their relocations and the symbols defined in them.
+Rust's precompiled std and every crate built with `lto = "fat"` carry it, and
+without this it was copied into the generated `.syso` as an unallocated section.
+A retained code or data relocation into these sections fails translation instead
+of leaving a dangling reference. The build log reports the dropped bytes, and
+`bao-debug.json` records `removed_bitcode_sections` and `removed_bitcode_bytes`.
+`-strip-bitcode=false` (`strip_bitcode` in the config file) keeps it. Windows
+COFF always drops `.llvmbc`/`.llvmcmd` and other `IMAGE_SCN_LNK_REMOVE` sections,
+so `-strip-bitcode=false` is rejected for Windows targets.
+
 ### Linux arm64 / ELF
 
 `translate -target linux/arm64` handles native Linux AArch64 ELF64 relocatable code, independently
@@ -1230,7 +1243,7 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 ```
 
 `bindings` is an inline manifest, a manifest path, or `dwarf`. Other top-level
-keys are `target`, `input`, `strip_debug`, `link_archives`, `link_notices`,
+keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
 `require_static_runtime` and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
 `sysroot`, `ld` and `system_libraries`; `windows` takes `imports`,

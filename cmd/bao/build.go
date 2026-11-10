@@ -25,6 +25,7 @@ type nativeFlags struct {
 	bindings                          string
 	signatures                        *bindings.Manifest
 	stripDebug                        bool
+	stripBitcode                      bool
 	windowsImports                    symbolFlags
 	windowsImportLibraries            symbolFlags
 	windowsMaxDataAlignment           uint
@@ -56,6 +57,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.BoolVar(&o.asJSON, "json", false, "print the generated package result as JSON")
 	fs.StringVar(&o.bindings, "bindings", "", "signature manifest JSON, or dwarf to infer selected C ABI exports; omission uses purego")
 	fs.BoolVar(&o.stripDebug, "strip-debug", true, "strip native debug data after inference; preserve unwind/exception metadata and original input")
+	fs.BoolVar(&o.stripBitcode, "strip-bitcode", true, "drop embedded LLVM bitcode (Mach-O __LLVM segment, ELF .llvmbc/.llvmcmd), which Go's linker never loads; Windows COFF always drops it")
 }
 
 func (o *nativeFlags) validate() error {
@@ -111,6 +113,9 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 		return usage("-linux-system-library requires a Linux target")
 	}
 	if strings.HasPrefix(target.Name, "windows/") {
+		if !o.stripBitcode {
+			return usage("Windows COFF always drops linker-remove LLVM bitcode; -strip-bitcode=false is unsupported")
+		}
 		if o.sdk != "" || o.sysroot != "" {
 			return usage("Windows COFF uses system DLL imports; -sdk/-sysroot do not apply")
 		}

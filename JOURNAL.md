@@ -4152,3 +4152,82 @@ GOCACHE nor HOME is set. On macOS 26.5.2 arm64 with go1.27.3, the test binary
 run with HOME, GOCACHE and XDG_CACHE_HOME unset passed (17 s from a cold cache,
 peaks 142-402 MiB), and `bazel test //cmd/bao:bao_test` (Bazel 8.4.2, with
 -test.v and -test.run=LargeGenerated) passed with peaks 148-402 MiB.
+
+## 2026-11-10: Drop embedded LLVM bitcode during translation
+
+Problem, reported from gpui-go v0.0.1 (built with bao 4ca57fa): the
+darwin/arm64 module carried 59.1 MB of .syso, of which 9.8 MB was the
+unallocated ELF section `.bao.<ns>.__LLVM.__bitcode.19`. It was copied from the
+Mach-O `__LLVM,__bitcode` sections of Rust's precompiled std, which survive
+`ld -r`. ELFContainer emits every Mach-O section, and the debug strip only
+matched `__DWARF`/`__debug_*`. A Rust staticlib built with `lto = "fat"` and
+`codegen-units = 1` embeds bitcode in every crate (98.4 MB). Go's linker never
+loads these sections, so only the download and module cache paid for them.
+`xcrun bitcode_strip -r` failed on that archive. Since the 2026-11-09 entry
+"GNU Rust std on Windows amd64/arm64 and coordinated FLS teardown", COFF has
+already dropped `IMAGE_SCN_LNK_REMOVE` payloads, including `.llvmbc`.
+
+Change:
+- translate.StripBitcode drops the whole Mach-O `__LLVM` segment (`__bitcode`,
+  `__cmdline`, `__asm`), its relocations and the symbols defined in it. It shares
+  stripSections with StripDebug, which is unchanged except for error text.
+- linuxelf.StripBitcode drops `.llvmbc`/`.llvmcmd` with their REL/RELA sections
+  and symbols. Unlike StripDebug, it keeps STT_FILE symbols. It also refuses
+  SHF_ALLOC sections.
+- On COFF, `.llvmbc`/`.llvmcmd` are now dropped by name even without
+  `IMAGE_SCN_LNK_REMOVE`. They are counted in Plan.RemovedBitcodeSections and
+  RemovedBitcodeBytes instead of RemovedDebugSections.
+- In every format, a retained relocation that targets a dropped section or
+  symbol fails translation and names the bitcode.
+- `build`/`translate` take `-strip-bitcode` (default true; config
+  `strip_bitcode`), applied before and independently of `-strip-debug`.
+  `-strip-bitcode=false` is a usage error for Windows, which always drops these
+  sections. The build log prints "Dropped N bytes of embedded LLVM bitcode from
+  M sections". `bao-debug.json` adds `bitcode_stripped`,
+  `removed_bitcode_sections` and `removed_bitcode_bytes`.
+
+Verification on macOS 26.5.2 arm64, go1.27.3 for bao and tests, ld-1267,
+rustc 1.99.1 (gpui-go's archives). Baseline bao was built from 4ca57fa in
+.work/bitcode/base, and new bao from this working tree. Each ran
+`bao build -config gpui-go/dist/bao.config.json -target darwin/ARCH -o OUT ARCHIVE`
+(scratch in .work/bitcode/):
+
+| input | base .syso | new .syso | dropped |
+| --- | --- | --- | --- |
+| gpui-go target/size-lto aarch64 libgpui_go_native.a (fat LTO, 144.9 MB) | 139,866,872 | 41,435,048 | 98,431,621 |
+| gpui-native-v0.0.1-darwin-arm64.a (release asset, sha256 verified) | 59,152,408 | 49,330,104 | 9,822,103 |
+| gpui-native-v0.0.1-darwin-amd64.a (release asset, sha256 verified) | 62,349,512 | 52,424,728 | 9,924,575 |
+
+- For the LTO package, `zip -9 -r` gave 47,728,214 bytes for base and
+  12,104,861 bytes for new.
+- Base .syso contained 501/247/255 "BC\xc0\xde" signatures; new ones contained 0.
+- Apart from the content-derived namespace, generated Go/assembly and the
+  bindings were unchanged.
+- The manifest renamed 1,002 fewer local symbols on LTO (97,929 base, 96,927
+  new). These were locals in the dropped sections.
+- `-strip-bitcode=false` on the v0.0.1 arm64 archive reproduced the
+  59,152,408-byte baseline.
+
+Linkage and execution: gpui-go's dist/native-smoke/main.go.tmpl was linked
+against each package with Go 1.26.10, GOTOOLCHAIN=local and CGO_ENABLED=0. It
+calls GPUIInit, creates and shuts down a Sable runtime, and finalizes TLS. Every
+build printed PASS with "TLS live=0 freed=2" and exited 0. darwin/arm64 (LTO and
+v0.0.1) ran natively. darwin/amd64 (v0.0.1) ran under Rosetta, which is emulated
+execution. Base and new executables have equal sizes: 36,098,066 bytes for LTO
+arm64, 42,840,962 for v0.0.1 arm64 and 46,684,368 for v0.0.1 amd64. None
+contains a bitcode signature, which confirms Go's linker already discarded the
+payload. Code signing was not checked separately.
+
+Unit tests cover:
+- Removal, remapping, idempotence, retained debug sections and STT_FILE symbols.
+- Rejection of extern and section relocations into `__LLVM`, and of an ELF
+  `.data` relocation to a symbol in `.llvmbc`.
+- COFF name-based removal and separate accounting.
+`go test ./...` and `go vet ./...` (go1.27.3) passed. Bazel was not run: no
+bazel or bazelisk is on PATH in this environment.
+
+Not checked:
+- An LTO darwin/amd64 archive (none was available).
+- Linux or Windows archives that actually carry `.llvmbc` (unit fixtures only;
+  gpui-go v0.0.1 linux/windows modules carry none).
+- The bao-verify suites.
