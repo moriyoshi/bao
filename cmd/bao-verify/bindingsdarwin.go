@@ -120,21 +120,27 @@ func main(){runtime.LockOSThread();if native.BaoExampleRun()!=42{panic("native r
 	out, err := h.command("bindings-rust-negative-run.log", negative, nil, negExe)
 	check(err != nil && strings.Contains(string(out), "failed to initiate panic") && !strings.Contains(string(out), "PASS:"), "typed Rust unwind negative control failed")
 	results["optimized_rust_std"] = map[string]any{"status": "PASS", "removed_debug_sections": rustDebug["removed_sections"], "runtime": "panic caught; 2 RAII drops; 8 native threads; 9 TLS drops, live=0 freed=9", "negative_unwind": "PASS", "executable_sha256": digest(rustExe)}
-	h.results["typed_bindings"] = map[string]any{"status": "PASS", "target": h.target, "modes": results, "producer": "optimized -O2 -g C; inferred scalar signatures before native debug stripping", "consumer": "stock Go CGO_ENABLED=0 and CGO_ENABLED=1 with internal linking and a cgo dependency; GOPROXY=off", "runtime": "integer/FP register and stack args; mixed/narrow types; uint32; pointer result/lifetime; TLS; scheduler progress while C blocks", "bootstrap": "bundled adapted Apache/BSD fakecgo for !cgo; runtime/cgo when cgo is enabled"}
+	h.results["typed_bindings"] = map[string]any{"status": "PASS", "target": h.target, "modes": results, "producer": "optimized -O2 -g C; inferred scalar signatures before native debug stripping", "consumer": "stock Go CGO_ENABLED=0; CGO_ENABLED=1 with default flags; CGO_ENABLED=1 with internal linking and a cgo dependency; GOPROXY=off", "runtime": "integer/FP register and stack args; mixed/narrow types; uint32; pointer result/lifetime; TLS; scheduler progress while C blocks", "bootstrap": "bundled adapted Apache/BSD fakecgo installed from runtime._cgo_init unless runtime/cgo is linked"}
 	fmt.Println("PASS typed bindings", h.target)
 }
 
-// Exercise a real cgo dependency alongside generated bindings. Darwin's ELF
-// containers require Go internal linking, including when cgo is enabled.
+// Exercise cgo-enabled builds. Without another cgo dependency runtime/cgo is
+// not linked and Go links internally by default. A real cgo dependency links
+// runtime/cgo, whose default external link cannot consume Darwin's ELF
+// containers, so it requires Go internal linking.
 func (h *harness) checkDarwinCgo(app, name, marker string) {
 	env := map[string]string{"CGO_ENABLED": "1", "CC": "/usr/bin/clang", "CXX": "/usr/bin/clang++"}
 	exe := filepath.Join(h.dst, name+"-cgo-executable")
-	h.run(name+"-cgo-no-dependency-build.log", app, env, h.goTool, "build", "-ldflags=-linkmode=internal", "-o", exe, ".")
-	check(strings.Contains(string(h.run(name+"-cgo-no-dependency-run.log", app, nil, exe)), marker), "cgo-enabled native ABI without cgo dependency failed")
+	h.run(name+"-cgo-no-dependency-build.log", app, env, h.goTool, "build", "-o", exe, ".")
+	for _, procs := range []string{"1", "4"} {
+		check(strings.Contains(string(h.run(name+"-cgo-no-dependency-run-"+procs+".log", app, map[string]string{"GOMAXPROCS": procs}, exe)), marker), "cgo-enabled native ABI without cgo dependency failed")
+	}
 	dep := filepath.Join(app, "cgodep")
 	require(os.Mkdir(dep, 0755))
 	require(os.WriteFile(filepath.Join(dep, "cgo.go"), []byte("package cgodep\n/* static int answer(void) { return 42; } */\nimport \"C\"\nfunc Answer() int { return int(C.answer()) }\n"), 0644))
 	require(os.WriteFile(filepath.Join(app, "cgo_check.go"), []byte("//go:build cgo\n\npackage main\nimport \"bao-bindings-check/cgodep\"\nfunc init() { if cgodep.Answer() != 42 { panic(\"cgo dependency\") } }\n"), 0644))
+	_, err := h.command(name+"-cgo-default-link-negative.log", app, env, h.goTool, "build", "-o", filepath.Join(h.dst, name+"-not-produced"), ".")
+	check(err != nil, "cgo dependency unexpectedly linked with the default external linker")
 	h.run(name+"-cgo-build.log", app, env, h.goTool, "build", "-ldflags=-linkmode=internal", "-o", exe, ".")
 	for _, procs := range []string{"1", "4"} {
 		check(strings.Contains(string(h.run(name+"-cgo-run-"+procs+".log", app, map[string]string{"GOMAXPROCS": procs}, exe)), marker), "cgo native ABI failed")

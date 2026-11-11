@@ -6,7 +6,7 @@
 ![bao](assets/bao.jpg)
 
 Bao translates native C/C++/Rust object code into `.syso` packages that stock Go can
-link with `CGO_ENABLED=0`. Its primary examples are small Rust static libraries
+link without cgo or a consumer C compiler. Its primary examples are small Rust static libraries
 using macOS frameworks, with no third-party Rust crates; see [examples](examples/README.md).
 
 The maintained Darwin path targets macOS/arm64 and macOS/amd64 with Go 1.26.10. It preserves Rust
@@ -112,16 +112,17 @@ func main() {
     fmt.Println(native.Add(1, 2))
 }
 EOF
-CGO_ENABLED=0 go build -o app .
+go build -o app .
 ./app
 ```
 
-The program prints `3`. Typed bindings need no PureGo module dependency, and
-this function has no pointer or TLS cleanup for the caller to manage. For a
+The program prints `3`. The build works with cgo enabled or disabled, so
+`CGO_ENABLED` need not be set. Typed bindings need no PureGo module dependency,
+and this function has no pointer or TLS cleanup for the caller to manage. For a
 published module, replace the placeholder module path and local `replace` with
-the library's real import path and version. If the application also needs a
-cgo dependency, use the [cgo-enabled build profile](#using-generated-go-packages)
-with a newly generated typed package and a C compiler:
+the library's real import path and version. If the application also has its own
+cgo dependency, use the [internal linker](#using-generated-go-packages) and a C
+compiler:
 
 ```sh
 CGO_ENABLED=1 go build -ldflags=-linkmode=internal -o app .
@@ -145,7 +146,7 @@ the mode when generating the package. Use the API shipped by that library:
 | Calling code | Call an exported Go function such as `native.Add(19, 23)` | Register a Go function variable with `purego.RegisterFunc`, or call a wrapper provided by the library |
 | Purego module dependency | None required by the generated package | Required, even if the library hides registration behind its own API |
 | Function types | Declared by the library developer and emitted as typed Go functions | The registered Go function type must match the native C ABI |
-| Application build | `CGO_ENABLED=0 go build` | `CGO_ENABLED=0 go build`, with PureGo available in the module graph |
+| Application build | `go build`, with cgo enabled or disabled | `CGO_ENABLED=0 go build`, with PureGo available in the module graph |
 
 Both modes link native code into the executable. Consumers need the supplied Go,
 assembly and `.syso` files, stock Go 1.26.10, and compatible target system libraries;
@@ -153,9 +154,18 @@ they need neither Rust nor a native compiler/SDK. Ordinary application builds do
 not invoke Bao. Changing a generated package's binding mode requires regeneration
 by the library developer; it is not an application `go build` option.
 
-On macOS, Linux and Windows, newly generated typed packages can also be used with
-cgo enabled and other cgo dependencies, provided the application uses Go's
-internal linker:
+Typed packages build with Go's defaults whether cgo is enabled or not; an
+application with no other cgo dependency needs no `CGO_ENABLED` setting, linker
+flag or C compiler. On Darwin and Linux the bundled bootstrap detects whether
+`runtime/cgo` is linked when the program starts and defers to it if so; Windows
+packages need no bootstrap. With Go 1.26.10, cgo-enabled builds without another
+cgo dependency were executed on macOS arm64 (native) and amd64 (Rosetta 2),
+Linux arm64 (native Docker), Linux loong64 and ppc64le (QEMU) and Windows amd64
+(Wine). Linux amd64 was executed under emulation with the bootstrap alone, not
+with a translated native library.
+
+If the application also has its own cgo dependency, which links `runtime/cgo`,
+it must use Go's internal linker:
 
 ```sh
 CGO_ENABLED=1 go build -ldflags=-linkmode=internal
@@ -163,15 +173,18 @@ CGO_ENABLED=1 go build -ldflags=-linkmode=internal
 
 The application needs a working C compiler for its cgo dependencies. Go's
 default external linking fails on supported examples with Bao-generated objects;
-dependencies requiring external linking remain unsupported in this profile.
-This path has been exercised on Darwin and Linux arm64 with Go 1.26.10; other
-architectures and toolchains require separate verification.
+dependencies requiring external linking remain unsupported in this profile. On
+Linux, the standard `net` and `os/user` packages link `runtime/cgo` when cgo is
+enabled, so applications using them, including through `net/http`, need either
+this flag or `CGO_ENABLED=0`. This path has been exercised with Go 1.26.10 on
+macOS arm64 and amd64 (Rosetta 2), Linux arm64, Linux loong64 and ppc64le
+(QEMU), and Windows amd64 under Wine with LLVM-MinGW; Linux amd64, native
+Windows and other toolchains require separate verification.
 
-Windows amd64 has been exercised under Wine with Go 1.26.10 and LLVM-MinGW;
-native Windows and ARM64 execution of this cgo-enabled profile require separate
-verification. Existing generated
-packages must be regenerated with the updated Bao. The PureGo mode retains
-its documented cgo-disabled profile.
+Packages generated by earlier Bao versions import `runtime/cgo` when cgo is
+enabled and so still need `CGO_ENABLED=0` or the internal linker flag;
+regenerate them with the updated Bao. The PureGo mode retains its documented
+cgo-disabled profile.
 
 #### Calling generated typed bindings
 
@@ -187,7 +200,7 @@ for this package. The generated functions and assembly perform the foreign-call
 transition using the runtime support bundled with the library. Build normally:
 
 ```sh
-CGO_ENABLED=0 go build
+go build
 ```
 
 #### Calling through PureGo
@@ -235,10 +248,11 @@ and [Linux profile](#linux-arm64--elf) for platform limitations.
 #### compatibility and pointer lifetimes
 
 Generated typed bindings bundle a bootstrap that installs process-wide runtime
-hooks when cgo is disabled. That profile uses **one bundled bootstrap per
+hooks when `runtime/cgo` is not linked. Use **one bundled bootstrap per
 executable**; combining it with another bundled bootstrap or PureGo's bootstrap
-is unsupported. On Darwin and Linux, the cgo-enabled typed profile excludes that
-bootstrap and uses runtime/cgo with internal linking. Native callbacks into Go are not
+is unsupported, and two bundled bootstraps fail at link time. On Darwin and Linux, when an application
+links `runtime/cgo` through a cgo dependency, the bootstrap defers to it at
+startup and the application uses internal linking. Native callbacks into Go are not
 supplied by this scalar generator. Other runtime combinations require separate
 verification.
 
@@ -1037,8 +1051,8 @@ normally, including when your own Go API hides registration.
 
 Document the target, binding mode, available functions or address-accessor
 order, pointer ownership, and any required TLS finalization. Consumers build
-either mode with `CGO_ENABLED=0 go build` and need neither Rust nor the
-producer SDK. Retain the generated provenance and license/notice files in
+typed packages with `go build` and runtime-registration packages with
+`CGO_ENABLED=0 go build`, and need neither Rust nor the producer SDK. Retain the generated provenance and license/notice files in
 both modes; see [licensing](#licensing). Windows lifecycle packages also include
 `LICENSE-BAO-WINDOWS.txt` and `NOTICE-BAO-WINDOWS.txt`; retain these and all
 `bao-linked-license-N.txt` files for bundled runtimes.
@@ -1470,8 +1484,9 @@ The generated `.syso` files use **ELF relocatable containers for Darwin ABI
 machine code** because Go's ELF object reader preserves section alignment that
 its Mach-O reader omits. Go's stock internal linker accepts these inputs and
 produces a normal Mach-O executable. This container choice is not Linux support
-and is not a claim of compatibility with Apple's external linker. Cgo-enabled
-typed packages still require Go's internal linker.
+and is not a claim of compatibility with Apple's external linker. Applications
+that link `runtime/cgo` through a cgo dependency still require Go's internal
+linker.
 
 #### Linux
 
@@ -1553,8 +1568,9 @@ from the public parser. Run its tests with
 
 Consumers of a generated package need stock Go 1.26.10, the complete generated
 package and compatible target system libraries. Ordinary application builds use
-`CGO_ENABLED=0 go build` and do not invoke Bao or a native compiler. A
-cgo-enabled application needs a working C compiler for its cgo dependencies.
+`go build` for typed packages, or `CGO_ENABLED=0 go build` for runtime
+registration, and do not invoke Bao or a native compiler. An application with
+its own cgo dependencies needs a working C compiler for them.
 Library producers need the native toolchain when compiling or combining inputs. See
 [consumer builds](#using-generated-go-packages) and
 [package production](#producing-a-go-package).
@@ -1569,9 +1585,11 @@ CGO_ENABLED=1 go build -ldflags=-linkmode=internal
 
 Regenerate older packages with the updated Bao. Dependencies that require
 external linking remain unsupported; the default cgo-enabled link fails on
-supported examples. This path was executed on macOS arm64, Linux arm64 and
-Windows amd64 under Wine with Go 1.26.10. Windows arm64 was cross-linked but not
-executed; other architectures and native Windows require separate verification.
+supported examples. This path was executed with Go 1.26.10 on macOS arm64 and
+amd64 (Rosetta 2), Linux arm64, Linux loong64 and ppc64le (QEMU) and Windows
+amd64 under Wine. Windows arm64 was cross-linked but not executed; Linux amd64
+and native Windows require separate verification. Without another cgo
+dependency, no flag is needed.
 The PureGo registration mode retains its cgo-disabled profile. See
 [consumer builds](#using-generated-go-packages) and
 [runtime compatibility](#compatibility-and-pointer-lifetimes).
@@ -1588,8 +1606,8 @@ registration mode uses PureGo. Neither mode requires a custom Go toolchain. See
 The library producer chooses. Generated typed bindings need no PureGo module
 dependency; Darwin/Linux typed packages bundle adapted bootstrap sources and
 their notices. Runtime-registration packages require PureGo even when a Go
-wrapper hides registration. When cgo is disabled, a bundled bootstrap must be
-the only bootstrap provider in the executable. See [binding modes](#choosing-a-binding-mode) and
+wrapper hides registration. A bundled bootstrap must be the only bootstrap
+provider in the executable. See [binding modes](#choosing-a-binding-mode) and
 [runtime compatibility](#compatibility-and-pointer-lifetimes).
 
 ### Is the resulting executable fully static?
@@ -1632,8 +1650,8 @@ and the macOS SDK on the producer. Link `lib/libc++.a` for C++, or
 `lib/libunwind.a` alongside a Rust staticlib, from the resulting
 `.work/static-runtimes/darwin-ARCH` prefix. C++ exceptions remain unsupported;
 Rust catch/unwind, aligned TLS, allocation, explicit C++ finalization and signed
-execution are checked. Typed consumers built with cgo disabled need no native
-compiler.
+execution are checked. Typed consumers without another cgo dependency need no
+native compiler.
 
 On Windows, supply the matching LLVM-MinGW target prefix's `libc++.a`,
 `libc++abi.a`, `libunwind.a`, `libmingwex.a`, compiler builtins archive and
