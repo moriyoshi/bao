@@ -4594,3 +4594,42 @@ was gone, the consumer linked, and the executable ran natively in the
 container with exit 0. `go test ./...` and `go vet ./...` passed with Go
 1.26.11. Scratch files are in .work/go1.26.11/llvmopt. The Linux C++ suites
 themselves were not run locally; hosted CI is the check for them.
+
+## 2026-11-11: Hosted CI for Go 1.26.11 and the cgo hook thunks
+
+Hosted CI run 42984748121 (workflow CI, pull_request event for PR #4) passed
+all seven jobs on commit 9160d1d with the pinned Go 1.26.11. Bazel used the
+rules_go-downloaded 1.26.11 SDK and the Windows jobs used setup-go 1.26.11. Job
+logs show each suite running fresh with its own evidence directory and no
+`##[error]` lines; uploaded ci-* artifacts hold the evidence. Runners and
+suites, from ci/check.sh:
+
+- unit (ubuntu-26.04).
+- darwin-arm64 (macos-26): darwin, tls, bindings, cpp, static (with a freshly
+  built static runtime root), signatures and bazel.
+- darwin-amd64 (macos-26-intel, native Intel): darwin, tls, bindings, cpp and
+  static.
+- linux-arm64 (ubuntu-26.04-arm, native): cpp with g++ and clang++; linux and
+  bindings for arm64; linux-cross, bindings and cpp with g++ and clang++ for
+  loong64 and ppc64le under QEMU; static for arm64, amd64, loong64 and ppc64le.
+- linux-amd64 (ubuntu-26.04, native): cpp with g++ and clang++.
+- windows-amd64 (windows-2025) and windows-arm64 (windows-11-vs2026-arm),
+  native: windows with the clang, clang-cl and msvc drivers, static with
+  LLVM-MinGW clang, and windows with MinGW GCC on amd64. The clang legs include
+  the cgo-enabled consumers without another cgo dependency, now built with
+  default flags, and the real cgo dependency with `-linkmode=internal`.
+
+This supersedes the "Not rerun with 1.26.11" and "Not checked" lists in the
+three preceding entries for these suites: the Linux C++ suites, Darwin static,
+bazel and native Windows amd64/arm64 execution have now run with 1.26.11, and
+the bindings and windows suites ran on the committed tree rather than the
+pre-bump copy. The run before the linker-options fix, 42983197798 on af3767a,
+failed both Linux jobs as recorded in the previous entry.
+
+README now records the Linux C++ profiles, loong64/ppc64le C++ lifecycle
+suites and native Windows profiles as passing with 1.26.11, and removes the
+statements that native Windows results were pending.
+
+Still not checked: release-smoke and the hosted release rehearsal, gpui,
+Linux amd64 typed bindings with a translated native library, combination with
+PureGo's fakecgo, `-race`, and signing of cgo-enabled Darwin executables.
