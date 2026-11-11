@@ -82,7 +82,7 @@ func signatureCommand(ctx context.Context, command string, args []string, stdout
 	fs.Var(&manifests, "manifest", "signed module envelope, repeatable")
 	target := fs.String("target", runtime.GOOS+"/"+runtime.GOARCH, "GOOS/GOARCH")
 	dir := fs.String("C", ".", "consumer module working directory; workspaces disabled")
-	goTool := fs.String("go", "go", "trusted stock Go 1.26.10 executable")
+	goTool := fs.String("go", "go", "trusted stock Go 1.26.11 executable")
 	scanOnly := command == "verify"
 	out := new(string)
 	asJSON := new(bool)

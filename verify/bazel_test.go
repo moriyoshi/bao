@@ -15,7 +15,7 @@ func TestBazelArchiveProfileAndNativeMultiplicity(t *testing.T) {
 		name string
 		data []byte
 	}
-	goObject := []byte("go object linux arm64 go1.26.10 fixture\n")
+	goObject := []byte("go object linux arm64 go1.26.11 fixture\n")
 	native := []byte{0x7f, 'E', 'L', 'F', 1, 2}
 	expected := PackageInputs{Native: map[string][]string{"native.syso": {Digest(native), Digest(native)}}, GoMembers: map[string]int{"_go_.o": 1, "s0.o": 1}}
 	base := []member{{"_go_.o", goObject}, {"s0.o", goObject}, {"native.syso", native}, {"native.syso", native}}
@@ -44,7 +44,7 @@ func TestBazelArchiveProfileAndNativeMultiplicity(t *testing.T) {
 			case "wrong-sdk":
 				m[0].data = []byte("go object linux arm64 go1.26.5 fixture\n")
 			case "wrong-target":
-				m[1].data = []byte("go object linux amd64 go1.26.10 fixture\n")
+				m[1].data = []byte("go object linux amd64 go1.26.11 fixture\n")
 			case "native-as-go":
 				m[1].data = native
 			}
@@ -129,7 +129,7 @@ func TestBazelGraphSelectsAssemblyAndRejectsUnapprovedSources(t *testing.T) {
 
 func TestBazelPrivateLinkUsesCheckedCopies(t *testing.T) {
 	root, work := t.TempDir(), t.TempDir()
-	goObject := []byte("go object linux arm64 go1.26.10 fixture\n")
+	goObject := []byte("go object linux arm64 go1.26.11 fixture\n")
 	native := []byte("signed native bytes")
 	a := archiveFixture(struct {
 		name string

@@ -55,7 +55,7 @@ The suite returns `CHECKED_WITH_LIMITATIONS`, with separate `PASS`, native
 control failures, and `UNSUPPORTED` entries. A successful suite exit means the
 supported checks and expected rejections behaved as recorded; it does not mean
 C++ stack unwinding works through Bao. The tested profile is Apple Clang 21,
-SDK 26.5, and Go 1.26.10. Local amd64 execution on an Arm Mac uses Rosetta;
+SDK 26.5, and Go 1.26.11. Local amd64 execution on an Arm Mac uses Rosetta;
 native Intel CI runs are separate. The separate
 [Linux C++ suite](../cpp_linux/README.md) covers GCC and Clang with libstdc++ on
 arm64/amd64 and QEMU loong64/ppc64le, including working C++ exception handling

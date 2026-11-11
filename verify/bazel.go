@@ -18,7 +18,7 @@ import (
 )
 
 // BazelOptions selects the bounded local rules_go profile. Consumer Bazel
-// definitions, Bazel 8.4.2, rules_go 0.65.0, the stock Go 1.26.10 SDK and the
+// definitions, Bazel 8.4.2, rules_go 0.65.0, the stock Go 1.26.11 SDK and the
 // same-user host are trusted. ModuleRoots bind approved Go module names to local
 // workspace-relative trees (including their BUILD files). External native
 // repositories, custom build actions, cgo and nonstandard link modes are excluded.
@@ -469,8 +469,8 @@ func bazelToolchain(execroot string, link bazelAction) error {
 		return err
 	}
 	b, err := os.ReadFile(filepath.Join(path, "VERSION"))
-	if err != nil || strings.SplitN(string(b), "\n", 2)[0] != "go1.26.10" {
-		return fmt.Errorf("Bazel profile requires the stock Go 1.26.10 SDK: %v", err)
+	if err != nil || strings.SplitN(string(b), "\n", 2)[0] != "go1.26.11" {
+		return fmt.Errorf("Bazel profile requires the stock Go 1.26.11 SDK: %v", err)
 	}
 	// Canonical repository naming is part of this deliberately small profile.
 	b, err = os.ReadFile(filepath.Join(repositories, "external", "rules_go+", "MODULE.bazel"))
@@ -601,7 +601,7 @@ func bazelCheckArchive(data []byte, expected PackageInputs, target string) (int,
 		}
 	}
 	seen, native := map[string]int{}, 0
-	header := []byte("go object " + strings.ReplaceAll(target, "/", " ") + " go1.26.10 ")
+	header := []byte("go object " + strings.ReplaceAll(target, "/", " ") + " go1.26.11 ")
 	for _, member := range members {
 		hash := Digest(member.Data)
 		if want[member.Name][hash] > 0 {

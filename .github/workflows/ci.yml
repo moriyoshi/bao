@@ -87,7 +87,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.result.outputs.hit != 'true' && startsWith(matrix.suite, 'windows-')
         with:
-          go-version: 1.26.10
+          go-version: 1.26.11
           architecture: ${{ matrix.goarch }}
           cache: false
       - name: Select the native VC toolset

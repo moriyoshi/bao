@@ -1,4 +1,4 @@
-// Package translate lowers Darwin arm64/amd64 native objects for Go 1.26.10's internal
+// Package translate lowers Darwin arm64/amd64 native objects for Go 1.26.11's internal
 // linker. It provides strict inspection/leaf packaging and a runtime translation
 // pipeline for TLS, initializers, imports, DWARF and supported compact unwind frames.
 // ELF is used as an input object container to retain native section alignment;
@@ -17,7 +17,7 @@ import (
 	"github.com/moriyoshi/bao/internal/ar"
 )
 
-const LinkerProfile = "go1.26.10/darwin/arm64/internal"
+const LinkerProfile = "go1.26.11/darwin/arm64/internal"
 
 type Object struct {
 	Name string
@@ -104,7 +104,7 @@ func Inspect(input []byte, objects []Object) (Report, error) {
 		}
 		r.Objects = append(r.Objects, or)
 		if or.Architecture == "amd64" {
-			r.Profile = "go1.26.10/darwin/amd64/internal"
+			r.Profile = "go1.26.11/darwin/amd64/internal"
 		}
 		for _, name := range defs {
 			if prev, exists := defined[name]; exists {

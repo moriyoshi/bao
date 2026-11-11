@@ -101,7 +101,7 @@ func run(o options) (err error) {
 		Go      string   `json:"go"`
 		Bazel   string   `json:"bazel"`
 		Hosts   []string `json:"cli_hosts"`
-	}{o.version, o.commit, o.epoch, "1.26.10", "8.4.2", targets}, "", "  ")
+	}{o.version, o.commit, o.epoch, "1.26.11", "8.4.2", targets}, "", "  ")
 	if err != nil {
 		return err
 	}

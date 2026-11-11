@@ -35,7 +35,7 @@ go_library(name="native", srcs=glob(["*.go", "*.s", "*.h", "*.syso"]), importpat
 	require(os.WriteFile(filepath.Join(workspace, "MODULE.bazel"), []byte(`module(name="bao_consumer")
 bazel_dep(name="rules_go", version="0.65.0")
 go_sdk=use_extension("@rules_go//go:extensions.bzl", "go_sdk")
-go_sdk.download(version="1.26.10")
+go_sdk.download(version="1.26.11")
 `), 0644))
 	// setup-bazel exposes Bazelisk in CI; the private consumer must select the
 	// same pinned release without depending on Bao's parent .bazelversion.

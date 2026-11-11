@@ -174,7 +174,7 @@ func verify(ctx context.Context, args []string) (err error) {
 	h.goTool = resolveRunfile(filepath.Join(goRoot, "bin", goName))
 	h.env["PATH"] = filepath.Dir(h.goTool) + string(os.PathListSeparator) + h.env["PATH"]
 	goVersion := strings.TrimSpace(string(h.run("go-version.log", *root, nil, h.goTool, "version")))
-	check(strings.Contains(goVersion, "go1.26.10 "), "requires Go 1.26.10; got %s", goVersion)
+	check(strings.Contains(goVersion, "go1.26.11 "), "requires Go 1.26.11; got %s", goVersion)
 	h.results["go"] = goVersion
 	h.results["purego"] = puregoModule + "@" + puregoVersion
 	h.results["purego_sum"] = puregoSum

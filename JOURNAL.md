@@ -4484,3 +4484,78 @@ alongside):
 Not checked: native Windows, Windows arm64 execution, a translated native
 library on linux/amd64, combination with PureGo's fakecgo, `-race`, and
 signing of cgo-enabled Darwin executables.
+
+## 2026-11-11: Pin Go 1.26.11
+
+Go 1.26.11 addresses build-toolchain vulnerabilities. Bao's Go pins (go.mod
+toolchain, MODULE.bazel SDK, CI and release workflows, ci/check.sh,
+release/smoke.sh, bao doctor, verified-build and scan profiles, the Bazel
+profile, bao-verify, bao-release metadata and translate.LinkerProfile) now
+require go1.26.11. Comments citing Go linker/assembler behavior were renumbered
+after confirming that cmd/link/internal/ld/macho.go and data.go,
+cmd/internal/obj/loong64 and cmd/link/internal/loader and loadelf are
+unchanged between 1.26.10 and 1.26.11. README statements that record
+verification were changed only where the corresponding check reran with
+1.26.11 (below); the Linux C++ profile still records 1.26.10 and says it has
+not been rechecked.
+
+Toolchain: darwin/arm64 1.26.11 installed by `mise install go@1.26.11`;
+linux/arm64 go1.26.11.linux-arm64.tar.gz downloaded from go.dev and matched
+the published SHA-256
+6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e
+(.work/go1.26.11/sdk-arm64). Bazel's rules_go fetched go1.26.11 for
+darwin/arm64.
+
+Relevant 1.26.11 changes, from diffing the two SDK source trees: cgo
+directives reject commas and the compiler checks every character of
+cgo_import_dynamic library names; cmd/go runs a format check on every .syso
+(rejecting LLVM/GCC LTO and bitcode sections such as `.llvmbc` and `__LLVM`,
+ELF embedded linker options, and validating COFF `.drectve`); cmd/link rejects
+unrecognized .syso formats; and cmd/go and cmd/pack now keep the `.syso`
+suffix when truncating long archive member names to 16 bytes. Bao's Darwin and
+Linux ELF and Windows COFF objects pass the format check; Bao already drops
+`.drectve` from translated COFF, and the base branch drops embedded bitcode.
+
+Regression found and fixed: with 1.26.11, `bao verified-build` (signatures
+suite) failed with `unexpected or substituted archive member
+"native_0000.syso"`, because verify.memberName still truncated every member to
+16 bytes. It now mirrors the 1.26.11 rule (first 11 bytes plus `.syso` for long
+.syso names; generated names are ASCII, so cmd/go's byte truncation and
+cmd/pack's rune truncation agree). rules_go 0.65.0 packs through `go tool
+pack`, so the Bazel profile uses the same names. TestArchiveMemberNames covers
+the rule.
+
+Verification on macOS 26.5.2 arm64 with stock Go 1.26.11 (GOROOT unset,
+GOTOOLCHAIN=local GOENV=off GOWORK=off), Apple clang 21.0.0, Rust 1.99.1:
+- `go test ./...` and `go vet ./...` passed; `bazel test //...` with Bazel 8.4.2
+  from .work/tools ran 11 tests, all passing.
+- Before the pin bump, from a copy of the tree whose only change was the
+  bao-verify version gate (.work/go1.26.11/tree,
+  `.work/go1.26.11/verify/run-all.sh`): bindings suite PASS on darwin/arm64,
+  darwin/amd64 (Rosetta 2), linux/arm64 (native Docker), linux/loong64 and
+  linux/ppc64le (QEMU, bao-static-linux:cross), including the cgo-enabled
+  default-flag and cgo-dependency legs; windows suite for windows/amd64 with
+  LLVM-MinGW 20261104 under local Wine (emulated, not native Windows):
+  `CHECKED_WITH_LIMITATIONS`, as with 1.26.10.
+- From the bumped tree (`.work/go1.26.11/verify-main/run-all.sh` and
+  rerun.sh): darwin, tls and cpp suites on darwin/arm64 and darwin/amd64
+  (Rosetta 2) passed (cpp: `CHECKED_WITH_LIMITATIONS` with its recorded
+  `UNSUPPORTED` entries, as before); linux suite on linux/arm64 with
+  bao-static-linux:cross passed; static suite on linux/arm64, loong64 and
+  ppc64le with bao-static-linux:cross passed; signatures suite on darwin/arm64
+  and darwin/amd64 passed after the memberName fix (it failed before it).
+- In containers with the Linux arm64 1.26.11 SDK: `sh ci/cgo-linux.sh`
+  (bao-static-linux:arm64, GCC 14.4.0) passed, including the default-link
+  negative; the loong64/ppc64le cgo-dependency consumers
+  (`.work/cgo-thunk-impl/crossdep/run.sh`, Debian GCC 14.2.0 cross compilers)
+  passed under QEMU at GOMAXPROCS 1 and 4.
+- The bootstrap-only linux/amd64 binaries linked with 1.26.11 for cgo 0 and 1
+  and ran under Docker's x86_64 emulation at GOMAXPROCS 1 and 4.
+
+Not rerun with 1.26.11: the Darwin static suite (no prebuilt static
+runtime root under .work/static-runtimes), the Linux cpp and linux-cross
+suites (their images are not present locally), the bazel and release-smoke
+suites, gpui, native Windows, Windows arm64 and hosted CI. The bindings and
+windows suite results above came from the pre-bump copy, which differs from
+the committed tree only in version pins and the memberName fix; neither
+suite uses verified-build.

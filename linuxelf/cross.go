@@ -297,7 +297,7 @@ func (p *Plan) normalizeCross(m *image, oi int) error {
 		for i := 0; i < len(s.relocs); i++ {
 			r := s.relocs[i]
 			if m.effectiveMachine() == elf.EM_LOONGARCH && elf.R_LARCH(r.typ) == elf.R_LARCH_CALL36 {
-				// Go 1.26.10's CALL36 emitter sign-extends the high immediate
+				// Go 1.26.11's CALL36 emitter sign-extends the high immediate
 				// into opcode bits for backward calls. Express the same call
 				// with supported B26 plus a retained NOP slot. Returning at
 				// PC+4 executes that slot before the original PC+8 continuation.
