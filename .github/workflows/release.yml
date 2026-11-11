@@ -216,7 +216,7 @@ jobs:
             tar -xzf ".work/dist/bao_${TAG}_linux_${arch}.tar.gz" -C ".work/smoke/$arch"
             qemu=qemu-loongarch64
             if [[ $arch == ppc64le ]]; then qemu=qemu-ppc64le; fi
-            docker run --rm --network none --read-only -v "$PWD/.work/smoke/$arch:/smoke:ro" --entrypoint "/usr/bin/$qemu" bao-release-cross "/smoke/bao_${TAG}_linux_${arch}/bao" version -json | jq -e --arg tag "$TAG" --arg commit "$COMMIT" '.version == $tag and .commit == $commit and .built_with == "go1.26.10"'
+            docker run --rm --network none --read-only -v "$PWD/.work/smoke/$arch:/smoke:ro" --entrypoint "/usr/bin/$qemu" bao-release-cross "/smoke/bao_${TAG}_linux_${arch}/bao" version -json | jq -e --arg tag "$TAG" --arg commit "$COMMIT" '.version == $tag and .commit == $commit and .built_with == "go1.26.11"'
             binary="$PWD/.work/smoke/$arch/bao_${TAG}_linux_${arch}/bao"
             bazel run --lockfile_mode=error //:verify -- -bao "$binary" -suite release-smoke -target "linux/$arch" -image bao-release-cross -evidence ".work/results/packaged-smoke-$arch"
           done

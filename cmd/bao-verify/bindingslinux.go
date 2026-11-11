@@ -58,6 +58,24 @@ func (h *harness) bindingsLinux() {
 		out := string(h.run("bindings-run-"+procs+".log", h.root, nil, args...))
 		check(strings.Contains(out, "PASS: typed scalars"), "typed scalar/scheduler checks failed")
 	}
+	// With cgo enabled and no other cgo dependency, runtime/cgo is not linked:
+	// default flags link internally and the bundled bootstrap installs its hooks
+	// from runtime._cgo_init. No C compiler is available to this build.
+	cgoExe := filepath.Join(h.dst, "bindings-cgo-executable")
+	cgoEnv := h.consumerEnv(map[string]string{"GOOS": "linux", "GOARCH": arch, "CGO_ENABLED": "1"})
+	h.run("bindings-cgo-consumer-build.log", app, cgoEnv, h.goTool, "build", "-o", cgoExe, ".")
+	info = string(h.run("bindings-cgo-buildinfo.log", app, nil, h.goTool, "version", "-m", cgoExe))
+	check(strings.Contains(info, "CGO_ENABLED=1") && !strings.Contains(info, "-ldflags"), "cgo-enabled typed consumer must build with default flags")
+	for _, procs := range []string{"1", "4"} {
+		args := []string{"docker", "run", "--rm", "--pull=never", "--network", "none", "--read-only", "-e", "GOMAXPROCS=" + procs, "-v", h.dst + ":/work:ro"}
+		if qemu == "" {
+			args = append(args, "--entrypoint", "/work/bindings-cgo-executable", h.image)
+		} else {
+			args = append(args, "--entrypoint", "/usr/bin/"+qemu, h.image, "-L", sysroot, "/work/bindings-cgo-executable")
+		}
+		out := string(h.run("bindings-cgo-run-"+procs+".log", h.root, nil, args...))
+		check(strings.Contains(out, "PASS: typed scalars"), "cgo-enabled typed scalar/scheduler checks failed")
+	}
 	artifacts, err := filepath.Glob(filepath.Join(app, "native", "*.syso"))
 	require(err)
 	unwind := false
@@ -80,7 +98,7 @@ func (h *harness) bindingsLinux() {
 	if qemu != "" {
 		execution = "QEMU guest execution; physical target hardware not verified"
 	}
-	h.results["typed_linux_bindings"] = map[string]any{"status": "PASS", "target": h.target, "image_id": imageID, "execution": execution, "cgo_enabled": false, "purego_module": false, "functions": len(scalarBindingSymbols), "checks": "integer/FP spills, mixed/narrow packing, pointer round trip, uint32 extension, TLS, GOMAXPROCS1schedulerprogress, GOMAXPROCS1/4", "dwarf": "original optimized -O2/-g C archive; source immutable; inference fails after source-level debug stripping", "debug": debug, "runtime_unwind": "preserved", "source_sha256": digest(filepath.Join(h.root, "testdata/bindings_integration.c")), "archive_sha256": originalHash, "executable_sha256": digest(exe)}
+	h.results["typed_linux_bindings"] = map[string]any{"status": "PASS", "target": h.target, "image_id": imageID, "execution": execution, "cgo_enabled": "0, and 1 with default flags and no cgo dependency", "cgo_executable_sha256": digest(cgoExe), "purego_module": false, "functions": len(scalarBindingSymbols), "checks": "integer/FP spills, mixed/narrow packing, pointer round trip, uint32 extension, TLS, GOMAXPROCS1schedulerprogress, GOMAXPROCS1/4", "dwarf": "original optimized -O2/-g C archive; source immutable; inference fails after source-level debug stripping", "debug": debug, "runtime_unwind": "preserved", "source_sha256": digest(filepath.Join(h.root, "testdata/bindings_integration.c")), "archive_sha256": originalHash, "executable_sha256": digest(exe)}
 	h.bindingsLinuxRust(lbao, arch, triple, sysroot, qemu)
 	fmt.Println("PASS fixed-signature", h.target, "without purego module")
 }

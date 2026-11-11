@@ -179,7 +179,7 @@ func showVersion(args []string, stdout io.Writer) error {
 		Commit  string `json:"commit,omitempty"`
 		Go      string `json:"built_with"`
 		Linker  string `json:"verified_go_linker"`
-	}{version, revision, runtime.Version(), "go1.26.10"}
+	}{version, revision, runtime.Version(), "go1.26.11"}
 	if *asJSON {
 		return writeJSON(stdout, info)
 	}

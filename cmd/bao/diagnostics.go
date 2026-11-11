@@ -44,7 +44,7 @@ const (
 	coffSectionLimit  = 0xffff
 	// Go stores a one-byte delta per 4 KiB findfunc bucket.
 	findfuncBucketLimit = 256
-	// cmd/link 1.26.10 masks SET_DYLIB_ORDINAL_IMM with 0xf.
+	// cmd/link 1.26.11 masks SET_DYLIB_ORDINAL_IMM with 0xf.
 	machOOrdinalLimit = 15
 )
 
@@ -658,7 +658,7 @@ func (d *diagnosticSession) checkOrdinals(libraries []string) {
 	d.limit(findingOrdinal, "ordinals", "dylibs", len(all), machOOrdinalLimit)
 	if len(all) > machOOrdinalLimit && len(d.report.Findings) != 0 {
 		last := &d.report.Findings[len(d.report.Findings)-1]
-		last.Evidence = append(evidence, "cmd/link 1.26.10 keeps only the low 4 bits of ordinals below 128, so ordinal 16 binds to this image")
+		last.Evidence = append(evidence, "cmd/link 1.26.11 keeps only the low 4 bits of ordinals below 128, so ordinal 16 binds to this image")
 	}
 }
 

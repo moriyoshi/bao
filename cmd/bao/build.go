@@ -201,8 +201,8 @@ func showPackage(o nativeFlags, target toolchain.Target, stdout io.Writer) error
 	}
 	fmt.Fprintf(stdout, "Generated %s for %s\n", r.Output, r.Target)
 	if o.signatures != nil {
-		fmt.Fprintln(stdout, "Consumer: CGO_ENABLED=0 go build (generated typed bindings; no purego module required)")
-		fmt.Fprintln(stdout, "Cgo-enabled consumer: CGO_ENABLED=1 go build -ldflags=-linkmode=internal (see README for verified targets)")
+		fmt.Fprintln(stdout, "Consumer: go build, with cgo enabled or disabled (generated typed bindings; no purego module required)")
+		fmt.Fprintln(stdout, "With another cgo dependency: CGO_ENABLED=1 go build -ldflags=-linkmode=internal (see README for verified targets)")
 	} else {
 		fmt.Fprintln(stdout, "Consumer: CGO_ENABLED=0 go build (requires purego)")
 	}

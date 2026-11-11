@@ -43,7 +43,7 @@ func TestDependencyScanScopeAndRejection(t *testing.T) {
 set -eu
 [ "$CGO_ENABLED" = 0 ] && [ "$GOPROXY" = off ] && [ "$GOWORK" = off ] && [ "$GOTOOLCHAIN" = local ] && [ "$GOENV" = off ]
 case "$*" in
-  'env GOVERSION') echo go1.26.10 ;;
+  'env GOVERSION') echo go1.26.11 ;;
   'list -m -mod=readonly -json all') cat "$BAO_SCAN_FIXTURE" ;;
   'mod verify') echo 'all modules verified' ;;
   *) echo 'unexpected build or execution command' >&2; exit 9 ;;

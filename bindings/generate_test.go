@@ -4,6 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -73,6 +77,54 @@ func TestBundledBootstrapSourceProvenance(t *testing.T) {
 		}
 		if fmt.Sprintf("%x", sha256.Sum256(b)) != want {
 			t.Fatalf("upstream bootstrap changed: %s", name)
+		}
+	}
+}
+
+func TestBootstrapServesCgoBuilds(t *testing.T) {
+	for _, target := range []string{"darwin/arm64", "darwin/amd64", "linux/arm64", "linux/amd64", "linux/loong64", "linux/ppc64le"} {
+		goos, arch, _ := strings.Cut(target, "/")
+		out := t.TempDir()
+		if err := emitBootstrap(out, "native", goos, arch); err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+		entries, err := os.ReadDir(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hooks := ""
+		for _, e := range entries {
+			b, err := os.ReadFile(filepath.Join(out, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := string(b)
+			if strings.Contains(s, `"runtime/cgo"`) {
+				t.Fatalf("%s: %s imports runtime/cgo", target, e.Name())
+			}
+			// Only crosscall2, which runtime/cgo also defines, stays cgo-disabled.
+			if source := strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), ".s"); source && strings.Contains(s, "!cgo") != strings.HasPrefix(e.Name(), "bao_bootstrap_asm_") {
+				t.Fatalf("%s: unexpected cgo constraint in %s", target, e.Name())
+			}
+			if regexp.MustCompile(`(?m)^var _cgo_\w+ = &|^var _iscgo bool = true|^var _set_crosscall2 = `).MatchString(s) {
+				t.Fatalf("%s: static runtime hook definition left in %s", target, e.Name())
+			}
+			if e.Name() == "bao_bootstrap_hooks_"+goos+"_"+arch+".s" {
+				hooks = s
+			}
+		}
+		for _, h := range bootstrapHooks {
+			if !strings.Contains(hooks, ", "+h.slot+"(SB)") {
+				t.Fatalf("%s: hook %s is not installed", target, h.slot)
+			}
+		}
+		for _, id := range syscallHooks {
+			if strings.Contains(hooks, "GLOBL\tsyscall·cgo_libc_"+id+"(SB), DUPOK|NOPTR, $16") != (goos == "linux") {
+				t.Fatalf("%s: syscall hook %s slot mismatch", target, id)
+			}
+		}
+		if !strings.Contains(hooks, "GLOBL\t_cgo_init(SB), DUPOK|NOPTR, $16") {
+			t.Fatalf("%s: missing DUPOK _cgo_init slot", target)
 		}
 	}
 }

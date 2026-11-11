@@ -152,6 +152,12 @@ func (m *image) addSymbol(name string, sect uint16, value, size uint64) uint32 {
 	return uint32(len(m.symbols) - 1)
 }
 
+// LLVM section types that carry linker directives.
+const (
+	shtLLVMLinkerOptions      elf.SectionType = 0x6fff4c01
+	shtLLVMDependentLibraries elf.SectionType = 0x6fff4c04
+)
+
 func (m *image) encode() ([]byte, error) {
 	if len(m.sections) >= int(elf.SHN_LORESERVE)-3 {
 		return nil, fmt.Errorf("too many sections")
@@ -161,6 +167,15 @@ func (m *image) encode() ([]byte, error) {
 	sections := append([]section(nil), m.sections...)
 	for i := range sections {
 		if sections[i].typ == elf.SHT_RELA || sections[i].typ == elf.SHT_REL || sections[i].typ == elf.SHT_SYMTAB || sections[i].typ == elf.SHT_STRTAB || sections[i].typ == elf.SHT_GROUP {
+			sections[i] = section{name: fmt.Sprintf(".bao.discard.%d", i), typ: elf.SHT_PROGBITS, align: 1}
+		}
+		// Clang emits empty .linker-options sections (for example with
+		// -std=c++20). Go's linker never applied these directives, and cmd/go
+		// 1.26.11 rejects .syso files containing either section type.
+		if sections[i].typ == shtLLVMLinkerOptions || sections[i].typ == shtLLVMDependentLibraries {
+			if sections[i].size != 0 {
+				return nil, fmt.Errorf("embedded linker options section %s is unsupported; pass required libraries explicitly", sections[i].name)
+			}
 			sections[i] = section{name: fmt.Sprintf(".bao.discard.%d", i), typ: elf.SHT_PROGBITS, align: 1}
 		}
 	}

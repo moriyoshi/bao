@@ -80,8 +80,8 @@ bazel run //:bao -- build -manifest-path examples/core_graphics/Cargo.toml \
 
 Bao requests full release DWARF from Cargo and emits `BaoExampleRun()` plus
 assembly adapters and bundled runtime support. Import this generated package
-and call `native.BaoExampleRun()` directly; build with `CGO_ENABLED=0 go build`
-without importing or fetching purego. The shared consumer template above is
+and call `native.BaoExampleRun()` directly; build with `go build`, with cgo
+enabled or disabled, without importing or fetching purego. The shared consumer template above is
 for runtime registration; its `RegisterFunc` call is replaced by the direct
 typed call for this mode. Runtime teardown and TLS finalization still apply.
 

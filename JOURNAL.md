@@ -4231,3 +4231,366 @@ Not checked:
 - Linux or Windows archives that actually carry `.llvmbc` (unit fixtures only;
   gpui-go v0.0.1 linux/windows modules carry none).
 - The bao-verify suites.
+
+## 2026-11-11: Spike: cgo hook thunks so plain go build works with cgo enabled
+
+Problem: generated Darwin typed packages import runtime/cgo when cgo is
+enabled. Go's linker then sees runtime/cgo plus a non-internal host object (the
+.syso) and selects external linking (cmd/link/internal/ld/config.go:208 in Go
+1.26.10), which cannot consume Bao's Darwin ELF containers. A plain `go build`
+on a macOS machine with Xcode therefore fails unless the consumer passes
+`CGO_ENABLED=0` or `-ldflags=-linkmode=internal`. Darwin's standard library does
+not link runtime/cgo with cgo enabled (`go list -deps net/http os/user
+crypto/x509` found it 0 times on darwin/arm64, once on linux/arm64), so the
+bundled bootstrap could serve cgo-enabled builds if it coexisted with a real
+runtime/cgo when one is present.
+
+Idea tested: an import-slot style thunk. The runtime's `_cgo_init` slot points
+to a Bao-owned C-ABI thunk. On its single-threaded first call from rt0_go, the
+thunk reads `runtime.iscgo` (initialized to true only by runtime/cgo) and either
+forwards to runtime/cgo's `x_cgo_init` or takes the bundled path (here: returns).
+`x_cgo_init` is declared in Go as a 1-byte BSS fallback so the reference
+resolves when runtime/cgo is absent; runtime/cgo's TEXT replaces it otherwise.
+No Bao generator or bootstrap code was changed.
+
+Findings:
+- Defining the slot in the .syso fails when runtime/cgo is linked: the ELF
+  loader panics with "unexpected non-empty interior symbol"
+  (loader.AddInteriorSym) because runtime/cgo's `_cgo_init` is Go DATA. A host
+  object may only take over an empty Go symbol. Without runtime/cgo the
+  takeover of the runtime's BSS slot worked.
+- Defining the slot in Go assembly as `GLOBL _cgo_init(SB), DUPOK|NOPTR, $16`
+  wins in every tested case. The loader keeps the larger symbol when one side
+  is DUPOK, so 16 bytes beats both the runtime's 8-byte BSS and runtime/cgo's
+  8-byte DATA. Two library orders were tested: runtime/cgo loaded after the
+  thunk package (layout A) and before it (layout B, via wrapper packages).
+- The thunk ran exactly once in every positive build; `go tool nm -size` showed
+  a 16-byte `_cgo_init`, and `x_cgo_init` as 1-byte BSS without runtime/cgo and
+  as runtime/cgo's TEXT with it.
+
+Results (macOS 26.5.2 arm64, native execution, stock Go 1.26.10 with GOROOT
+unset, GOTOOLCHAIN=local GOENV=off GOWORK=off, Apple clang 21.0.0 producing the
+aarch64 ELF .syso with `-target aarch64-linux-gnu`; each binary ran at
+GOMAXPROCS=1 and 4; the cgo-dependency app made 64 cgo calls from goroutines
+locked to OS threads):
+
+| Build | Result |
+| --- | --- |
+| `CGO_ENABLED=0 go build` | Linked and ran; thunk called, iscgo=false |
+| `CGO_ENABLED=1 go build`, no cgo dependency | Linked internally with no flags and ran; thunk called, iscgo=false |
+| `CGO_ENABLED=1`, real cgo dependency, `-linkmode=internal`, layouts A and B | Linked and ran; thunk forwarded, cgo results correct |
+| Negative: thunk without forwarding, cgo dependency | Hung; killed after 10s at both GOMAXPROCS values |
+| Negative: 8-byte DUPOK slot, no cgo and both cgo layouts | Linked and ran, but the thunk was never installed |
+| Negative: cgo dependency with default link mode | External link failed, `ld: unknown file type` on the ELF .syso |
+
+Reproduce with `.work/cgo-thunk-spike/run.sh` (sources and log in that
+directory; the Go cache path is local to it).
+
+Limitations: only `_cgo_init` was thunked, and the bundled path was a no-op
+rather than the real bootstrap. The bundled branch must still set `iscgo`
+(safe at that single-threaded point) and the other hooks (`_cgo_thread_start`,
+`_cgo_notify_runtime_init_done`, `_cgo_bindm`, `_cgo_pthread_key_created`,
+setenv/unsetenv, `set_crosscall2`); `crosscall2` is defined by both bootstraps.
+`runtime.iscgo` gets a merged symbol size (2 bytes BSS without runtime/cgo);
+this was harmless here but is unexplained. The DUPOK size rule is
+linker-internal behavior of Go 1.26.10 and could change. Apps with a real cgo
+dependency still need `-ldflags=-linkmode=internal`. Darwin amd64, Linux,
+Windows, `-race`, and signing were not checked.
+
+## 2026-11-11: cgo hook-thunk spike on Linux arm64 and Windows amd64 link modes
+
+Follows the Darwin spike entry of the same date.
+
+Linux arm64: the same thunk (`_cgo_init` as a 16-byte DUPOK Go-assembly slot
+pointing at a C-ABI thunk in an ELF .syso) was built with the pinned Linux
+arm64 Go 1.26.10 SDK and GCC 14.4.0 in the native Colima Linux arm64 VM
+(Docker image bao-static-linux:arm64, `--network none`). The .syso was
+assembled on the macOS host with Apple clang 21.0.0
+`-target aarch64-linux-gnu`. Reproduce from the repository root:
+
+    docker run --rm --pull=never --network none --platform linux/arm64 \
+      -v "$PWD:/repo" -v "$PWD/.work/ci-42510210430/sdk-arm64/go:/sdk:ro" \
+      -w /repo/.work/cgo-thunk-spike/linux \
+      -e PATH=/sdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      --entrypoint /bin/sh bao-static-linux:arm64 ./run.sh
+
+The first run segfaulted at startup in every build without runtime/cgo. Cause:
+the spike had no dynamic imports, so Go's linker produced a static (-d)
+executable (cmd/link/internal/ld/lib.go:841-844) and skipped dynreloc
+(data.go:1003), which is where host-object ELF relocations are converted. The
+thunk's ADRP/ADD/B relocations were left as zeros and its first store hit
+read-only text. No link error was reported. Real Bao Linux packages always
+import libc dynamically. After adding one libc dynamic import
+(`//go:cgo_import_dynamic ... "libc.so.6"`) to the spike packages, the
+binaries had NEEDED libc.so.6 and the results matched Darwin. Each binary ran
+natively at GOMAXPROCS=1 and 4 (log: .work/cgo-thunk-spike/linux/run-dyn.log;
+the static-executable run is run.log):
+
+| Build | Result |
+| --- | --- |
+| `CGO_ENABLED=0 go build` | Linked and ran; thunk called, iscgo=false |
+| `CGO_ENABLED=1 go build`, no cgo dependency | Linked internally with no flags and ran |
+| Real cgo dependency, `-linkmode=internal`, layouts A and B | Linked and ran; thunk forwarded, cgo results correct |
+| net/http import, `-linkmode=internal` | Linked and ran; runtime/cgo linked via net, thunk forwarded |
+| net/http or cgo dependency, default link mode | External link failed: `undefined reference to runtime.iscgo` from the .syso |
+| Negative: thunk without forwarding, cgo dependency | Segfault at both GOMAXPROCS values |
+| Negative: 8-byte DUPOK slot | Ran, but the thunk was never installed |
+
+The external-link failure is specific to the spike's reference to a Go symbol
+name. Bao's real objects already fail external linking. On Linux, net/http
+pulls in runtime/cgo when cgo is enabled, so such applications still need
+`-ldflags=-linkmode=internal` even with thunks.
+
+Windows amd64: generated packages already omit both the runtime/cgo import and
+the bundled bootstrap, so no thunk was tried. A fresh typed package was
+generated by `bao build -target windows/amd64 -bindings dwarf` from a C object
+built with LLVM-MinGW 20261104 (clang 23.1.5) and cross-built with Go 1.26.10
+on macOS arm64. It runs under local Wine Devel on macOS arm64; this is emulated
+execution, not native Windows. Reproduce with `.work/cgo-thunk-spike/win/run.sh`.
+With `add` plus a function calling kernel32 GetCurrentProcessId (one system
+import, one unwind table), each binary ran at GOMAXPROCS=1 and 4 (log:
+run-dllimport.log):
+
+| Build | Result |
+| --- | --- |
+| `CGO_ENABLED=0 go build` | Ran; add=42, pid check passed |
+| `CGO_ENABLED=1 go build`, no cgo dependency, no flags | Linked internally (no host link with `-ldflags=-v`), no runtime/cgo symbols; ran |
+| Real cgo dependency, default link mode | External link failed: `relocation target bao_win_..._unwind_roots_0 not defined` and alignment symbols |
+| Real cgo dependency, `-linkmode=internal` | Ran; cgo call correct |
+
+So Windows typed consumers with cgo enabled and no cgo dependency already need
+no flags; the README's cgo instructions are stricter than necessary for that
+case. An earlier `add`-only fixture did link externally through LLVM-MinGW with
+a cgo dependency and ran (log: run.log), but it is not representative.
+
+Limitations: as in the Darwin spike, only `_cgo_init` was thunked and the
+bundled branch was a no-op; on Linux the bundled branch must also complete
+thread setup inside that call because Linux threads use clone without cgo
+hooks. Linux amd64, loong64, ppc64le, Windows arm64, native Windows, `-race`,
+and signing were not checked. No Bao code or README text was changed.
+
+## 2026-11-11: Typed bindings build with default go build flags on Darwin and Linux
+
+Implements the hook-thunk design from the two spike entries of the same date.
+Previously, generated Darwin and Linux typed packages imported runtime/cgo
+when cgo was enabled, so a plain `go build` on a machine with a C compiler
+selected external linking and failed. Consumers had to pass `CGO_ENABLED=0` or
+`-ldflags=-linkmode=internal`.
+
+Change (bindings/hooks.go, bindings/generate.go):
+- The `bao_cgo_<goos>_<arch>.go` file importing runtime/cgo is no longer
+  generated. The bundled bootstrap is emitted for cgo-enabled and -disabled
+  builds: `!cgo` build constraints are removed at emission, except on the
+  upstream crosscall2 assembly, which runtime/cgo also defines and neither
+  runtime calls.
+- Upstream static hook definitions are rewritten at emission into plain
+  declarations (`_cgo_init`, `_cgo_thread_start`,
+  `_cgo_notify_runtime_init_done`, `_cgo_pthread_key_created`, `_cgo_bindm`,
+  `runtime.set_crosscall2`, `runtime.iscgo`, `runtime._cgo_setenv`,
+  `runtime._cgo_unsetenv`). The rewrite count is checked against the hook list,
+  so an upstream change fails generation. The embedded `.txt` sources and their
+  provenance hashes are unchanged.
+- New Bao-authored `bao_bootstrap_hooks.go` and
+  `bao_bootstrap_hooks_<goos>_<arch>.s` define `_cgo_init` as a 16-byte
+  `DUPOK|NOPTR` slot pointing at `bao_cgo_init_thunk`. From rt0_go, the thunk
+  tail-calls runtime/cgo's `x_cgo_init` if runtime/cgo set `runtime.iscgo`;
+  otherwise it installs the bundled hooks, sets `iscgo` and tail-calls the
+  bundled `x_cgo_init_trampoline`. Thunks exist for arm64, amd64, loong64 and
+  ppc64le.
+- Linux `syscall.cgo_libc_*` hooks: syscall does not push these names, so Go
+  1.26.10's linkname check rejects references from other packages, from Go
+  and from assembly alike ("invalid reference to syscall.cgo_libc_setegid").
+  Bao instead defines each as a 16-byte DUPOK slot holding the bundled
+  trampoline (definitions are allowed), and the runtime/cgo branch of the thunk
+  points each back at runtime/cgo's `_cgo_libc_*` C function. References to a
+  symbol whose winning definition is in the referencing package pass the check.
+- ppc64x rt0_go calls save_g before `_cgo_init`; the ppc64le thunk calls
+  runtime·save_g after setting iscgo. A negative control without this step
+  still passed the scalar fixture under QEMU (below): systemstack, gogo, mcall
+  and asmcgocall all call save_g, so the step only covers the window before the
+  runtime's next save_g. It is kept to match the static bootstrap's state.
+- CLI hint, NOTICE text, bao-bindings.json runtime text, README,
+  examples/README.md, ci/cgo-linux.sh and bao-verify updated. The Darwin
+  verifier now builds the no-dependency cgo case with default flags at
+  GOMAXPROCS 1 and 4 and adds a negative control requiring the default link of
+  a real cgo dependency to fail. The Linux bindings verifier adds a CGO_ENABLED=1
+  default-flag build, with unavailable native compiler paths, run at GOMAXPROCS
+  1 and 4. The Windows verifier's no-dependency cgo build drops
+  `-linkmode=internal`.
+
+Combinations: two generated typed packages in one executable still fail at
+link time (`duplicated definition of symbol crosscall2` with cgo disabled,
+`bao_cgo_init_thunk` with cgo enabled), so the one-bootstrap rule remains
+enforced. Combination with PureGo's own fakecgo was not tested. With a cgo
+dependency, the default external link now fails on the bootstrap's dynamic
+import relocations (`unhandled relocation for purego_sigfillset ...
+R_CALLARM64` on Linux arm64) and, on Darwin, on missing native sections, as
+before; `-ldflags=-linkmode=internal` is still required.
+
+Verification, macOS 26.5.2 arm64 host, stock Go 1.26.10 (GOROOT unset,
+GOTOOLCHAIN=local GOENV=off GOWORK=off), Apple clang 21.0.0, Rust 1.99.1. Fresh
+CLI and verifier were built from this tree into .work/cgo-thunk-impl/verify and
+run by `.work/cgo-thunk-impl/verify/run-all.sh` (logs and evidence directories
+alongside):
+
+    verify -suite bindings -target T [-image bao-static-linux:cross] \
+      -bao .work/cgo-thunk-impl/verify/bao -go <go1.26.10> -evidence ...
+
+- darwin/arm64 (native) and darwin/amd64 (Rosetta 2): PASS. Manifest, DWARF and
+  Rust std fixtures each ran with CGO_ENABLED=0 (ad-hoc Hardened Runtime signing
+  and signed execution of the cgo-disabled Rust executable), CGO_ENABLED=1 with
+  default flags and no cgo dependency, and a real cgo dependency with
+  `-linkmode=internal`, at GOMAXPROCS 1 and 4. The default-link negative
+  failed as required. Cgo-enabled executables were not separately signed.
+- linux/arm64 (native Docker), linux/loong64 and linux/ppc64le (QEMU guest
+  execution in bao-static-linux:cross, image sha256:e1b1ecf3b7d7...): PASS,
+  including C scalar and Rust std fixtures with CGO_ENABLED=0, and the new
+  CGO_ENABLED=1 default-flag scalar build at GOMAXPROCS 1 and 4.
+- `sh ci/cgo-linux.sh` in the native Linux arm64 VM (bao-static-linux:arm64,
+  Linux arm64 Go 1.26.10 SDK, GCC 14.4.0): fresh producer and fixture; plain
+  CGO_ENABLED=1 build ran at GOMAXPROCS 1 and 4; the default link with a real
+  cgo dependency failed; the internal-link cgo dependency build ran at 1 and 4;
+  the cgo-disabled control ran. Log: .work/cgo-thunk-impl/cgo-linux.log.
+- Real cgo dependency on loong64 and ppc64le: the verifier-generated scalar
+  consumers plus a cgo package were built inside bao-static-linux:cross with the
+  Linux arm64 Go SDK and Debian GCC 14.2.0 cross compilers
+  (`.work/cgo-thunk-impl/crossdep/run.sh`) and run under qemu-loongarch64 and
+  qemu-ppc64le at GOMAXPROCS 1 and 4: PASS, with runtime/cgo's x_cgo_init and
+  x_cgo_thread_start linked and the default link failing.
+- ppc64le negative control: removing the save_g call from the generated hook
+  assembly still passed the cgo-disabled scalar fixture at GOMAXPROCS 1 and 4
+  under QEMU (.work/cgo-thunk-impl/ppc-nosaveg).
+- Bootstrap-only link matrix (`.work/cgo-thunk-impl/xlink/link.sh`): a trivial
+  main calling os.Setenv linked for darwin/{arm64,amd64} and
+  linux/{arm64,amd64,loong64,ppc64le} with CGO_ENABLED 0 and 1. The Darwin
+  binaries ran natively and under Rosetta; linux/amd64 ran under Docker's
+  x86_64 emulation (bao-static-linux:amd64) at GOMAXPROCS 1 and 4. No
+  translated native library was executed on linux/amd64.
+- On darwin/arm64, `go tool nm -size` confirmed a 16-byte `_cgo_init`, the
+  placeholder `x_cgo_init` without runtime/cgo and runtime/cgo's TEXT
+  `x_cgo_init`/`x_cgo_thread_start` with a cgo dependency.
+- `go test ./...` and `go vet ./...` passed; new
+  `TestBootstrapServesCgoBuilds` checks emitted constraints, removed static
+  hooks and generated installs for all six targets. With Bazel 8.4.2 from
+  .work/tools, `bazel test //bindings:bindings_test` passed and
+  `bazel build //cmd/... //bindings/...` succeeded.
+- windows/amd64 under local Wine Devel on macOS arm64 (emulated, not native
+  Windows), LLVM-MinGW 20261104 clang driver (`.work/cgo-thunk-impl/verify/
+  run-windows.sh`): `CHECKED_WITH_LIMITATIONS`, as before. The manifest, DWARF
+  and lifecycle cgo-enabled no-dependency consumers now build with default
+  flags and passed; the cgo-dependency legs still use `-linkmode=internal`.
+  Windows generation code was not changed.
+
+Not checked: native Windows, Windows arm64 execution, a translated native
+library on linux/amd64, combination with PureGo's fakecgo, `-race`, and
+signing of cgo-enabled Darwin executables.
+
+## 2026-11-11: Pin Go 1.26.11
+
+Go 1.26.11 addresses build-toolchain vulnerabilities. Bao's Go pins (go.mod
+toolchain, MODULE.bazel SDK, CI and release workflows, ci/check.sh,
+release/smoke.sh, bao doctor, verified-build and scan profiles, the Bazel
+profile, bao-verify, bao-release metadata and translate.LinkerProfile) now
+require go1.26.11. Comments citing Go linker/assembler behavior were renumbered
+after confirming that cmd/link/internal/ld/macho.go and data.go,
+cmd/internal/obj/loong64 and cmd/link/internal/loader and loadelf are
+unchanged between 1.26.10 and 1.26.11. README statements that record
+verification were changed only where the corresponding check reran with
+1.26.11 (below); the Linux C++ profile still records 1.26.10 and says it has
+not been rechecked.
+
+Toolchain: darwin/arm64 1.26.11 installed by `mise install go@1.26.11`;
+linux/arm64 go1.26.11.linux-arm64.tar.gz downloaded from go.dev and matched
+the published SHA-256
+6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e
+(.work/go1.26.11/sdk-arm64). Bazel's rules_go fetched go1.26.11 for
+darwin/arm64.
+
+Relevant 1.26.11 changes, from diffing the two SDK source trees: cgo
+directives reject commas and the compiler checks every character of
+cgo_import_dynamic library names; cmd/go runs a format check on every .syso
+(rejecting LLVM/GCC LTO and bitcode sections such as `.llvmbc` and `__LLVM`,
+ELF embedded linker options, and validating COFF `.drectve`); cmd/link rejects
+unrecognized .syso formats; and cmd/go and cmd/pack now keep the `.syso`
+suffix when truncating long archive member names to 16 bytes. Bao's Darwin and
+Linux ELF and Windows COFF objects pass the format check; Bao already drops
+`.drectve` from translated COFF, and the base branch drops embedded bitcode.
+
+Regression found and fixed: with 1.26.11, `bao verified-build` (signatures
+suite) failed with `unexpected or substituted archive member
+"native_0000.syso"`, because verify.memberName still truncated every member to
+16 bytes. It now mirrors the 1.26.11 rule (first 11 bytes plus `.syso` for long
+.syso names; generated names are ASCII, so cmd/go's byte truncation and
+cmd/pack's rune truncation agree). rules_go 0.65.0 packs through `go tool
+pack`, so the Bazel profile uses the same names. TestArchiveMemberNames covers
+the rule.
+
+Verification on macOS 26.5.2 arm64 with stock Go 1.26.11 (GOROOT unset,
+GOTOOLCHAIN=local GOENV=off GOWORK=off), Apple clang 21.0.0, Rust 1.99.1:
+- `go test ./...` and `go vet ./...` passed; `bazel test //...` with Bazel 8.4.2
+  from .work/tools ran 11 tests, all passing.
+- Before the pin bump, from a copy of the tree whose only change was the
+  bao-verify version gate (.work/go1.26.11/tree,
+  `.work/go1.26.11/verify/run-all.sh`): bindings suite PASS on darwin/arm64,
+  darwin/amd64 (Rosetta 2), linux/arm64 (native Docker), linux/loong64 and
+  linux/ppc64le (QEMU, bao-static-linux:cross), including the cgo-enabled
+  default-flag and cgo-dependency legs; windows suite for windows/amd64 with
+  LLVM-MinGW 20261104 under local Wine (emulated, not native Windows):
+  `CHECKED_WITH_LIMITATIONS`, as with 1.26.10.
+- From the bumped tree (`.work/go1.26.11/verify-main/run-all.sh` and
+  rerun.sh): darwin, tls and cpp suites on darwin/arm64 and darwin/amd64
+  (Rosetta 2) passed (cpp: `CHECKED_WITH_LIMITATIONS` with its recorded
+  `UNSUPPORTED` entries, as before); linux suite on linux/arm64 with
+  bao-static-linux:cross passed; static suite on linux/arm64, loong64 and
+  ppc64le with bao-static-linux:cross passed; signatures suite on darwin/arm64
+  and darwin/amd64 passed after the memberName fix (it failed before it).
+- In containers with the Linux arm64 1.26.11 SDK: `sh ci/cgo-linux.sh`
+  (bao-static-linux:arm64, GCC 14.4.0) passed, including the default-link
+  negative; the loong64/ppc64le cgo-dependency consumers
+  (`.work/cgo-thunk-impl/crossdep/run.sh`, Debian GCC 14.2.0 cross compilers)
+  passed under QEMU at GOMAXPROCS 1 and 4.
+- The bootstrap-only linux/amd64 binaries linked with 1.26.11 for cgo 0 and 1
+  and ran under Docker's x86_64 emulation at GOMAXPROCS 1 and 4.
+
+Not rerun with 1.26.11: the Darwin static suite (no prebuilt static
+runtime root under .work/static-runtimes), the Linux cpp and linux-cross
+suites (their images are not present locally), the bazel and release-smoke
+suites, gpui, native Windows, Windows arm64 and hosted CI. The bindings and
+windows suite results above came from the pre-bump copy, which differs from
+the committed tree only in version pins and the memberName fix; neither
+suite uses verified-build.
+
+## 2026-11-11: Drop empty LLVM linker-option sections from Linux ELF output
+
+Follows the "Pin Go 1.26.11" entry. Hosted CI run 42983197798 (PR #4) failed
+in the Linux C++ clang++ unwind leg on linux/amd64 and linux/arm64:
+
+    bao-cpp-check/native: disallowed ELF embedded linker options section in
+    .syso: .../native/native_0_linux_<arch>.syso
+
+Cause: Clang 19 emits an empty `.linker-options` section
+(SHT_LLVM_LINKER_OPTIONS, 0x6fff4c01, SHF_EXCLUDE) with `-std=c++20`, and the
+Linux translator copied it into the .syso. Go's linker never applied it, but
+cmd/go 1.26.11 rejects .syso files containing SHT_LLVM_LINKER_OPTIONS or
+SHT_LLVM_DEPENDENT_LIBRARIES (0x6fff4c04) regardless of size. The local
+1.26.11 runs did not cover this because the Linux C++ suites were not run
+locally (their images are absent).
+
+Change: linuxelf's encoder replaces empty sections of either type with the
+existing empty `.bao.discard.N` placeholder, preserving section indices, and
+rejects non-empty ones with an error asking for explicit libraries, since
+neither Go's linker nor Bao applies those directives.
+TestEncodeDropsEmptyLinkerOptions covers both cases.
+
+Reproduction on macOS 26.5.2 arm64: in bao-static-linux:cross (Debian clang
+19.1.7), `clang++ -std=c++20 -O2 -g -fPIC -fno-omit-frame-pointer -pthread
+-mno-outline-atomics -stdlib=libstdc++ -c examples/cpp/unwind.cpp` produced
+`.linker-options` (and `.llvm_addrsig`); without `-std=c++20` only
+`.llvm_addrsig` appeared. A linux/arm64 `bao build -bindings dwarf -symbol
+bao_example_run` of that archive with the previous CLI kept one
+LLVM_LINKER_OPTIONS section, and a typed consumer cross-built with Go 1.26.11
+failed with the CI error (negative control). With the fixed CLI the section
+was gone, the consumer linked, and the executable ran natively in the
+container with exit 0. `go test ./...` and `go vet ./...` passed with Go
+1.26.11. Scratch files are in .work/go1.26.11/llvmopt. The Linux C++ suites
+themselves were not run locally; hosted CI is the check for them.

@@ -57,8 +57,8 @@ func doctor(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return trimOutput(b), err
 	}
 	goVersion, err := probe("go", "version")
-	if err == nil && !strings.Contains(goVersion, " go1.26.10 ") {
-		err = fmt.Errorf("verified consumer linker is go1.26.10; found %s", goVersion)
+	if err == nil && !strings.Contains(goVersion, " go1.26.11 ") {
+		err = fmt.Errorf("verified consumer linker is go1.26.11; found %s", goVersion)
 	}
 	check("go", err, goVersion)
 	rustVersion, err := probe("rustc", "--version")

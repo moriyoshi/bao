@@ -613,7 +613,7 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 				return nil, fmt.Errorf("COFF section %s requests alignment %d beyond the checked stock-Go profile %d; -windows-max-data-alignment 32 accepts this for read-only data only", s.name, alignment, limit)
 			}
 			if s.flags&pe.IMAGE_SCN_CNT_CODE == 0 && !(p.Arch == "amd64" && (s.name == ".pdata" || s.name == ".xdata")) {
-				// Go 1.26.10 infers data alignment up to 32 from section size.
+				// Go 1.26.11 infers data alignment up to 32 from section size.
 				// Pad only the end so all original symbol/relocation offsets stay fixed.
 				if s.size < alignment {
 					s.size = alignment

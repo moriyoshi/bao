@@ -151,7 +151,8 @@ func (h *harness) windows() {
 func (h *harness) checkWindowsCgo(app, mode, arch, module, marker string) {
 	exe := filepath.Join(h.dst, mode+"-cgo.exe")
 	env := map[string]string{"CGO_ENABLED": "1", "GOOS": "windows", "GOARCH": arch, "CC": h.windowsCC, "CXX": h.windowsCXX}
-	h.run("windows-"+mode+"-cgo-no-dependency-build.log", app, env, h.goTool, "build", "-ldflags=-linkmode=internal", "-o", exe, ".")
+	// Windows packages never import runtime/cgo, so Go links internally by default.
+	h.run("windows-"+mode+"-cgo-no-dependency-build.log", app, env, h.goTool, "build", "-o", exe, ".")
 	out := h.run("windows-"+mode+"-cgo-no-dependency-run.log", h.root, nil, h.windowsExecute(exe)...)
 	check(strings.Contains(string(out), marker), "Windows cgo-enabled consumer without cgo dependency failed")
 	dep := filepath.Join(app, "cgodep")

@@ -17,8 +17,10 @@ mkdir "$work/app"
 printf 'module bao-bindings-check\n\ngo 1.26.0\n' > "$work/app/go.mod"
 cp testdata/bindings_consumer.go.tmpl "$work/app/main.go"
 cd "$work/app"
-CGO_ENABLED=1 go build -ldflags=-linkmode=internal -o "$work/app-cgo-no-dependency" .
+# Without another cgo dependency runtime/cgo is not linked; default flags link internally.
+CGO_ENABLED=1 go build -o "$work/app-cgo-no-dependency" .
 GOMAXPROCS=1 "$work/app-cgo-no-dependency"
+GOMAXPROCS=4 "$work/app-cgo-no-dependency"
 mkdir "$work/app/cgodep"
 cat > "$work/app/cgodep/cgo.go" <<'EOF'
 package cgodep
@@ -33,6 +35,11 @@ package main
 import "bao-bindings-check/cgodep"
 func init() { if cgodep.Answer() != 42 { panic("cgo dependency") } }
 EOF
+# A real cgo dependency links runtime/cgo; Go's default external link must fail.
+if CGO_ENABLED=1 go build -o "$work/app-cgo-not-produced" . > "$work/default-link.log" 2>&1; then
+  echo "cgo dependency unexpectedly linked with the default external linker" >&2
+  exit 1
+fi
 CGO_ENABLED=1 go build -ldflags=-linkmode=internal -o "$work/app-cgo" .
 GOMAXPROCS=1 "$work/app-cgo"
 GOMAXPROCS=4 "$work/app-cgo"

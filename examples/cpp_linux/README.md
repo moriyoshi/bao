@@ -15,7 +15,8 @@ including both binding modes and the scalar ABI controls:
 | loong64 | 14.2.0 | 19.1.7 | QEMU 10.0.13 on arm64 |
 | ppc64le (ELFv2) | 14.2.0 | 19.1.7 | QEMU 10.0.13 on arm64 |
 
-The profiles use glibc 2.41, GNU ld 2.44, and Go 1.26.10. Clang selects the
+The profiles use glibc 2.41 and GNU ld 2.44 and were checked with Go 1.26.10;
+they have not yet been rechecked with the pinned Go 1.26.11. Clang selects the
 corresponding GCC toolchain and libstdc++; libc++ and LLVM libunwind remain
 unverified. Reusable CI selects native runners for arm64/amd64 and
 explicit QEMU execution for loong64/ppc64le. Physical LoongArch and PowerPC

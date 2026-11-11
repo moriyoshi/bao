@@ -140,8 +140,8 @@ func Build(ctx context.Context, o BuildOptions) (BuildReport, error) {
 	if err = Decode(b, &ge); err != nil {
 		return report, err
 	}
-	if ge["GOVERSION"] != "go1.26.10" {
-		return report, fmt.Errorf("verified-build profile requires stock Go 1.26.10, got %s", ge["GOVERSION"])
+	if ge["GOVERSION"] != "go1.26.11" {
+		return report, fmt.Errorf("verified-build profile requires stock Go 1.26.11, got %s", ge["GOVERSION"])
 	}
 	// Resolve without compiling or executing any consumer init/main. Dependencies
 	// must be downloaded beforehand; no network or toolchain download is allowed.
@@ -317,7 +317,14 @@ func decodePackages(b []byte) ([]Package, error) {
 		out = append(out, p)
 	}
 }
+// memberName is the archive member name that cmd/go and cmd/pack 1.26.11 give
+// file s: names are truncated to 16 bytes, but a long .syso name keeps its
+// suffix (first 11 bytes plus ".syso"). Generated native names are ASCII, so
+// cmd/go's byte truncation and cmd/pack's rune truncation agree.
 func memberName(s string) string {
+	if len(s) > 16 && strings.HasSuffix(s, ".syso") {
+		return s[:16-len(".syso")] + ".syso"
+	}
 	if len(s) > 16 {
 		return s[:16]
 	}

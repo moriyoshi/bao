@@ -93,8 +93,8 @@ func Scan(ctx context.Context, o ScanOptions) (ScanReport, error) {
 	if err != nil {
 		return report, err
 	}
-	if strings.TrimSpace(string(b)) != "go1.26.10" {
-		return report, fmt.Errorf("verification profile requires stock Go 1.26.10, got %s", strings.TrimSpace(string(b)))
+	if strings.TrimSpace(string(b)) != "go1.26.11" {
+		return report, fmt.Errorf("verification profile requires stock Go 1.26.11, got %s", strings.TrimSpace(string(b)))
 	}
 	b, err = run("list", "-m", "-mod=readonly", "-json", "all")
 	if err != nil {

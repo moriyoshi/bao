@@ -3,6 +3,7 @@ package linuxelf
 import (
 	"bytes"
 	"debug/elf"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -103,5 +104,35 @@ func TestStripELFBitcodeKeepsDebugAndRuntime(t *testing.T) {
 	}
 	if _, _, _, err := StripBitcode(live); err == nil || !strings.Contains(err.Error(), "LLVM bitcode") {
 		t.Fatal("runtime reference to bitcode was not rejected", err)
+	}
+}
+
+func TestEncodeDropsEmptyLinkerOptions(t *testing.T) {
+	m := tlsFixture()
+	m.sections = append(m.sections, section{name: ".linker-options", typ: shtLLVMLinkerOptions, flags: 0x80000000, align: 1})
+	b, err := m.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := elf.NewFile(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	i := len(m.sections) - 1
+	if len(f.Sections) <= i || f.Sections[i].Name != fmt.Sprintf(".bao.discard.%d", i) {
+		t.Fatal("section indices were not preserved")
+	}
+	for _, s := range f.Sections {
+		if s.Type == shtLLVMLinkerOptions || s.Name == ".linker-options" {
+			t.Fatal("empty linker options section survived")
+		}
+	}
+	for _, typ := range []elf.SectionType{shtLLVMLinkerOptions, shtLLVMDependentLibraries} {
+		m := tlsFixture()
+		m.sections = append(m.sections, section{name: ".deplibs", typ: typ, flags: 0x80000000, align: 1, size: 4, data: []byte("foo\x00")})
+		if _, err := m.encode(); err == nil || !strings.Contains(err.Error(), "linker options") {
+			t.Fatalf("non-empty %#x section was not rejected: %v", uint32(typ), err)
+		}
 	}
 }

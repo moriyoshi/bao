@@ -255,3 +255,18 @@ func TestAssemblyIncludeEscapeRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestArchiveMemberNames(t *testing.T) {
+	for in, want := range map[string]string{
+		"native.syso":                "native.syso",
+		"native_0_darwin_arm64.syso": "native_0_da.syso",
+		"bindings_darwin_arm64.o":    "bindings_darwin_",
+		"_go_.o":                     "_go_.o",
+		"exactly_16_b.syso":          "exactly_16_.syso",
+		"sixteen_chars_ok":           "sixteen_chars_ok",
+	} {
+		if got := memberName(in); got != want {
+			t.Fatalf("memberName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
