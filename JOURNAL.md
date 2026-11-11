@@ -4559,3 +4559,38 @@ suites, gpui, native Windows, Windows arm64 and hosted CI. The bindings and
 windows suite results above came from the pre-bump copy, which differs from
 the committed tree only in version pins and the memberName fix; neither
 suite uses verified-build.
+
+## 2026-11-11: Drop empty LLVM linker-option sections from Linux ELF output
+
+Follows the "Pin Go 1.26.11" entry. Hosted CI run 42983197798 (PR #4) failed
+in the Linux C++ clang++ unwind leg on linux/amd64 and linux/arm64:
+
+    bao-cpp-check/native: disallowed ELF embedded linker options section in
+    .syso: .../native/native_0_linux_<arch>.syso
+
+Cause: Clang 19 emits an empty `.linker-options` section
+(SHT_LLVM_LINKER_OPTIONS, 0x6fff4c01, SHF_EXCLUDE) with `-std=c++20`, and the
+Linux translator copied it into the .syso. Go's linker never applied it, but
+cmd/go 1.26.11 rejects .syso files containing SHT_LLVM_LINKER_OPTIONS or
+SHT_LLVM_DEPENDENT_LIBRARIES (0x6fff4c04) regardless of size. The local
+1.26.11 runs did not cover this because the Linux C++ suites were not run
+locally (their images are absent).
+
+Change: linuxelf's encoder replaces empty sections of either type with the
+existing empty `.bao.discard.N` placeholder, preserving section indices, and
+rejects non-empty ones with an error asking for explicit libraries, since
+neither Go's linker nor Bao applies those directives.
+TestEncodeDropsEmptyLinkerOptions covers both cases.
+
+Reproduction on macOS 26.5.2 arm64: in bao-static-linux:cross (Debian clang
+19.1.7), `clang++ -std=c++20 -O2 -g -fPIC -fno-omit-frame-pointer -pthread
+-mno-outline-atomics -stdlib=libstdc++ -c examples/cpp/unwind.cpp` produced
+`.linker-options` (and `.llvm_addrsig`); without `-std=c++20` only
+`.llvm_addrsig` appeared. A linux/arm64 `bao build -bindings dwarf -symbol
+bao_example_run` of that archive with the previous CLI kept one
+LLVM_LINKER_OPTIONS section, and a typed consumer cross-built with Go 1.26.11
+failed with the CI error (negative control). With the fixed CLI the section
+was gone, the consumer linked, and the executable ran natively in the
+container with exit 0. `go test ./...` and `go vet ./...` passed with Go
+1.26.11. Scratch files are in .work/go1.26.11/llvmopt. The Linux C++ suites
+themselves were not run locally; hosted CI is the check for them.
