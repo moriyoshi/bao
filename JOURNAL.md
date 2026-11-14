@@ -5083,3 +5083,26 @@ link and the template offset, plus eight rejections. Packages generated from
 those DLLs, including one with typed bindings, cross-compiled and linked into
 windows/amd64 and windows/arm64 executables. Nothing has executed on Windows
 yet; the Windows CI legs are the first execution check.
+
+Windows CI iterations (PR #9, GitHub windows-2025 and windows-11-arm runners,
+Go 1.26.11):
+- Run 1: the generated package copied the DLL's TLS initializer into the
+  helper's template, which the helper emits read-only (`.bao.tpl`); the amd64
+  consumer faulted in Go code. The copy now happens only when base
+  relocations fall inside the initializer, under VirtualProtect. On arm64 the
+  LLVM-MinGW DLL's TLS-array load at 0x1600 was rejected: clang had hoisted
+  `ADRP x19, page(_tls_index)` to the function's start, leaving only
+  `ldr w9, [x19, #0x18]` near the load (decoded from the error's code dump).
+  The evidence now takes that LDR within 64 bytes and its base register's
+  ADRP up to 4 KiB earlier; a fixture reproduces the layout.
+- Run 2: the LLVM-MinGW (`-shared -static`) DLL leg passed natively on amd64,
+  both negative controls included. The MSVC (`/LD /MD`) consumer exited with
+  0xC0000602 (fail-fast) with no output then.
+- Run 3: LLVM-MinGW passed on amd64 and arm64. MSVC printed the expected
+  `threads=85 throw=17 state=142 format=v7 ok=1 value=7` on both, then failed
+  fast in `Shutdown`: the helper's finish runs TLS callbacks for process
+  detach, and vcruntime's TLS destructor callback reads the caller's TLS,
+  recreating the block shutdown had released, so the live-block check fails.
+  Finish now releases that block before checking; both helper objects were
+  regenerated (Debian clang 19.1.7). `DllMain` detach also now runs before the
+  helper's TLS teardown, as FreeLibrary orders it.

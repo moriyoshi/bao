@@ -174,6 +174,9 @@ int bao_winrt_shutdown(void) {
 }
 void bao_winrt_finish(void) {
     for(SIZE i=callback_count;i;i--)callbacks[i-1](image_base,0,0);
+    // MSVC's TLS destructor callback reads the caller's TLS on process detach,
+    // recreating the block shutdown released; release it again.
+    destroy(FlsGetValue(key));
     if(live_blocks)fail();
     stopped=1;FlsFree(key);key=0xffffffff;
     while(fls_registrations){struct fls_registration *r=fls_registrations;fls_registrations=r->next;if(r->allocated)FlsFree(r->key);HeapFree(heap,0,r);}
