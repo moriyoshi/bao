@@ -1160,6 +1160,49 @@ image; destructor re-registration is bounded to four rounds. Native lifecycle
 callbacks must not throw. Bigobj, ARM64EC and MSVC Rust targets remain unsupported.
 Debug stripping retains runtime unwind metadata.
 
+#### Windows DLLs
+
+A linked 64-bit DLL can be the input instead of COFF objects:
+
+```sh
+bao build -target windows/amd64 -symbol python_entry -o ./py python313.dll
+```
+
+A linked DLL's code reaches its data through PC-relative instructions without
+relocations, and Go's PE reader gives host code only function alignment, which
+ARM64 page-relative addressing cannot use. So the generated package embeds the
+DLL's prepared image and loads it at initialization into memory from
+`VirtualAlloc`, as the Windows loader would:
+- **Load steps:** base relocations; imports by name or ordinal, resolved with
+  `LoadLibrary`; section protections; the DLL's function table, registered with
+  its own base; TLS; then `DllMain(DLL_PROCESS_ATTACH)`.
+- **Shutdown:** `Shutdown` calls `DllMain(DLL_PROCESS_DETACH)` and then the TLS
+  callbacks.
+- **Exports:** every export is reachable through `SharedObjectExport(name)` and
+  `SharedObjectExports()`; `-symbol` selects exported functions for accessors
+  and typed bindings.
+- **Exceptions:** the DLL's exception handlers (SEH, MSVC C++, MinGW) work
+  unmodified, because the registered function table gives them the DLL's base.
+  RtlPcToFileHeader finds no module for private memory, which breaks MSVC's C++
+  throw; Bao's helper replaces the DLL's imports of `RtlPcToFileHeader` and
+  `_CxxThrowException` so the DLL's base is reported for its own addresses.
+- **TLS:** implicit TLS uses Bao's helper storage. Each TEB TLS-array load in the
+  DLL's code (`mov reg, gs:[0x58]` or `ldr xN, [x18, #0x58]`) is redirected to
+  a thunk. It must be within 64 bytes of a PC-relative reference to the DLL's
+  `_tls_index`, which the compiler's TLS sequence has; otherwise translation
+  fails. TLS callbacks run with the DLL's base.
+
+Not supported:
+- 32-bit DLLs, .NET assemblies, writable executable sections, and DLLs without
+  base relocations.
+- Relocatable code combined with a DLL.
+- Loading the DLL's own dependencies from inside the image: imports use the
+  ordinary `LoadLibrary` search.
+
+`DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH` are not delivered, and the DLL has
+no module handle: `GetModuleHandle` and `GetModuleFileName` do not know it, and
+its `DllMain` receives its base as `HINSTANCE`.
+
 ### Distributing a generated package
 
 Ship the complete generated package as a normal Go package. For typed

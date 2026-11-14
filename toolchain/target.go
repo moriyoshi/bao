@@ -88,6 +88,15 @@ func Detect(path string) (target Target, archive bool, err error) {
 			return target, false, err
 		}
 	}
+	// A linked DLL is accepted as a whole input, never as an archive member.
+	if pecoff.IsDLL(b) {
+		arch, err := pecoff.DLLMachine(b)
+		if err != nil {
+			return target, false, err
+		}
+		target, err = ParseTarget("windows/" + arch)
+		return target, false, err
+	}
 	target, err = detectObject(b)
 	return target, false, err
 }

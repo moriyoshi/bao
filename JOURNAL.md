@@ -5018,3 +5018,68 @@ uses that form. `TestLinuxSourcesAcceptTypedBindings` generates typed bindings
 over both generated Linux variants; it failed with the same message before the
 fix. Locally, a shared-object package with `-bindings dwarf` built and ran
 with CGO_ENABLED=0 and 1, and `.work/so-e2e/run.sh` passed again.
+
+## 2026-11-14: Windows DLL input
+
+Problem: the user asked for shared-object input on every supported platform;
+this entry covers Windows (Darwin follows separately). The Linux approach, the
+whole image as one section of Go's text, does not carry over: Go 1.26.11's PE
+reader ignores COFF section alignment flags (`cmd/link/internal/loadpe` gives
+host text only function alignment), while ARM64 ADRP needs the image's 4 KiB
+page offsets; a COFF section holds at most 65535 relocations, and Go's reader
+lacks the overflow form; and on amd64 a function table registered for code
+inside Go's image is not consulted (the 2026-11-12 Windows entry), so a DLL's
+unwind and handler data would need every image-relative address rebased.
+
+Decision (user): Windows first; TLS by patching TEB TLS-array loads with
+evidence; handler formats SEH, MSVC EH3 and EH4, and MinGW. Loading the image
+into private memory (below) needs no handler-format rewriting at all, so all
+four are covered without parsing them.
+
+Change:
+- `pecoff.TranslateDLL` prepares the DLL's image (headers and sections at their
+  RVAs) and plans the Windows loader's steps; the generated package embeds the
+  image (`dll_windows_<arch>.bin`) and `dllLoad` runs them at initialization:
+  `VirtualAlloc` (64 KiB-aligned, read-write), copy, DIR64 base relocations
+  (other types are rejected), imports by name or ordinal through `LoadLibrary`
+  and `GetProcAddress` (a missing import panics, as loading would fail),
+  TLS thunks, per-section `VirtualProtect`, `FlushInstructionCache`, and
+  `RtlAddFunctionTable` with the DLL's base. Then the helper's TLS
+  initialization (the DLL's TLS callbacks receive its base) and `DllMain`.
+  `Shutdown` calls `DllMain(DLL_PROCESS_DETACH)` before the helper's finish.
+- RtlPcToFileHeader reports no image for private memory; vcruntime's
+  `_CxxThrowException` uses it for the thrown ThrowInfo's image base. The
+  helper (pecoff/native/runtime.c) gains `bao_winrt_pc_to_file_header` and
+  `bao_winrt_cxx_throw`, bound in place of the DLL's imports of
+  `RtlPcToFileHeader` and `_CxxThrowException`; the throw replica raises
+  0xE06D7363 with EH_MAGIC_NUMBER1 (EH_PURE_MAGIC_NUMBER1 for TI_IsPure) and
+  the DLL's base, and passes WinRT exceptions and rethrows to the original.
+  Both helper objects were regenerated with `cmd/bao-native` using Debian clang
+  19.1.7 in bao-cpp-cross:20261108 (previously Apple clang 21).
+- TLS: the DLL's `_tls_index` is set to 0, the slot of the helper's one-slot TLS
+  array. Its initializer becomes a `.tls` contribution of a small anchor object
+  that selects the helper through the ordinary COFF translation; `.tls` sorts
+  before the helper's `.tls$`, so the DLL's data stays at template offset 0.
+  The relocated initializer is copied into the template at load. Each TEB
+  TLS-array load must have a RIP-relative (amd64) or ADRP+LDR (arm64)
+  reference decoding to `_tls_index` within 64 bytes; thunks reuse the COFF
+  path's register-preserving code, calling the helper through an address slot
+  because private memory may be out of direct-branch range.
+- `toolchain.Detect` accepts PE DLLs; exports become `SharedObjectExport` and
+  `-symbol` accessors returning load-time addresses (typed bindings work).
+- `bao-verify`'s Windows suite gains a DLL leg (testdata/windows_dll.cpp:
+  DllMain, a static constructor, `thread_local` with dynamic initialization
+  over 8 threads, a C++ throw/catch inside the DLL, CRT/Win32 imports and an
+  exported datum), linked by MSVC (`/LD /MD`), LLVM-MinGW and MinGW GCC
+  (`-shared -static`), with negative controls that drop the function table and
+  the TLS patches.
+
+Verification so far, on the Linux arm64 host with Go 1.26.11: `go test ./...`
+and `go vet ./...` pass. Unit tests build a synthetic PE32+ DLL for amd64 and
+arm64 (base relocations, imports by name and ordinal, exports with a
+forwarder, a TLS directory with a callback and a pointer initializer, one
+function-table entry) and check the plan, the TLS thunk branches, the helper
+link and the template offset, plus eight rejections. Packages generated from
+those DLLs, including one with typed bindings, cross-compiled and linked into
+windows/amd64 and windows/arm64 executables. Nothing has executed on Windows
+yet; the Windows CI legs are the first execution check.

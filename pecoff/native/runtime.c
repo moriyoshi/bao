@@ -14,6 +14,7 @@ DLL int FlsSetValue(DWORD, void *);
 DLL int FlsFree(DWORD);
 DLL void RaiseFailFastException(void *, void *, DWORD);
 DLL void Sleep(DWORD);
+DLL void RaiseException(DWORD, DWORD, DWORD, const SIZE *);
 DLL void free(void *);
 
 struct exit_entry { struct exit_entry *next; FN function; void (*cxa)(void *); void *arg; };
@@ -233,3 +234,37 @@ void __dyn_tls_on_demand_init(void) { bao_winrt_tls_array(); }
 int (*const __imp_atexit)(FN) = atexit;
 FN (*const __imp__onexit)(FN) = _onexit;
 int (*const __imp___tlregdtor)(FN) = __tlregdtor;
+
+// A DLL that Bao loads into private memory is outside every Windows image.
+// MSVC's C++ throw finds the throwing module's base with RtlPcToFileHeader,
+// which reports no image there; catch matching then resolves the thrown
+// type's image-relative records against zero. These replace the DLL's
+// imports of RtlPcToFileHeader and _CxxThrowException so the DLL's own base
+// is reported. Unwind lookup already gets that base from the DLL's function
+// table, which is registered with it.
+static char *dll_base;
+static SIZE dll_size;
+static void *(*dll_pc_to_file_header)(void *, void **);
+static void (*dll_cxx_throw)(void *, const DWORD *);
+void bao_winrt_dll_configure(char *base, SIZE size, void *pc_to_file_header, void *cxx_throw) {
+    dll_base = base; dll_size = size;
+    dll_pc_to_file_header = pc_to_file_header; dll_cxx_throw = cxx_throw;
+}
+static int in_dll(const void *p) { return (const char *)p >= dll_base && (const char *)p < dll_base + dll_size; }
+void *bao_winrt_pc_to_file_header(void *pc, void **base) {
+    if (in_dll(pc)) { *base = dll_base; return dll_base; }
+    if (!dll_pc_to_file_header) { *base = 0; return 0; }
+    return dll_pc_to_file_header(pc, base);
+}
+// Mirrors vcruntime's _CxxThrowException for a ThrowInfo inside the DLL:
+// EH_MAGIC_NUMBER1, or EH_PURE_MAGIC_NUMBER1 for TI_IsPure (0x8); WinRT
+// exceptions (TI_IsWinRT, 0x10) and rethrows go to the original.
+void bao_winrt_cxx_throw(void *object, const DWORD *info) {
+    if (info && in_dll(info) && !(info[0] & 0x10)) {
+        SIZE params[4] = {(info[0] & 8) ? 0x01994000 : 0x19930520, (SIZE)object, (SIZE)info, (SIZE)dll_base};
+        RaiseException(0xE06D7363, 1, 4, params);
+    }
+    if (!dll_cxx_throw) fail();
+    dll_cxx_throw(object, info);
+    fail();
+}

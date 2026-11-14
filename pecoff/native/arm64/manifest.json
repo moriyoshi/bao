@@ -1,8 +1,8 @@
 {
-  "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+  "compiler": "Debian clang version 19.1.7 (3+b1)\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/lib/llvm-19/bin\n",
   "files": {
-    "../runtime.c": "090820a7f1ad325d229e326f8290a09e35e1808d748cd5dcf1fa16e5c35fe0b9",
-    "runtime.bin": "4cdb9b9ae47fce9dd7a71e81dd84328ead28a2c00b314ebd319b22550186838d"
+    "../runtime.c": "253add9a1fbea2430388f3f01a9ff83a8d917b9de5b2d1f1b4aa2ad73949a7d4",
+    "runtime.bin": "ad0cfede90e4d1e9b453ae511f6a06041b1ea5457deae2292df0a9db35c1527d"
   },
   "flags": [
     "--target=aarch64-pc-windows-msvc",
