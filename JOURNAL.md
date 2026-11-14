@@ -5008,3 +5008,13 @@ the arm64 host. This is emulated execution, not native.
 - Not run: native (non-emulated) amd64, loong64 or ppc64le execution, real
   libraries other than the fixture on those targets, and kernels with pages
   larger than the host's.
+
+CI correction: the linux-arm64 and linux-amd64 suites of PR #8 failed in the
+Linux C++ typed-binding check with `bao: unhandled dynamic runtime adapter`.
+The generated `lookupVersion` helper (emitted for every Linux package) called
+`purego.SyscallN`, which the typed-bindings rewriter cannot replace; it only
+rewrites `purego.RegisterFunc` on function-typed variables. The helper now
+uses that form. `TestLinuxSourcesAcceptTypedBindings` generates typed bindings
+over both generated Linux variants; it failed with the same message before the
+fix. Locally, a shared-object package with `-bindings dwarf` built and ran
+with CGO_ENABLED=0 and 1, and `.work/so-e2e/run.sh` passed again.

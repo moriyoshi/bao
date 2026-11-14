@@ -225,14 +225,17 @@ func lookup(name string) uintptr {
     if err != nil { panic(err) }; return address
 }
 
-var dlvsym uintptr
+var dlvsym func(uintptr, uintptr, uintptr) uintptr
 
 // lookupVersion binds a versioned import exactly, as the dynamic linker would.
+// glibc's RTLD_DEFAULT is 0.
 func lookupVersion(name, version string) uintptr {
     if version == "" { return lookup(name) }
-    if dlvsym == 0 { dlvsym = lookup("dlvsym") }
+    if dlvsym == nil {
+        purego.RegisterFunc(&dlvsym, lookup("dlvsym"))
+    }
     n, v := append([]byte(name), 0), append([]byte(version), 0)
-    address, _, _ := purego.SyscallN(dlvsym, purego.RTLD_DEFAULT, uintptr(unsafe.Pointer(&n[0])), uintptr(unsafe.Pointer(&v[0])))
+    address := dlvsym(0, uintptr(unsafe.Pointer(&n[0])), uintptr(unsafe.Pointer(&v[0])))
     runtime.KeepAlive(n); runtime.KeepAlive(v)
     if address == 0 { panic("bao: target lacks " + name + "@" + version) }
     return address

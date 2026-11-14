@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/moriyoshi/bao/bindings"
 	"github.com/moriyoshi/bao/linuxelf"
 	"github.com/moriyoshi/bao/pecoff"
 	"github.com/moriyoshi/bao/translate"
@@ -248,6 +249,30 @@ func TestLargeGeneratedPackagesCompile(t *testing.T) {
 			t.Logf("%d entries per table: peak %d MiB", largeTableEntries, peak>>20)
 			if peak > 1536<<20 {
 				t.Fatalf("building %d entries per table peaked at %d MiB", largeTableEntries, peak>>20)
+			}
+		})
+	}
+}
+
+// Typed bindings replace every PureGo use in a generated Linux package; a
+// helper they cannot rewrite fails generation for every Linux consumer.
+func TestLinuxSourcesAcceptTypedBindings(t *testing.T) {
+	for name, plan := range map[string]*linuxelf.Plan{"archive": syntheticLinuxPlan(3), "shared object": syntheticSharedObjectPlan(3)} {
+		t.Run(name, func(t *testing.T) {
+			plan.Arch = "arm64"
+			source, asm, err := linuxSource(plan, "native", []string{"answer"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			for file, data := range map[string][]byte{"symbols_linux_arm64.go": source, "symbols_linux_arm64.s": asm} {
+				if err := os.WriteFile(filepath.Join(dir, file), data, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := bindings.Manifest{Schema: 1, ABI: "c", Functions: []bindings.Function{{Name: "Answer", Symbol: "answer", Result: "int64"}}}
+			if err := bindings.Generate(dir, "native", "linux/arm64", m, []string{"answer"}); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
