@@ -138,7 +138,10 @@ func main() {
 func (h *harness) darwinDylibSwift(arch, sdk string) {
 	triple := map[string]string{"arm64": "arm64-apple-macos14", "amd64": "x86_64-apple-macos14"}[arch]
 	dylib := filepath.Join(h.dst, "swift.dylib")
-	h.run("dylib-swift-link.log", h.dst, nil, "xcrun", "swiftc", "-emit-library", "-O", "-target", triple, "-module-name", "BaoSwift", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib_swift.swift"))
+	// A resilient framework whose NSObject subclass the fixture subclasses
+	// (Objective-C class stubs), loaded through @rpath from beside the consumer.
+	h.run("dylib-swift-base-link.log", h.dst, nil, "xcrun", "swiftc", "-emit-library", "-emit-module", "-enable-library-evolution", "-O", "-target", triple, "-module-name", "BaoSwiftBase", "-Xlinker", "-install_name", "-Xlinker", "@rpath/libBaoSwiftBase.dylib", "-o", filepath.Join(h.dst, "libBaoSwiftBase.dylib"), filepath.Join(h.root, "testdata/darwin_dylib_swift_base.swift"))
+	h.run("dylib-swift-link.log", h.dst, nil, "xcrun", "swiftc", "-emit-library", "-O", "-target", triple, "-module-name", "BaoSwift", "-I", h.dst, "-L", h.dst, "-lBaoSwiftBase", "-Xlinker", "-rpath", "-Xlinker", "@executable_path", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib_swift.swift"))
 	app := filepath.Join(h.dst, "dylib-swift")
 	require(os.Mkdir(app, 0o755))
 	h.run("dylib-swift-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "swift_check", "-o", filepath.Join(app, "native"), dylib)
@@ -159,7 +162,7 @@ func (h *harness) darwinDylibSwift(arch, sdk string) {
 	h.consumer("dylib-swift-negative-build.log", negative, h.goTool, "build", "-o", negativeExe, ".")
 	out, err = h.command("dylib-swift-negative-run.log", h.root, nil, negativeExe)
 	check(err != nil && !strings.Contains(string(out), "PASS:"), "Swift registration control did not fail: %s", out)
-	h.results["darwin_dylib_swift"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "protocol dispatch over a struct and a final class, dynamic cast to a protocol, CaseIterable, type name, dictionary, thrown error, enum description; negative control skips registration"}
+	h.results["darwin_dylib_swift"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "protocol dispatch over a struct and a final class, dynamic cast to a protocol, CaseIterable, type name, dictionary, thrown error, enum description, NSObject subclass with @objc, generic class, actor, JSONEncoder subclass, a resilient framework NSObject subclass (class stubs) found by name before first use; negative control skips registration"}
 }
 
 const darwinDylibSwiftConsumer = `package main
@@ -174,11 +177,11 @@ import (
 )
 
 func main() {
-	var out [9]int32
+	var out [13]int32
 	purego.SyscallN(native.SymbolAddr0(), uintptr(unsafe.Pointer(&out[0])))
 	got := fmt.Sprint(out)
 	fmt.Println("swift:", got)
-	if got != "[17 3 1 6 2 1 1]" {
+	if got != "[17 3 1 6 2 1 1 3 1 6 5 5 17]" {
 		os.Exit(1)
 	}
 	fmt.Println("PASS: Swift dylib")

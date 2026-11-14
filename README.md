@@ -896,7 +896,9 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   libswiftCore's `swift_registerProtocols`,
   `swift_registerProtocolConformances` and `swift_registerTypeMetadataRecords`,
   after the Objective-C step (Swift classes are Objective-C classes there).
-  Dynamic casts to protocols, generics, enums and errors work. Dynamic
+  Dynamic casts to protocols, generics, enums, errors, actors, NSObject
+  subclasses with `@objc` members, and subclasses of classes from resilient
+  frameworks (Objective-C class stubs) work. Dynamic
   replacements (`__swift5_replace`) and accessible functions
   (`__swift5_acfuncs`) are rejected, and runtime lookups that scan every image's
   reflection sections by name do not see this one.

@@ -5346,3 +5346,28 @@ Follow-ups to the Objective-C entry:
   test only covered a plan with Objective-C sections; a darwindylibc variant
   without Objective-C or Swift now compiles too, and it fails with the same
   message when the fix is reverted.
+
+Swift follow-up (user request, after a review of the remaining limits): a
+probe on the Intel Mac found that libswiftCore exports no registration for
+dynamic replacements (`swift_registerDynamicReplacements`) or accessible
+functions (`swift_registerAccessibleFunctions`), so those stay rejected, while
+libobjc exports `_objc_realizeClassFromSwift`. The fixture gained an NSObject
+subclass with an `@objc` method (called, found with NSClassFromString and
+answering `respondsToSelector:`), a generic class, an actor driven from a
+detached Task, a JSONEncoder subclass, and a subclass of `open class Base:
+NSObject` from a resilient framework (`BaoSwiftBase`, built with
+`-enable-library-evolution`, loaded through `@rpath`). The last one makes
+swiftc emit `__objc_stublist`, confirmed with otool; the loader does not
+process that section, and the class still worked, including lookup by name
+before its first Swift use: Swift registers stub-backed classes when it
+initializes their metadata, and its class lookup hook finds them through the
+registered type records. Result on the Intel Mac: `[17 3 1 6 2 1 1 3 1 6 5 5
+17]`. The JSONEncoder subclass alone emitted no stubs (a native Swift class
+initialized lazily). Not covered: Objective-C code in the same image naming a
+stub-backed class.
+
+CI on 6c95e5b, darwin-arm64: the C/C++ and Objective-C legs passed on native
+arm64. The Swift leg failed only in its consumer: widening the Objective-C
+consumer to 9 slots had also widened the Swift one, so the expected 7 values
+did not match `[17 3 1 6 2 1 1 0 0]`. The first 7 values, all Swift checks of
+that commit, were correct on arm64.
