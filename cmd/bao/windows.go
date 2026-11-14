@@ -335,9 +335,10 @@ registerFunctionTable(unwindAddressMerged(),uintptr(len(functionRecords)),base)
 		if p.DLL != nil {
 			// The DLL's TLS callbacks receive its own base as their module.
 			src.WriteString("moduleBase=dllBase\nfor _,rva:=range dllTLSCallbacks{nativeTLSCallbacks=append(nativeTLSCallbacks,dllBase+uintptr(rva))}\n")
-			if t := p.DLL.TLS; t != nil && t.End > t.Start {
-				// The TLS initializer may hold relocated pointers: copy it from the loaded image.
-				fmt.Fprintf(&src, "copy(unsafe.Slice((*byte)(unsafe.Pointer(tlsTemplateAddress())),%d),unsafe.Slice((*byte)(unsafe.Pointer(dllBase+%#x)),%d))\n", t.End-t.Start, t.Start, t.End-t.Start)
+			if t := p.DLL.TLS; t != nil && t.Relocated {
+				// The initializer holds relocated pointers: copy its loaded
+				// bytes over the read-only template.
+				fmt.Fprintf(&src, "{n:=uintptr(%d);var old uint32;if ok,_,_:=dllProc(\"VirtualProtect\").Call(tlsTemplateAddress(),n,0x04,uintptr(unsafe.Pointer(&old)));ok==0{panic(\"bao: DLL TLS template protection failed\")}\ncopy(unsafe.Slice((*byte)(unsafe.Pointer(tlsTemplateAddress())),n),unsafe.Slice((*byte)(unsafe.Pointer(dllBase+%#x)),n))\ndllProc(\"VirtualProtect\").Call(tlsTemplateAddress(),n,uintptr(old),uintptr(unsafe.Pointer(&old)))}\n", t.End-t.Start, t.Start)
 			}
 		}
 		for _, kind := range []string{"tlsCallback", "tlsInitializer"} {

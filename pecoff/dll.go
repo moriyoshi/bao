@@ -72,6 +72,9 @@ type DLLExport struct {
 type DLLTLS struct {
 	Index, Start, End, ZeroFill, Alignment uint32
 	Callbacks                              []uint32
+	// Relocated reports base relocations inside the initializer, whose
+	// loaded bytes then replace the template's.
+	Relocated bool
 }
 
 // DLLPatch redirects one TEB TLS-array load to a thunk at Thunk. Site holds
@@ -387,6 +390,9 @@ func parseDLL(input []byte, symbols []string) (*DLLImage, string, error) {
 			}
 		}
 		binary.LittleEndian.PutUint32(img[t.Index:], 0)
+		for _, r := range d.Relocations {
+			t.Relocated = t.Relocated || r+8 > t.Start && r < t.End
+		}
 		d.TLS = t
 		for _, c := range code {
 			patches, err := patchDLLTLSReads(img, c.start, min(c.end, oh.SizeOfImage), t.Index, arch, &size)
@@ -481,7 +487,11 @@ func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, end *u
 			continue
 		}
 		if !evidence(pos) {
-			return nil, fmt.Errorf("DLL TLS array load at %#x has no nearby _tls_index reference", pos)
+			lo, hi := start, min(stop, pos+dllTLSEvidenceWindow)
+			if pos > start+dllTLSEvidenceWindow {
+				lo = (pos - dllTLSEvidenceWindow) &^ 3
+			}
+			return nil, fmt.Errorf("DLL TLS array load at %#x has no nearby reference to _tls_index at %#x; code %#x-%#x: % x", pos, index, lo, hi, img[lo:hi])
 		}
 		thunk := (*end + 15) &^ 15
 		p := DLLPatch{Site: pos, Thunk: thunk}

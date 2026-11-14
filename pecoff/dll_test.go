@@ -298,8 +298,8 @@ func TestParseDLLRejects(t *testing.T) {
 		symbols []string
 		want    string
 	}{
-		"no evidence":   {dllFixture{noEvidence: true}.build(), nil, "no nearby _tls_index"},
-		"arm64 no evid": {dllFixture{machine: pe.IMAGE_FILE_MACHINE_ARM64, noEvidence: true}.build(), nil, "no nearby _tls_index"},
+		"no evidence":   {dllFixture{noEvidence: true}.build(), nil, "no nearby reference to _tls_index"},
+		"arm64 no evid": {dllFixture{machine: pe.IMAGE_FILE_MACHINE_ARM64, noEvidence: true}.build(), nil, "no nearby reference to _tls_index"},
 		"fixed base":    {dllFixture{noRelocs: true}.build(), nil, "preferred address"},
 		"executable":    {dllFixture{exe: true}.build(), nil, "not a DLL"},
 		"reloc type":    {dllFixture{badRelocTyp: true}.build(), nil, "base relocation type 3"},
