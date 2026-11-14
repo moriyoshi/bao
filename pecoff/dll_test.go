@@ -15,6 +15,7 @@ import (
 type dllFixture struct {
 	machine     uint16
 	noEvidence  bool
+	hoisted     bool // arm64: ADRP far before the TLS sequence, as CI's clang emitted
 	noRelocs    bool
 	exe         bool
 	badRelocTyp bool
@@ -23,9 +24,9 @@ type dllFixture struct {
 const (
 	dllImageBase = 0x180000000
 	fxTLSUse     = 0x1000
-	fxFn         = 0x1040
-	fxCallback   = 0x1050
-	fxMain       = 0x1060
+	fxFn         = 0x1100
+	fxCallback   = 0x1110
+	fxMain       = 0x1120
 	fxExportDir  = 0x2000
 	fxImportDir  = 0x2100
 	fxTLSDir     = 0x2200
@@ -68,9 +69,18 @@ func (o dllFixture) build() []byte {
 		if !o.noEvidence {
 			page := int64(fxTLSIndex&^0xfff) - int64(p&^0xfff)
 			imm := uint32(page >> 12)
-			w(p, 0x90000008|(imm&3)<<29|(imm>>2&0x7ffff)<<5)  // ADRP X8, _tls_index
-			w(p+4, 0xb9400108|uint32(fxTLSIndex&0xfff/4)<<10) // LDR W8, [X8, #lo12]
-			p += 8
+			if o.hoisted {
+				w(p, 0x90000013|(imm&3)<<29|(imm>>2&0x7ffff)<<5) // ADRP X19, _tls_index
+				for q := p + 4; q < p+0x50; q += 4 {
+					w(q, 0xd503201f) // NOP
+				}
+				w(p+0x50, 0xb9400269|uint32(fxTLSIndex&0xfff/4)<<10) // LDR W9, [X19, #lo12]
+				p += 0x54
+			} else {
+				w(p, 0x90000008|(imm&3)<<29|(imm>>2&0x7ffff)<<5)  // ADRP X8, _tls_index
+				w(p+4, 0xb9400108|uint32(fxTLSIndex&0xfff/4)<<10) // LDR W8, [X8, #lo12]
+				p += 8
+			}
 		}
 		w(p, 0xf9402e49)   // LDR X9, [X18, #0x58]
 		w(p+4, 0xd65f03c0) // RET
@@ -289,6 +299,13 @@ func TestParseDLL(t *testing.T) {
 		if protect[0x1000] != pageExecuteRead || protect[0x2000] != pageReadOnly || protect[0x3000] != pageReadWrite || protect[d.ImageSize] != pageExecuteRead {
 			t.Fatalf("%s protections %+v", arch, d.Protections)
 		}
+	}
+}
+
+func TestParseDLLHoistedTLSIndexPage(t *testing.T) {
+	d, _, err := parseDLL(dllFixture{machine: pe.IMAGE_FILE_MACHINE_ARM64, hoisted: true}.build(), nil)
+	if err != nil || len(d.Patches) != 1 || d.Patches[0].Site != fxTLSUse+0x54 {
+		t.Fatalf("hoisted ADRP evidence: %v %+v", err, d)
 	}
 }
 

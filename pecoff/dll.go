@@ -451,22 +451,30 @@ func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, end *u
 			}
 			return false
 		}
-		// ADRP Xr, page(_tls_index), then LDR Wt, [Xr, #lo12].
-		for q := lo &^ 3; q+4 <= hi; q += 4 {
-			w := binary.LittleEndian.Uint32(img[q:])
-			if w&0x9f000000 != 0x90000000 {
+		// LDR Wt, [Xn, #lo12(_tls_index)] near the load, with Xn set by
+		// ADRP Xn, page(_tls_index). Compilers hoist the ADRP, often to the
+		// function's start, so it may be up to 4 KiB earlier.
+		for l := lo &^ 3; l+4 <= hi; l += 4 {
+			v := binary.LittleEndian.Uint32(img[l:])
+			if v&0xffc00000 != 0xb9400000 || (v>>10&0xfff)*4 != index&0xfff {
 				continue
 			}
-			imm := int64(w>>29&3) | int64(w>>5&0x7ffff)<<2
-			imm = imm << 43 >> 43 // sign-extend 21 bits
-			if uint64(int64(q)&^0xfff+imm<<12) != uint64(index)&^0xfff {
-				continue
+			base := v >> 5 & 31
+			from := start
+			if l > start+4096 {
+				from = l - 4096
 			}
-			for l := q + 4; l+4 <= min(q+4+dllTLSEvidenceWindow, stop); l += 4 {
-				v := binary.LittleEndian.Uint32(img[l:])
-				if v&0xffc00000 == 0xb9400000 && v>>5&31 == w&31 && (v>>10&0xfff)*4 == index&0xfff {
+			for q := l - 4; q >= from && q+4 > q; q -= 4 {
+				w := binary.LittleEndian.Uint32(img[q:])
+				if w&0x9f000000 != 0x90000000 || w&31 != base {
+					continue
+				}
+				imm := int64(w>>29&3) | int64(w>>5&0x7ffff)<<2
+				imm = imm << 43 >> 43 // sign-extend 21 bits
+				if uint64(int64(q)&^0xfff+imm<<12) == uint64(index)&^0xfff {
 					return true
 				}
+				break // the nearest earlier ADRP to Xn decides
 			}
 		}
 		return false

@@ -32,8 +32,8 @@ func (h *harness) windowsDLL(arch string) {
 	exe := filepath.Join(h.dst, "dll.exe")
 	h.run("windows-dll-build.log", app, cross, h.goTool, "build", "-o", exe, ".")
 	for _, procs := range []string{"1", "4"} {
-		out := h.run("windows-dll-run-"+procs+".log", h.root, map[string]string{"GOMAXPROCS": procs}, h.windowsExecute(exe)...)
-		check(strings.Contains(string(out), "PASS: Windows DLL"), "Windows DLL consumer failed: %s", out)
+		out, err := h.command("windows-dll-run-"+procs+".log", h.root, map[string]string{"GOMAXPROCS": procs}, h.windowsExecute(exe)...)
+		check(err == nil && strings.Contains(string(out), "PASS: Windows DLL"), "Windows DLL consumer failed: %v\n%s", err, out)
 	}
 	manifest := string(read(filepath.Join(app, "native", "bao-manifest.json")))
 	controls := map[string][2]string{"unwind": {"registerFunctionTable(base+", "_ = base\n//"}}

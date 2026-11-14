@@ -268,15 +268,17 @@ func TLSDestroyedBlocks() uint64 {r,_,_:=syscall.SyscallN(runtimeAddress_tls_des
 // Shutdown runs this package's TLS cleanup, registered exits and CRT terminators once.
 // Stop and join native callers first. Go process exit does not call Shutdown.
 func Shutdown(){shutdownMutex.Lock();defer shutdownMutex.Unlock();if shutdownDone{return}
- r,_,_:=syscall.SyscallN(runtimeAddress_shutdown());if int32(r)!=0{panic("native Windows shutdown requires quiescent native threads")}
 `)
+		if p.DLL != nil && p.DLL.Entry != 0 {
+			// As FreeLibrary: DllMain detaches before TLS teardown, and its CRT
+			// may still use the calling thread's TLS.
+			fmt.Fprintf(&src, "syscall.SyscallN(dllBase+%#x,dllBase,0,0)\n", p.DLL.Entry)
+		}
+		src.WriteString(" r,_,_:=syscall.SyscallN(runtimeAddress_shutdown());if int32(r)!=0{panic(\"native Windows shutdown requires quiescent native threads\")}\n")
 		for _, kind := range []string{"preTerminator", "terminator"} {
 			if w, ok := walk[kind]; ok {
 				fmt.Fprintf(&src, "baoEachPointer(%s,func(p uintptr){callConstructor(p)})\n", w)
 			}
-		}
-		if p.DLL != nil && p.DLL.Entry != 0 {
-			fmt.Fprintf(&src, "syscall.SyscallN(dllBase+%#x,dllBase,0,0)\n", p.DLL.Entry)
 		}
 		src.WriteString("syscall.SyscallN(runtimeAddress_finish());shutdownDone=true}\n")
 	} else {
