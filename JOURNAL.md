@@ -5224,3 +5224,40 @@ fixture links `libdep.dylib` (install name `@rpath/libdep.dylib`) with rpaths
 to itself. A new generated-package test (darwindylib) compiles the loader for
 darwin/arm64 at 40000 table entries; it caught a uintptr/int mismatch in the
 TLS template code that would have failed every dylib consumer's build.
+
+## 2026-11-14: Loading a dylib from an unlinked file (spike, negative)
+
+Question: Objective-C and Swift dylibs need dyld to load them, because libobjc
+and libswiftCore register images only through dyld's notifications. The user
+allows no provisional disk writes unless they are hardened. macOS has no
+memfd_create or O_TMPFILE; the closest candidate was a file created with
+`O_CREAT|O_EXCL|O_NOFOLLOW` in a fresh `0700` directory under `$TMPDIR`,
+unlinked (with its directory) before `dlopen("/dev/fd/N")`.
+
+Spike (scripts and logs in .work/spike-dyld-fd): a dylib with a C function, a
+constructor and an Objective-C class; a C host; an ad-hoc signed and an
+unsigned copy of the dylib; the host plain and with the hardened runtime
+(`codesign -s - -o runtime`); loads by original path, by a private copy's
+path, through `/dev/fd/N` with the file still linked, and through `/dev/fd/N`
+after unlinking. Run natively on an Intel MacBook Pro, macOS 26.6.2 (25G83),
+Apple clang 17.0.0 (clang-1700.6.3.2). x86_64 `ld` does not ad-hoc sign
+dylibs by default, so the first run's "signed" case was unsigned; the second
+run signs it explicitly.
+
+Results:
+- Plain host, signed or unsigned dylib: the original path, the private copy
+  and `/dev/fd/N` while the file was linked all loaded; the function, the
+  constructor and `objc_getClass` plus a message send worked, and `dladdr`
+  named the file. dyld resolves `/dev/fd/N` to the file's path (F_GETPATH)
+  even when the file is unlinked.
+- `/dev/fd/N` after unlinking (link count 0) was refused in every case, plain
+  host included, signed or not: "library load disallowed by system policy".
+- Hardened host: every load failed, the original path included. The ad-hoc
+  signed dylib failed library validation ("mapping process and mapped file
+  (non-platform) have different Team IDs"), and the unsigned one had no cdhash.
+
+Conclusion: dyld needs a linked file at `dlopen`, which a same-user process can
+replace before it is opened, and a hardened-runtime app would also need the
+dylib signed with its own Team ID. Neither meets the no-provisional-write
+requirement, so Objective-C and Swift dylibs stay unsupported. Not run: arm64
+macOS, which is expected to be stricter, not looser.
