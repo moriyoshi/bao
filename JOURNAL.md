@@ -5387,3 +5387,84 @@ framework; the fixture adds `@_dynamicReplacement(for: greeting())` returning
 process-wide; without enabling the scopes it read 1, the rest unchanged.
 Helper functions the Swift step uses are now emitted for every dylib, and a
 generated-package variant without Objective-C image info compiles.
+
+## 2026-11-14: Symbol edits (`-wrap`, `-redefine-sym(s)`, `-prefix-symbols`, `bao objcopy`)
+
+Problem (request from the pythago session, scope chosen by the user: ELF
+rename and wrap first, with both build flags and a standalone command):
+pythago redirected about 30 libpython calls to its glue by relinking
+libpython.o with `ld.lld -r --wrap=...`. That needs lld and covers only call
+redirection. Hosts with only a downloaded LLVM have no objcopy, and the
+darwin/windows cross hosts have nothing. pythago also needs private prefixes
+for each wheel's vendored libraries. pythago later narrowed the request: its
+libpython members are bitcode that it lowers with `ld.lld -r --lto-O2` before
+Bao sees them, so cross-TU wrapping stays in that LTO link. Prefixes must
+cover only a component's own definitions and its references to them, not
+imports such as `malloc` or `PyModule_Create` (unlike llvm-objcopy
+`--prefix-symbols`).
+
+Decision: a new `symedit` package edits little-endian ELF64 relocatable
+objects in place rather than re-encoding them. The linuxelf encoder targets
+Go's object reader and drops group and index metadata, so it cannot produce
+linker inputs. Renames point the symbol entry at a name appended to a copy of
+its string table; existing offsets, shared suffixes and section names stay
+valid. Added symbols grow the symbol table and any SHT_SYMTAB_SHNDX. The new
+tables are placed at the end of the file and their section headers are
+repointed; every other byte is unchanged. Archives are rewritten in GNU
+format with a new symbol index, which a searched archive needs once its
+definitions are renamed. `bao build` applies the edits to its private copies
+of the input and each `-link-archive` before `ld -r`. `bao objcopy` edits one
+file. Both are Linux-only for now.
+
+`-wrap` follows lld, not GNU ld. In an object that defines and calls SYM,
+the call goes to a newly added undefined `__wrap_SYM`, or to an existing
+global one. Only relocations applying to allocated sections are redirected,
+so debug data keeps describing the definition. CREL relocation sections are
+rejected when a redirection is needed. An undefined `__real_SYM` beside a
+defined SYM is renamed to SYM, which the linker binds to the definition.
+`-prefix-symbols PATH=PREFIX` matches PATH to the input or a link archive by
+file identity. Inputs sharing a prefix form one group, whose definitions are
+renamed in each group member only. Explicit renames and wraps take
+precedence, so an identity rename keeps an entry point's name. `-bindings
+dwarf` still reads the unedited input.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4 (host toolchain, not the
+pinned 1.26.11). Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. New symedit unit tests use
+  hand-built aarch64 objects whose string table also holds the section names.
+  They cover wrap with in-object redirection (debug relocation unchanged,
+  extended index grown, section names intact), in-place renames, the
+  unchanged-input fast path, reuse of a defined `__wrap_`, prefixes, archive
+  long names, the regenerated index offsets, and rejected bitcode,
+  big-endian and ET_EXEC inputs. CLI tests cover flag and config parsing,
+  prefix path matching and usage errors.
+- End to end, driver `.work/symedit/e2e.sh` (fixtures in
+  `.work/symedit/src`). On native linux/arm64: GCC 13.3.0, GNU ld, and LLD
+  22.1.8 (rust-lld from Rust 1.98.0). For linux/amd64: x86_64-linux-gnu-gcc
+  14.2.0 in bao-cpp-cross:20261108 with the same LLD binary, executables run
+  under emulated qemu-x86_64 10.0.13. The fixture defines `target`, calls it
+  from the same object, imports `strlen`, and has wrapper glue for both. On
+  both architectures:
+  - Linker `--wrap` printed `102 20 1003` under GNU ld (the same-object call
+    is not wrapped) and `102 1020 1003` under lld.
+  - The Bao-edited objects printed `102 1020 1003` when linked by either
+    linker. Unedited objects printed `2 20 3`.
+  - Prefixing an archive with `bao objcopy` gave a searched `-lp` archive
+    that linked and ran. That proves the new index.
+  - `bao build` with `-wrap target -wrap strlen` and two link archives that
+    each vendor `vendored_fn`/`counter` produced packages. Each archive used
+    its own prefix, with identity renames for its entry points.
+  - CGO_ENABLED=0 purego consumers read 103021003 (102/1020/1003) and 11012
+    (1+1000, 2+1000; the vendored `strlen` calls are wrapped too). They ran
+    natively on arm64 and under qemu on amd64.
+  - A build without wrapping read 2020003 and 12 on both.
+  - `bao-build.json` recorded the edits.
+- Negative controls, both architectures:
+  - Linking the unedited glue failed on unresolved `__real_` references.
+  - The unprefixed archive left `p_` references unresolved.
+  - `bao build` without prefixes failed in `ld -r` with "multiple
+    definition of `vendored_fn'".
+
+Remaining: localize/keep-global/strip (phase 2), Mach-O and COFF (phase 3),
+section edits. Edits apply only at ingest of relocatable inputs, not to a
+linked shared object.

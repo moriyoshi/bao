@@ -12,6 +12,7 @@ go_library(
         "//internal/ar",
         "//linuxelf",
         "//pecoff",
+        "//symedit",
         "//toolchain",
         "//translate",
         "//verify",
