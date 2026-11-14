@@ -14,14 +14,15 @@ func (h *harness) darwinDylib(arch, sdk string) {
 	dylib := filepath.Join(h.dst, "fixture.dylib")
 	h.run("dylib-link.log", h.dst, nil, "xcrun", "clang++", "-dynamiclib", "-O2", "-std=c++17", "-arch", ldarch, "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib.cpp"))
 	app := filepath.Join(h.dst, "dylib")
+	require(os.Mkdir(app, 0o755))
 	h.run("dylib-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "dylib_threads", "-o", filepath.Join(app, "native"), dylib)
 	h.module(app, "bao-dylib-check", "")
 	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(darwinDylibConsumer), 0o644))
 	exe := filepath.Join(h.dst, "dylib-check")
 	h.consumer("dylib-build.log", app, h.goTool, "build", "-o", exe, ".")
 	for _, procs := range []string{"1", "4"} {
-		out := h.run("dylib-run-"+procs+".log", h.root, map[string]string{"GOMAXPROCS": procs}, exe)
-		check(strings.Contains(string(out), "PASS: Darwin dylib"), "Darwin dylib consumer failed: %s", out)
+		out, err := h.command("dylib-run-"+procs+".log", h.root, map[string]string{"GOMAXPROCS": procs}, exe)
+		check(err == nil && strings.Contains(string(out), "PASS: Darwin dylib"), "Darwin dylib consumer failed: %v\n%s", err, out)
 	}
 	for kind, edit := range map[string][2]string{
 		"unwind": {"registerFrame(base + uintptr(f))", "_ = f"},
