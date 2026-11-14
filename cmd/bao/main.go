@@ -63,6 +63,20 @@ func runLegacy(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if cmd == "translate" && translate.IsDylib(input) {
+		dylib, anchor, err := translate.PrepareDylib(input, symbols)
+		if err != nil {
+			return err
+		}
+		if *out == "" {
+			return usage("-o is required")
+		}
+		report, err := translate.Inspect(anchor.Data, []translate.Object{anchor})
+		if err != nil {
+			return err
+		}
+		return probeDylib(*out, *pkg, *sdk, symbols, dylib, anchor, report, stderr)
+	}
 	objects, err := translate.Parse(filepath.Base(fs.Arg(0)), input)
 	if err != nil {
 		return err

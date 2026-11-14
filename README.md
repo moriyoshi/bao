@@ -845,6 +845,45 @@ of leaving a dangling reference. The build log reports the dropped bytes, and
 COFF always drops `.llvmbc`/`.llvmcmd` and other `IMAGE_SCN_LNK_REMOVE` sections,
 so `-strip-bitcode=false` is rejected for Windows targets.
 
+### macOS dylibs
+
+A linked arm64 or x86_64 dylib can be the input instead of objects or an
+archive:
+
+```sh
+bao build -target darwin/arm64 -symbol python_entry -o ./py libpython3.13.dylib
+```
+
+A dylib's segments are contiguous and arm64 macOS pages are 16 KiB, so its
+data cannot be made writable inside Go's text without exposing its code. The
+generated package embeds the dylib's prepared image and loads it at
+initialization, as dyld would:
+- **Mapping:** private memory, with `__TEXT` in `MAP_JIT` memory on arm64,
+  which macOS lets an unsigned image execute and which is written only while
+  the loading thread has disabled JIT write protection. Other segments are
+  ordinary anonymous memory at their fixed offsets.
+- **Fixups:** chained fixups (`DYLD_CHAINED_PTR_64` and `_64_OFFSET`) or
+  `LC_DYLD_INFO` rebase and bind opcodes, with lazy binds bound eagerly. Imports
+  resolve with `dlsym`; a missing weak import is null.
+- **TLS:** thread-local variables use Bao's Darwin TLS runtime. Each TLV
+  descriptor's thunk is replaced, and the dylib's template is first in Bao's.
+- **Unwinding:** libunwind finds compact unwind information only for images
+  dyld loaded, so `__unwind_info` is converted to DWARF FDEs. That covers arm64
+  `FRAME`/`FRAMELESS` and x86_64 `RBP_FRAME`/`STACK_IMMD`/`STACK_IND`,
+  including personality and LSDA. The FDEs are registered with
+  `__register_frame`, together with the dylib's own `__eh_frame` records.
+- **Initializers:** `__mod_init_func` or `__init_offsets` run in order.
+- **Exports:** `SharedObjectExport(name)`, `SharedObjectExports()` and
+  `-symbol` accessors return load-time addresses.
+
+Not supported:
+- arm64e dylibs, Objective-C and Swift images (their runtimes register
+  images through dyld), and tagged or multi-start chained fixups.
+- Relocatable code combined with a dylib.
+
+`dladdr` and `dlopen` do not know the image, and `__mod_term_func` does not run.
+Weak definitions are not coalesced across images.
+
 ### Linux arm64 / ELF
 
 `translate -target linux/arm64` handles native Linux AArch64 ELF64 relocatable code, independently

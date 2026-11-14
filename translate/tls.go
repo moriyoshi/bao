@@ -40,6 +40,8 @@ type TLSProbe struct {
 	AddendsNormalized               int
 	CompactFramesSynthesized        int
 	RegisterFrame                   string
+	// Dylib is a dylib the generated package loads at initialization.
+	Dylib *DylibImage
 }
 
 func (p TLSProbe) RuntimeSymbol(suffix string) string { return p.Namespace + suffix }

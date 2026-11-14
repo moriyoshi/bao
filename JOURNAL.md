@@ -5121,3 +5121,54 @@ Go 1.26.11):
   so Go could run the DLL calls on several OS threads; each kept a TLS block,
   and Shutdown correctly refused. Run 4 passed by scheduling. The consumer now
   calls runtime.LockOSThread, as Bao's other Windows consumers do.
+
+## 2026-11-14: macOS dylib input
+
+Problem: the user asked for shared-object input on every platform; this entry
+covers Darwin (Linux is PR #8, Windows PR #9). The Linux approach, the image
+as one section of Go's text, fails here: a dylib's segments are contiguous,
+arm64 macOS pages are 16 KiB, and Go starts Darwin text at 0x100001000, so a
+16 KiB-aligned image would trigger the text-alignment bug of the earlier
+2026-11-14 entry, while 4 KiB alignment would put data on code pages. And
+arm64 macOS executes only signed pages, or MAP_JIT memory.
+
+Decision: as for Windows, load the prepared image at initialization into
+private memory: on arm64, MAP_JIT for the whole range, with every
+non-executable segment remapped MAP_FIXED as ordinary anonymous memory so its
+data stays writable while code runs; code is copied with
+`pthread_jit_write_protect_np(0)`, then the icache is invalidated. On x86_64,
+plain anonymous memory with mprotect.
+
+Change (`translate/dylib.go`, `translate/dylibunwind.go`, `cmd/bao/dylib.go`):
+- Parse: segments (no `__PAGEZERO`; `__TEXT` must map the header), chained
+  fixups for `DYLD_CHAINED_PTR_64`/`_64_OFFSET` with all three import
+  formats, or LC_DYLD_INFO rebase/bind/lazy-bind opcodes (weak binds keep the
+  dylib's own definitions), the export trie (re-exports and resolvers
+  skipped), TLV sections, `__mod_init_func`/`__init_offsets`. ObjC, Swift and
+  arm64e are rejected.
+- Unwind: libunwind uses compact unwind only through dyld's image list. The
+  two-level `__unwind_info` (regular and compressed pages, LSDA index,
+  personalities) is decoded and converted to DWARF appended after the image:
+  arm64 FRAME/FRAMELESS (factored from the object path), x86_64 RBP_FRAME,
+  STACK_IMMD and STACK_IND with ld64's register permutation, plus a zPLR CIE
+  per personality (indirect through the dylib's bound slot) and LSDA pointers;
+  absolute pointers are rebases. DWARF-mode entries and `__eh_frame`-only FDEs
+  register the dylib's own records.
+- TLS: an anchor Mach-O object carries the dylib's TLV template (and one
+  descriptor, which the object pipeline requires) through `LowerTLSKeeping`,
+  which links Bao's TLS runtime with the dylib's template at offset 0; the
+  loader points every dylib TLV descriptor at Bao's thunk.
+- Generated package: `dylibLoad` runs after TLS configuration and before
+  initializers; `SharedObjectExport`/`SharedObjectExports` and `-symbol`
+  accessors use load-time addresses. `toolchain.Detect` accepts dylibs, and
+  debug/bitcode stripping is skipped for them.
+- `bao-verify`'s Darwin suite gains a dylib leg (testdata/darwin_dylib.cpp,
+  linked with `xcrun clang++ -dynamiclib`) with negative controls that drop FDE
+  registration and the TLV descriptor setup.
+
+Verification so far, on the Linux arm64 host with Go 1.26.11: `go test ./...`
+and `go vet ./...` pass. Unit tests check the anchor through the ordinary
+pipeline for arm64 and amd64 (template at offset 0), arm64 compact CFI,
+x86_64 permutations against ld64's encoder for six register sets plus
+STACK_IND, and the export trie. No dylib has been loaded yet: no Apple linker
+or macOS host is available here, so the macOS CI legs are the first check.
