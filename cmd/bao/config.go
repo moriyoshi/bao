@@ -45,9 +45,10 @@ type buildConfig struct {
 	} `json:"darwin"`
 	Linux *struct {
 		platformLinkConfig
-		Sysroot         string   `json:"sysroot"`
-		Linker          string   `json:"ld"`
-		SystemLibraries []string `json:"system_libraries"`
+		Sysroot          string   `json:"sysroot"`
+		Linker           string   `json:"ld"`
+		SystemLibraries  []string `json:"system_libraries"`
+		MaxTextAlignment *uint    `json:"max_text_alignment"`
 	} `json:"linux"`
 	Windows *struct {
 		platformLinkConfig
@@ -244,6 +245,12 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 			func() error { return setPaths("sysroot", s.Linux.Sysroot) },
 			func() error { return setLinker(s.Linux.Linker) },
 			func() error { return set("linux-system-library", s.Linux.SystemLibraries...) },
+			func() error {
+				if s.Linux.MaxTextAlignment == nil {
+					return nil
+				}
+				return set("linux-max-text-alignment", strconv.FormatUint(uint64(*s.Linux.MaxTextAlignment), 10))
+			},
 		}
 		steps = append(steps, link(s.Linux.platformLinkConfig)...)
 	case strings.HasPrefix(target.Name, "windows/") && s.Windows != nil:

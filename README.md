@@ -868,6 +868,20 @@ sysroot libraries with `-linux-system-library libxcb.so.1` (repeatable). Each
 must exist in the sysroot, and it cannot replace a symbol the standard set
 already exports. The consumer machine must provide the same library.
 
+On every Linux target, an executable section aligned beyond 4096 bytes fails
+translation by default. Stock Go's linker starts `runtime.text` at its 4 KiB
+text address and then rounds the `.text` section up to the larger alignment,
+so method offsets no longer match `runtime.text`. Interface method calls
+through itabs built at run time then call the wrong function. Earlier packages
+silently produced such binaries. libffi's AArch64 `trampoline_code_table`
+(16 KiB) is one source. `-linux-max-text-alignment 4096` (or
+`"max_text_alignment": 4096` in the `linux` config section) links these
+sections at 4096 bytes, prints a notice and lists them under
+`linux_capped_text_alignments` in bao-manifest.json and as
+`BAO-ELF-TEXT-ALIGNMENT-CAPPED` in diagnostics. Code that depends on the
+stronger alignment, such as libffi's static trampolines on kernels with pages
+larger than 4 KiB, is unverified under the cap.
+
 This path targets glibc/AArch64 and one combined native image. Other native TLS
 models, native IFUNC definitions, preinit arrays, static musl and arbitrary
 shared-library inputs are not supported. Other architectures use their
@@ -1289,7 +1303,7 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
 `require_static_runtime` and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
-`sysroot`, `ld` and `system_libraries`; `windows` takes `imports`,
+`sysroot`, `ld`, `system_libraries` and `max_text_alignment`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
 section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.

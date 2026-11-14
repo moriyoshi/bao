@@ -48,6 +48,24 @@ type Table struct {
 	Count    int    `json:"count"`
 	Priority int    `json:"priority"`
 }
+
+// CappedAlignment records an executable section linked below its requested
+// alignment because of -linux-max-text-alignment.
+type CappedAlignment struct {
+	Section   string `json:"section"`
+	Requested uint64 `json:"requested"`
+	Applied   uint64 `json:"applied"`
+}
+
+// MaxSafeTextAlignment is the largest executable section alignment that stock
+// Go's linker places correctly. It starts runtime.text at -T, which is only
+// 4 KiB-aligned by default (for example 0x11000 on linux/arm64), assigns text
+// symbol addresses from there, and then rounds the .text section start up to
+// the largest symbol alignment. Method offsets (R_METHODOFF) are relative to
+// that rounded start, but the runtime adds them to runtime.text, so every
+// itab built at run time calls the wrong function.
+const MaxSafeTextAlignment = 4096
+
 type Plan struct {
 	Arch                 string            `json:"goarch"`
 	LocalFixups          []LocalFixup      `json:"local_pointer_fixups,omitempty"`
@@ -65,6 +83,7 @@ type Plan struct {
 	Imports              []Import          `json:"imports"`
 	Fixups               []Fixup           `json:"pointer_fixups"`
 	WeakZero             []string          `json:"unavailable_weak_symbols"`
+	CappedTextAlignments []CappedAlignment `json:"linux_capped_text_alignments,omitempty"`
 	Artifacts            map[string]string `json:"artifact_sha256"`
 	Objects              [][]byte          `json:"-"`
 }
@@ -297,6 +316,10 @@ func (e *UnresolvedError) Error() string {
 
 // Options configures TranslateWithOptions.
 type Options struct {
+	// MaxTextAlignment, when MaxSafeTextAlignment, links executable sections
+	// requesting more at that alignment and records them in the plan.
+	// Otherwise such sections are rejected.
+	MaxTextAlignment uint64
 	// SystemLibraries names additional sysroot shared objects, such as
 	// libxcb.so.1, whose exports may satisfy native imports. Each must exist.
 	SystemLibraries []string
@@ -307,6 +330,9 @@ func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
 }
 
 func TranslateWithOptions(input []byte, sysroot string, exports []string, opts Options) (*Plan, error) {
+	if opts.MaxTextAlignment != 0 && opts.MaxTextAlignment != MaxSafeTextAlignment {
+		return nil, fmt.Errorf("unsupported Linux maximum text alignment %d; only %d is supported", opts.MaxTextAlignment, MaxSafeTextAlignment)
+	}
 	main, err := parse(input)
 	if err != nil {
 		return nil, err
@@ -391,6 +417,9 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 			}
 			if s.flags&elf.SHF_TLS != 0 {
 				return nil, fmt.Errorf("unlowered ELF TLS section %s", s.name)
+			}
+			if err := p.limitTextAlignment(s, opts.MaxTextAlignment); err != nil {
+				return nil, err
 			}
 			if s.flags&elf.SHF_COMPRESSED != 0 || s.flags&elf.SHF_LINK_ORDER != 0 {
 				return nil, fmt.Errorf("unsupported allocated ELF section flags in %s", s.name)
@@ -528,6 +557,18 @@ func normalizeSymbols(m *image) error {
 			return fmt.Errorf("native symbol outside section: %s", s.name)
 		}
 	}
+	return nil
+}
+
+func (p *Plan) limitTextAlignment(s *section, max uint64) error {
+	if s.flags&elf.SHF_EXECINSTR == 0 || s.align <= MaxSafeTextAlignment {
+		return nil
+	}
+	if max != MaxSafeTextAlignment {
+		return fmt.Errorf("executable section %s requests %d-byte alignment; stock Go's linker misplaces runtime.text when text is aligned beyond %d bytes, corrupting interface method calls. -linux-max-text-alignment %d links it at %d bytes", s.name, s.align, MaxSafeTextAlignment, MaxSafeTextAlignment, MaxSafeTextAlignment)
+	}
+	p.CappedTextAlignments = append(p.CappedTextAlignments, CappedAlignment{s.name, s.align, MaxSafeTextAlignment})
+	s.align = MaxSafeTextAlignment
 	return nil
 }
 

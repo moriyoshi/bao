@@ -36,6 +36,7 @@ const (
 	findingImportMissing = "BAO-IMPORT-MISSING"
 	findingGenerate      = "BAO-GENERATE"
 	findingAlignCapped   = "BAO-COFF-ALIGNMENT-CAPPED"
+	findingTextCapped    = "BAO-ELF-TEXT-ALIGNMENT-CAPPED"
 )
 
 const (
@@ -567,7 +568,8 @@ func (d *diagnosticSession) checkDensity(functions []textFunction) {
 
 // checkCappedAlignments keeps an opted-in alignment cap visible in every report.
 func (d *diagnosticSession) checkCappedAlignments(output string) {
-	if !strings.HasPrefix(d.target.Name, "windows/") {
+	windows := strings.HasPrefix(d.target.Name, "windows/")
+	if !windows && !strings.HasPrefix(d.target.Name, "linux/") {
 		return
 	}
 	data, err := os.ReadFile(filepath.Join(output, "bao-manifest.json"))
@@ -576,23 +578,31 @@ func (d *diagnosticSession) checkCappedAlignments(output string) {
 		return
 	}
 	var parsed struct {
-		Capped []pecoff.CappedAlignment `json:"windows_capped_alignments"`
+		Windows []pecoff.CappedAlignment   `json:"windows_capped_alignments"`
+		Linux   []linuxelf.CappedAlignment `json:"linux_capped_text_alignments"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		d.skip("alignment", err.Error())
 		return
 	}
-	if len(parsed.Capped) == 0 {
+	var evidence []string
+	for _, c := range parsed.Windows {
+		evidence = append(evidence, fmt.Sprintf("%s: requested %d, applied %d", c.Section, c.Requested, c.Applied))
+	}
+	for _, c := range parsed.Linux {
+		evidence = append(evidence, fmt.Sprintf("%s: requested %d, applied %d", c.Section, c.Requested, c.Applied))
+	}
+	if len(evidence) == 0 {
 		d.stage("alignment", "OK", "no sections linked below their requested alignment", nil, nil)
 		return
 	}
-	detail := fmt.Sprintf("%d read-only sections linked below their requested alignment", len(parsed.Capped))
-	d.stage("alignment", "WARN", detail, nil, nil)
-	var evidence []string
-	for _, c := range parsed.Capped {
-		evidence = append(evidence, fmt.Sprintf("%s: requested %d, applied %d", c.Section, c.Requested, c.Applied))
+	kind, finding := "read-only", findingAlignCapped
+	if !windows {
+		kind, finding = "executable", findingTextCapped
 	}
-	d.finding(findingAlignCapped, "WARN", "alignment", detail, evidence...)
+	detail := fmt.Sprintf("%d %s sections linked below their requested alignment", len(evidence), kind)
+	d.stage("alignment", "WARN", detail, nil, nil)
+	d.finding(finding, "WARN", "alignment", detail, evidence...)
 }
 
 var dynamicImport = regexp.MustCompile(`^//go:cgo_import_dynamic\s.*"([^"]+)"\s*$`)

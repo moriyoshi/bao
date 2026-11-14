@@ -387,3 +387,25 @@ func TestShortBranchesOutsideSectionOrRangeRejected(t *testing.T) {
 		})
 	}
 }
+
+// libffi's AArch64 trampoline_code_table makes .text 16 KiB-aligned.
+func TestTextAlignmentBeyondGoLinkerLimit(t *testing.T) {
+	text := section{name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 16384}
+	s := text
+	if err := (&Plan{}).limitTextAlignment(&s, 0); err == nil || !strings.Contains(err.Error(), "-linux-max-text-alignment 4096") {
+		t.Fatalf("over-aligned text accepted without the opt-in: %v", err)
+	}
+	p := &Plan{}
+	if err := p.limitTextAlignment(&s, MaxSafeTextAlignment); err != nil || s.align != 4096 || len(p.CappedTextAlignments) != 1 || p.CappedTextAlignments[0] != (CappedAlignment{".text", 16384, 4096}) {
+		t.Fatalf("cap not applied and recorded: %v %+v", err, p.CappedTextAlignments)
+	}
+	for _, ok := range []section{{name: ".text", flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4096}, {name: ".data", flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 16384}} {
+		p := &Plan{}
+		if err := p.limitTextAlignment(&ok, 0); err != nil || len(p.CappedTextAlignments) != 0 {
+			t.Fatalf("%s at %d must pass unchanged: %v", ok.name, ok.align, err)
+		}
+	}
+	if _, err := TranslateWithOptions(nil, "", nil, Options{MaxTextAlignment: 8192}); err == nil || !strings.Contains(err.Error(), "only 4096") {
+		t.Fatalf("unsupported cap value accepted: %v", err)
+	}
+}

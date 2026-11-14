@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/moriyoshi/bao/bindings"
+	"github.com/moriyoshi/bao/linuxelf"
 	"github.com/moriyoshi/bao/toolchain"
 )
 
@@ -30,6 +32,7 @@ type nativeFlags struct {
 	windowsImportLibraries            symbolFlags
 	windowsMaxDataAlignment           uint
 	linuxSystemLibraries              symbolFlags
+	linuxMaxTextAlignment             uint
 	config                            string
 	inlineBindings                    []byte
 	diagnostics                       diagnosticFlags
@@ -51,6 +54,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.Var(&o.windowsImportLibraries, "windows-import-library", "short-import library naming system DLL functions, such as libuser32.a; repeatable, first match wins, never overrides -windows-import or built-in bindings")
 	fs.UintVar(&o.windowsMaxDataAlignment, "windows-max-data-alignment", 0, "link read-only data requesting more alignment at this value; only 32 is supported, and capped sections are recorded in the manifest")
 	fs.Var(&o.linuxSystemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
+	fs.UintVar(&o.linuxMaxTextAlignment, "linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported, and capped sections are recorded in the manifest")
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
 	fs.StringVar(&o.windowsCRT, "windows-crt", "ucrt", "Windows system C runtime: ucrt or msvcrt; match the producer toolchain")
 	o.diagnostics.register(fs)
@@ -111,6 +115,12 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 	}
 	if len(o.linuxSystemLibraries) > 0 && !strings.HasPrefix(target.Name, "linux/") {
 		return usage("-linux-system-library requires a Linux target")
+	}
+	if o.linuxMaxTextAlignment != 0 && o.linuxMaxTextAlignment != linuxelf.MaxSafeTextAlignment {
+		return usage("-linux-max-text-alignment supports only 4096")
+	}
+	if o.linuxMaxTextAlignment != 0 && !strings.HasPrefix(target.Name, "linux/") {
+		return usage("-linux-max-text-alignment requires a Linux target")
 	}
 	if strings.HasPrefix(target.Name, "windows/") {
 		if !o.stripBitcode {
@@ -176,6 +186,9 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 	if strings.HasPrefix(target.Name, "linux/") {
 		for _, name := range o.linuxSystemLibraries {
 			args = append(args, "-linux-system-library", name)
+		}
+		if o.linuxMaxTextAlignment != 0 {
+			args = append(args, "-linux-max-text-alignment", strconv.FormatUint(uint64(o.linuxMaxTextAlignment), 10))
 		}
 		return translateELF(append(args, "-sysroot", o.sysroot, input), stderr)
 	}
