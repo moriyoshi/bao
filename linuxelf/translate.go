@@ -450,38 +450,8 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 			s.flags &^= elf.SHF_GROUP | elf.SectionFlag(0x200000)
 			s.name = fmt.Sprintf(".bao.%s.%d.%d.%s", digest[:12], oi, si, strings.TrimPrefix(s.name, "."))
 		}
-		for i := 1; i < len(m.symbols); i++ {
-			s := &m.symbols[i]
-			typ := elf.ST_TYPE(s.info)
-			if s.sect >= uint16(elf.SHN_LORESERVE) {
-				if typ == elf.STT_FILE {
-					s.info = byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE)
-					s.name = "$d.bao.ignored"
-					s.sect = 0
-					s.value = 0
-					continue
-				}
-				return nil, fmt.Errorf("unsupported absolute/common/extended symbol %s", s.name)
-			}
-			if int(s.sect) >= len(m.sections) {
-				return nil, fmt.Errorf("invalid native symbol section")
-			}
-			if s.sect != 0 && m.sections[s.sect].flags&elf.SHF_ALLOC == 0 {
-				s.info = byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE)
-				s.name = "$d.bao.ignored"
-				s.sect = 0
-				s.value = 0
-				continue
-			}
-			if typ != elf.STT_FUNC && typ != elf.STT_OBJECT && typ != elf.STT_NOTYPE && typ != elf.STT_SECTION {
-				return nil, fmt.Errorf("unsupported native symbol type %s: %s", s.name, typ)
-			}
-			if err := normalizeUnique(s); err != nil {
-				return nil, err
-			}
-			if s.sect != 0 && (s.value > m.sections[s.sect].size || s.size > m.sections[s.sect].size-s.value) {
-				return nil, fmt.Errorf("native symbol outside section: %s", s.name)
-			}
+		if err := normalizeSymbols(m); err != nil {
+			return nil, err
 		}
 	}
 	sort.SliceStable(p.Constructors, func(i, j int) bool { return p.Constructors[i].Priority < p.Constructors[j].Priority })
@@ -506,6 +476,59 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 		p.Artifacts[name] = fmt.Sprintf("%x", sha256.Sum256(b))
 	}
 	return p, nil
+}
+
+// Retire symbols that cannot or need not reach Go's linker, and reject the
+// rest of the forms outside the supported profile.
+func normalizeSymbols(m *image) error {
+	referenced := map[uint32]bool{}
+	for _, s := range m.sections {
+		if s.flags&elf.SHF_ALLOC != 0 {
+			for _, r := range s.relocs {
+				referenced[r.sym] = true
+			}
+		}
+	}
+	for i := 1; i < len(m.symbols); i++ {
+		s := &m.symbols[i]
+		typ := elf.ST_TYPE(s.info)
+		if s.sect >= uint16(elf.SHN_LORESERVE) {
+			// Assembler constants such as OpenSSL perlasm's `mixin` are
+			// local absolute symbols that no code or data refers to.
+			unused := elf.ST_BIND(s.info) == elf.STB_LOCAL && s.sect == uint16(elf.SHN_ABS) && !referenced[uint32(i)]
+			if typ == elf.STT_FILE || unused {
+				s.info = byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE)
+				s.name = "$d.bao.ignored"
+				s.sect = 0
+				s.value = 0
+				continue
+			}
+			if s.sect == uint16(elf.SHN_ABS) && referenced[uint32(i)] {
+				return fmt.Errorf("unsupported relocation against absolute symbol %s", s.name)
+			}
+			return fmt.Errorf("unsupported absolute/common/extended symbol %s", s.name)
+		}
+		if int(s.sect) >= len(m.sections) {
+			return fmt.Errorf("invalid native symbol section")
+		}
+		if s.sect != 0 && m.sections[s.sect].flags&elf.SHF_ALLOC == 0 {
+			s.info = byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE)
+			s.name = "$d.bao.ignored"
+			s.sect = 0
+			s.value = 0
+			continue
+		}
+		if typ != elf.STT_FUNC && typ != elf.STT_OBJECT && typ != elf.STT_NOTYPE && typ != elf.STT_SECTION {
+			return fmt.Errorf("unsupported native symbol type %s: %s", s.name, typ)
+		}
+		if err := normalizeUnique(s); err != nil {
+			return err
+		}
+		if s.sect != 0 && (s.value > m.sections[s.sect].size || s.size > m.sections[s.sect].size-s.value) {
+			return fmt.Errorf("native symbol outside section: %s", s.name)
+		}
+	}
+	return nil
 }
 
 // Partial native linking has already coalesced GNU unique C++ objects. The
@@ -555,9 +578,6 @@ func (p *Plan) lowerTLS(m *image) error {
 		if s.typ != elf.SHT_PROGBITS && s.typ != elf.SHT_NOBITS {
 			return fmt.Errorf("unsupported native TLS section %s", s.name)
 		}
-		if len(s.relocs) != 0 {
-			return fmt.Errorf("relocations in ELF TLS templates require additional support")
-		}
 		alignment = max(alignment, s.align)
 		for uint64(len(template))%s.align != 0 {
 			template = append(template, 0)
@@ -581,6 +601,9 @@ func (p *Plan) lowerTLS(m *image) error {
 	p.TLSTemplateSymbol = p.Runtime("tls_template")
 	templateSection := m.addSection(section{name: ".bao.tls_template", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: alignment, size: uint64(len(template)), data: template})
 	m.addSymbol(p.TLSTemplateSymbol, templateSection, 0, uint64(len(template)))
+	if err := moveTemplateRelocs(m, offsets, templateSection); err != nil {
+		return err
+	}
 	descSection := m.addSection(section{name: ".bao.tls_descriptors", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8})
 	thunk := m.addSymbol(p.Runtime("tls_thunk"), 0, 0, 0)
 	type target struct {
@@ -658,6 +681,65 @@ func (p *Plan) lowerTLS(m *image) error {
 		m.sections[si].relocs = out
 	}
 	p.TLSDescriptors = len(descriptors)
+	return nil
+}
+
+// TLS initializers may hold absolute pointers to ordinary image data, such as
+// mimalloc's `__thread mi_heap_t *_mi_heap_default = &_mi_heap_empty`. Move
+// them onto the native template: the Go linker, or the import fixup pass that
+// runs before native code, writes each pointer before any thread copies it.
+// A pointer to TLS would need a per-thread value, so it is rejected.
+func moveTemplateRelocs(m *image, offsets map[uint16]uint64, template uint16) error {
+	abs := map[elf.Machine]uint32{elf.EM_AARCH64: uint32(elf.R_AARCH64_ABS64), elf.EM_X86_64: uint32(elf.R_X86_64_64), elf.EM_LOONGARCH: uint32(elf.R_LARCH_64), elf.EM_PPC64: uint32(elf.R_PPC64_ADDR64)}[m.effectiveMachine()]
+	for si := range m.sections {
+		base, ok := offsets[uint16(si)]
+		if !ok {
+			continue
+		}
+		s := &m.sections[si]
+		for _, r := range s.relocs {
+			sym := m.symbols[r.sym]
+			if uint32(r.typ) != abs {
+				return fmt.Errorf("unsupported relocation %d in native TLS template %s; only absolute pointers are supported", r.typ, s.name)
+			}
+			if r.off+8 > uint64(len(s.data)) {
+				return fmt.Errorf("absolute pointer outside native TLS template %s", s.name)
+			}
+			if _, tls := offsets[sym.sect]; tls || elf.ST_TYPE(sym.info) == elf.STT_TLS {
+				return fmt.Errorf("native TLS template %s points into TLS through %s", s.name, sym.name)
+			}
+			r.off += base
+			m.sections[template].relocs = append(m.sections[template].relocs, r)
+		}
+		s.relocs = nil
+	}
+	return nil
+}
+
+// Go's linker does not apply AArch64 conditional (B.cond, CBZ/CBNZ) or
+// test-bit (TBZ/TBNZ) branch relocations. Hand-written assembly such as
+// OpenSSL's uses them against symbols in the same section, where the
+// displacement is already final; resolve those in place.
+func resolveShortBranch(m *image, si uint16, r reloc) error {
+	s := &m.sections[si]
+	sym := m.symbols[r.sym]
+	bits, opcode, opmask := 19, uint32(0x54000000), uint32(0xff000010) // B.cond
+	if r.typ == elf.R_AARCH64_TSTBR14 {
+		bits, opcode, opmask = 14, 0x36000000, 0x7e000000 // TBZ/TBNZ
+	}
+	if sym.sect != si || s.flags&elf.SHF_EXECINSTR == 0 || r.off+4 > uint64(len(s.data)) {
+		return fmt.Errorf("%s from %s to %s outside its section is unsupported", r.typ, s.name, sym.name)
+	}
+	word := binary.LittleEndian.Uint32(s.data[r.off:])
+	if word&opmask != opcode && !(r.typ == elf.R_AARCH64_CONDBR19 && word&0x7e000000 == 0x34000000) { // CBZ/CBNZ
+		return fmt.Errorf("%s at %s+%#x is not a branch instruction", r.typ, s.name, r.off)
+	}
+	delta := int64(sym.value) + r.add - int64(r.off)
+	if limit := int64(1) << (bits + 1); delta&3 != 0 || delta < -limit || delta >= limit {
+		return fmt.Errorf("%s from %s+%#x to %s is misaligned or out of range", r.typ, s.name, r.off, sym.name)
+	}
+	mask := uint32(1)<<bits - 1
+	binary.LittleEndian.PutUint32(s.data[r.off:], word&^(mask<<5)|uint32(delta>>2)&mask<<5)
 	return nil
 }
 
@@ -739,6 +821,12 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 			}
 			var out []reloc
 			for _, r := range s.relocs {
+				if r.typ == elf.R_AARCH64_CONDBR19 || r.typ == elf.R_AARCH64_TSTBR14 {
+					if err := resolveShortBranch(m, uint16(si), r); err != nil {
+						return err
+					}
+					continue
+				}
 				if !supportedReloc(r.typ) {
 					return fmt.Errorf("unsupported allocated ELF relocation %s in %s", r.typ, s.name)
 				}

@@ -196,3 +196,194 @@ func fmtHash(h [32]byte) string {
 	}
 	return string(b)
 }
+
+// mimalloc: __thread mi_heap_t *_mi_heap_default = &_mi_heap_empty.
+func tlsTemplatePointerFixture() *image {
+	m := tlsFixture()
+	m.sections = append(m.sections,
+		section{name: ".tdata.ptr", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE | elf.SHF_TLS, align: 8, size: 16, data: make([]byte, 16), relocs: []reloc{{off: 8, sym: 2, typ: elf.R_AARCH64_ABS64, add: 4}}},
+		section{name: ".data", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8, size: 16, data: make([]byte, 16)})
+	m.symbols = append(m.symbols, symbol{name: "heap_empty", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_OBJECT), sect: 5, size: 16})
+	return m
+}
+
+func TestTLSTemplatePointerMovesToNativeTemplate(t *testing.T) {
+	m := tlsTemplatePointerFixture()
+	p := &Plan{Namespace: "test_"}
+	if err := p.lowerTLS(m); err != nil {
+		t.Fatal(err)
+	}
+	var template *section
+	for i := range m.sections {
+		if m.sections[i].name == ".bao.tls_template" {
+			template = &m.sections[i]
+		}
+	}
+	// .tdata at 0, .tbss at 128..256, then the pointer section at 256.
+	if template == nil || len(template.relocs) != 1 || template.relocs[0].off != 264 || template.relocs[0].typ != elf.R_AARCH64_ABS64 || template.relocs[0].sym != 2 || template.relocs[0].add != 4 {
+		t.Fatalf("TLS template pointer was not moved to its template offset: %+v", template)
+	}
+	if len(m.sections[4].relocs) != 0 {
+		t.Fatal("lowered TLS section kept its relocation")
+	}
+	if err := (&Plan{Namespace: "test_"}).bind([]*image{m, thunkHelper()}, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The runtime helper image that defines the TLSDESC thunk.
+func thunkHelper() *image {
+	return &image{sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 4, data: make([]byte, 4)}}, symbols: []symbol{{}, {name: "test_tls_thunk", info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC), sect: 1, size: 4}}}
+}
+
+func TestTLSTemplateImportedPointerBecomesFixup(t *testing.T) {
+	m := tlsTemplatePointerFixture()
+	m.symbols[2] = symbol{name: "environ", info: byte(elf.STB_GLOBAL) << 4}
+	p := &Plan{Namespace: "test_"}
+	if err := p.lowerTLS(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.bind([]*image{m, thunkHelper()}, map[string]string{"environ": "libc.so.6"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Fixups) != 1 || p.Fixups[0].Addend != 4 {
+		t.Fatalf("imported TLS initializer pointer needs a fixup before threads copy the template: %+v", p.Fixups)
+	}
+	for _, s := range m.symbols {
+		if s.name == p.Fixups[0].Location && (m.sections[s.sect].name != ".bao.tls_template" || s.value != 264) {
+			t.Fatal("fixup does not patch the native template")
+		}
+	}
+}
+
+func TestTLSTemplateRejectsUnmodeledRelocations(t *testing.T) {
+	for _, kind := range []string{"pc-relative", "pointer-to-tls", "pointer-to-tls-section", "truncated", "amd64-pc-relative"} {
+		t.Run(kind, func(t *testing.T) {
+			m := tlsTemplatePointerFixture()
+			r := &m.sections[4].relocs[0]
+			switch kind {
+			case "pc-relative":
+				r.typ = elf.R_AARCH64_PREL64
+			case "pointer-to-tls":
+				r.sym = 1
+			case "pointer-to-tls-section":
+				m.symbols[2].sect = 3
+			case "truncated":
+				r.off = 12
+			case "amd64-pc-relative":
+				m.machine = elf.EM_X86_64
+				r.typ = elf.R_AARCH64(elf.R_X86_64_PC64)
+			}
+			p := &Plan{Namespace: "test_"}
+			if err := p.lowerTLSForMachine(m); err == nil || !strings.Contains(err.Error(), "TLS template") {
+				t.Fatalf("unsupported TLS template relocation accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestTLSTemplatePointerOnDynamicTLSTargets(t *testing.T) {
+	m, p := amd64TLSFixture(false)
+	m.sections[2].relocs = []reloc{{off: 0, sym: 3, typ: elf.R_AARCH64(elf.R_X86_64_64)}}
+	m.sections = append(m.sections, section{name: ".data", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8, size: 8, data: make([]byte, 8)})
+	m.symbols = append(m.symbols, symbol{name: "heap_empty", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_OBJECT), sect: 3, size: 8})
+	if err := p.lowerTLSForMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range m.sections {
+		if s.name == ".bao.tls_template" && (len(s.relocs) != 1 || elf.R_X86_64(s.relocs[0].typ) != elf.R_X86_64_64) {
+			t.Fatal("amd64 TLS template pointer was not moved")
+		}
+	}
+}
+
+func TestUnreferencedLocalAbsoluteSymbolIsRetired(t *testing.T) {
+	abs := symbol{name: "mixin", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE), sect: uint16(elf.SHN_ABS), value: 0x1234}
+	text := section{name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 8, data: make([]byte, 8)}
+	m := &image{sections: []section{{}, text}, symbols: []symbol{{}, abs}}
+	if err := normalizeSymbols(m); err != nil || m.symbols[1].sect != 0 || m.symbols[1].name == "mixin" {
+		t.Fatal("unreferenced local absolute symbol was not retired", err)
+	}
+	for _, kind := range []string{"referenced", "global"} {
+		m := &image{sections: []section{{}, text}, symbols: []symbol{{}, abs}}
+		switch kind {
+		case "referenced":
+			m.sections[1].relocs = []reloc{{off: 0, sym: 1, typ: elf.R_AARCH64_ABS64}}
+		case "global":
+			m.symbols[1].info = byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_NOTYPE)
+		}
+		if err := normalizeSymbols(m); err == nil {
+			t.Fatalf("%s absolute symbol accepted", kind)
+		}
+	}
+	// A debug-only reference does not keep the symbol alive.
+	m = &image{sections: []section{{}, text, {name: ".debug_info", typ: elf.SHT_PROGBITS, size: 8, data: make([]byte, 8), relocs: []reloc{{sym: 1, typ: elf.R_AARCH64_ABS64}}}}, symbols: []symbol{{}, abs}}
+	if err := normalizeSymbols(m); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// b.ne / cbz / tbnz into the same section: OpenSSL poly1305-armv8.
+func TestSameSectionShortBranchesResolved(t *testing.T) {
+	code := make([]byte, 0x40)
+	for i, w := range []uint32{0x54000001, 0xb4000000, 0x37000000, 0xd65f03c0} {
+		binary.LittleEndian.PutUint32(code[4*i:], w)
+	}
+	m := &image{sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: uint64(len(code)), data: code, relocs: []reloc{{off: 0, sym: 1, typ: elf.R_AARCH64_CONDBR19}, {off: 4, sym: 2, typ: elf.R_AARCH64_CONDBR19, add: 0x10}, {off: 8, sym: 1, typ: elf.R_AARCH64_TSTBR14, add: 0x20}}}}, symbols: []symbol{{}, {name: "poly1305_emit", info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC), sect: 1, value: 0x30, size: 4}, {info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_SECTION), sect: 1}}}
+	if err := (&Plan{Namespace: "test_"}).bind([]*image{m}, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	text := m.sections[1]
+	want := []uint32{0x54000001 | (0x30/4)<<5, 0xb4000000 | (0xc/4)<<5, 0x37000000 | (0x48/4)<<5}
+	for i, w := range want {
+		if got := binary.LittleEndian.Uint32(text.data[4*i:]); got != w {
+			t.Fatalf("branch %d: got %#x, want %#x", i, got, w)
+		}
+	}
+	if len(text.relocs) != 0 {
+		t.Fatal("resolved branch relocations reached Go's linker")
+	}
+	// Backward branches encode negative displacements.
+	binary.LittleEndian.PutUint32(text.data[0x3c:], 0x54000000)
+	text.relocs = []reloc{{off: 0x3c, sym: 2, typ: elf.R_AARCH64_CONDBR19}}
+	m.sections[1] = text
+	if err := (&Plan{Namespace: "test_"}).bind([]*image{m}, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	back := int32(-0x3c / 4)
+	if got := binary.LittleEndian.Uint32(text.data[0x3c:]); got != 0x54000000|(uint32(back)&0x7ffff)<<5 {
+		t.Fatalf("backward branch: %#x", got)
+	}
+}
+
+func TestShortBranchesOutsideSectionOrRangeRejected(t *testing.T) {
+	for _, kind := range []string{"other-section", "import", "tbz-range", "misaligned", "not-a-branch", "condbr-range"} {
+		t.Run(kind, func(t *testing.T) {
+			code := make([]byte, 16)
+			binary.LittleEndian.PutUint32(code, 0x54000001)
+			binary.LittleEndian.PutUint32(code[4:], 0x36000000)
+			text := section{name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 16, data: code}
+			other := section{name: ".text.other", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 4, data: make([]byte, 4)}
+			m := &image{sections: []section{{}, text, other}, symbols: []symbol{{}, {name: "target", info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC), sect: 1, value: 12}}}
+			r := reloc{off: 0, sym: 1, typ: elf.R_AARCH64_CONDBR19}
+			switch kind {
+			case "other-section":
+				m.symbols[1].sect, m.symbols[1].value = 2, 0
+			case "import":
+				m.symbols[1].sect, m.symbols[1].value = 0, 0
+			case "tbz-range":
+				r.off, r.typ, r.add = 4, elf.R_AARCH64_TSTBR14, 1<<15
+			case "misaligned":
+				r.add = 2
+			case "not-a-branch":
+				binary.LittleEndian.PutUint32(m.sections[1].data, 0xd503201f) // nop
+			case "condbr-range":
+				r.add = 1 << 20
+			}
+			m.sections[1].relocs = []reloc{r}
+			if err := (&Plan{Namespace: "test_"}).bind([]*image{m}, map[string]string{"target": "libc.so.6"}); err == nil || !strings.Contains(err.Error(), "R_AARCH64_") {
+				t.Fatalf("unsupported short branch accepted: %v", err)
+			}
+		})
+	}
+}

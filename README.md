@@ -869,9 +869,29 @@ must exist in the sysroot, and it cannot replace a symbol the standard set
 already exports. The consumer machine must provide the same library.
 
 This path targets glibc/AArch64 and one combined native image. Other native TLS
-models, TLS-template relocations, native IFUNC definitions, preinit arrays,
-static musl and arbitrary shared-library inputs are not supported. Other
-architectures use their separate target profiles. Missing optional weak imports have NULL address semantics and are
+models, native IFUNC definitions, preinit arrays, static musl and arbitrary
+shared-library inputs are not supported. Other architectures use their
+separate target profiles.
+
+TLS initializers may hold absolute pointers to image data or system imports,
+such as mimalloc's `__thread mi_heap_t *_mi_heap_default = &_mi_heap_empty`.
+Bao writes them into its native TLS template before any thread copies it. A
+pointer to another TLS variable, or any other relocation in a TLS template,
+is rejected. This applies to every Linux target; it has run natively only on
+arm64. Conditional and test-bit branches (`R_AARCH64_CONDBR19`,
+`R_AARCH64_TSTBR14`), which Go's linker does not apply, are resolved during
+translation when the target is in the same section; other targets fail
+translation. Unreferenced local absolute symbols, such as OpenSSL perlasm
+constants, are dropped; a relocation against an absolute symbol is rejected.
+
+glibc keeps `atexit` in the static `libc_nonshared.a`, and its version loads
+the value of `__dso_handle`, which Bao's private DSO identity does not
+provide. Libraries that call `atexit` need a small wrapper such as
+`int atexit(void (*f)(void)) { return __cxa_atexit((void (*)(void *))f, 0, &__dso_handle); }`.
+Code built with AArch64 outline atomics (the default of many Linux GCC and
+Clang toolchains) needs `__aarch64_cas*`/`__aarch64_ldadd*` helpers: pass
+`-link-archive "$(gcc -print-libgcc-file-name)"` or compiler-rt builtins, or
+build with `-mno-outline-atomics`. Missing optional weak imports have NULL address semantics and are
 reported in the manifest; missing strong imports are rejected. Symbol version
 requirements and other glibc/toolchain combinations need separate verification.
 The [example README](examples/linux_runtime/README.md) records the final
@@ -899,8 +919,8 @@ cover Linux arm64 with both compilers.
 
 The amd64 TLS profile uses general/local dynamic TLS with ordinary SysV
 `__tls_get_addr` calls. GNU2 TLSDESC, initial/local exec TLS, native IFUNC
-definitions, TLS-template relocations, preinit arrays, static musl and
-arbitrary shared-library inputs remain unsupported. Rust std is checked in the
+definitions, preinit arrays, static musl and arbitrary shared-library inputs
+remain unsupported. Rust std is checked in the
 [static-runtime profile](#can-linux-packages-bundle-c-and-rust-runtimes);
 Clang with libc++ is unverified. Exceptions must stay inside native code;
 Go process exit does not run C++ static destructors. Explicit TLS/static
