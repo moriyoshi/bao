@@ -5115,3 +5115,9 @@ Go 1.26.11):
   TLS array loads were patched) without the TLS patches. The existing Windows
   COFF suites passed with the regenerated helper. Not run: Wine, other DLLs
   (no real-world library such as python313.dll yet), and clang-cl-built DLLs.
+- Run 5 (journal commit): the LLVM-MinGW amd64 consumer printed the expected
+  results, then Shutdown refused with "native Windows shutdown requires
+  quiescent native threads". The fixture consumer did not lock its OS thread,
+  so Go could run the DLL calls on several OS threads; each kept a TLS block,
+  and Shutdown correctly refused. Run 4 passed by scheduling. The consumer now
+  calls runtime.LockOSThread, as Bao's other Windows consumers do.

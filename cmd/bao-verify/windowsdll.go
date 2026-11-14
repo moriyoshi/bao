@@ -60,6 +60,7 @@ const windowsDLLConsumer = `package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -76,6 +77,9 @@ func call(name string, args ...uintptr) int32 {
 }
 
 func main() {
+	// Shutdown requires that only this thread holds the DLL's TLS; unlocked,
+	// Go may run each call on a different OS thread.
+	runtime.LockOSThread()
 	buf := make([]byte, 16)
 	ok := call("dll_format", uintptr(unsafe.Pointer(&buf[0])), 16)
 	value, _ := native.SharedObjectExport("dll_value")
