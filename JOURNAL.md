@@ -5172,3 +5172,42 @@ pipeline for arm64 and amd64 (template at offset 0), arm64 compact CFI,
 x86_64 permutations against ld64's encoder for six register sets plus
 STACK_IND, and the export trie. No dylib has been loaded yet: no Apple linker
 or macOS host is available here, so the macOS CI legs are the first check.
+
+Superseding design, after review. CI run 2 of PR #10 (19789c1, the MAP_JIT
+loader above) passed the dylib leg on native macOS arm64 (macos-26) and on the
+Intel runner (macos-26-intel), Xcode 26.6 clang, Go 1.26.11, both negative
+controls included. It showed that the parsing, fixups, compact-unwind
+conversion and TLV redirection work on a real clang-built dylib, but the
+design was rejected on review: the dylib's code ran as unsigned JIT memory,
+which hardened-runtime apps may use only with the allow-jit entitlement, and
+code review found three defects the fixture did not exercise. Dependent
+libraries were never opened, binds ignored the two-level namespace, and the
+TLS template was copied from the image after its fixup slots were zeroed, so a
+thread-local initialized with an address became null. The user chose to keep
+the image inside the executable's signed text instead. A blog post on
+restoring dyld memory loading (patching dyld in-process and spoofing its
+code-signing checks; it needs allow-unsigned-executable-memory) was reviewed
+and rejected for the same reasons.
+
+New design: Go's Darwin linker places a read-only, non-executable host section
+in `__TEXT,__rodata`, inside the r-x, signed `__TEXT` segment (maxprot rwx).
+Checked here by cross-linking darwin/arm64 with Go 1.26.11 against an ELF
+object whose read-only section asks for 16 KiB alignment: the section landed in
+`__TEXT,__rodata` at 0x1000b0000, aligned, while `runtime.text` stayed at
+0x100001000. `.text` alignment beyond 4 KiB is what misplaces runtime.text, so
+the image avoids that bug. The anchor object now carries the prepared image
+as that section, with a per-dylib base symbol and no relocations. At load the
+generated package makes only the dylib's data segments (16 KiB-aligned in the
+image) read-write, applies rebases, opens each bind's library by install name
+and binds through that handle (self, flat and weak lookups use the dylib's own
+export, else any image), points TLV descriptors at Bao's thunk, restores the
+segments' protections, registers the FDEs, builds the TLS template from the
+fixed-up image for `bao_tls_configure`, and runs initializers after TLS
+configuration. No MAP_JIT and no entitlements.
+
+Verification: `go test ./...` and `go vet ./...` pass on the Linux arm64 host;
+a unit test checks the anchor's image section (16 KiB alignment, read-only,
+base symbol at offset 0) through the ordinary pipeline for both
+architectures. Whether macOS allows the `__TEXT` data pages to become writable
+is checked only by the macOS CI legs; hardened-runtime binaries are not
+checked.

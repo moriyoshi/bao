@@ -2,41 +2,47 @@ package translate
 
 import (
 	"bytes"
+	"debug/elf"
 	"encoding/binary"
 	"testing"
 )
 
-// The anchor must pass Bao's ordinary Mach-O pipeline with the dylib's TLV
-// template at template offset 0, as the dylib's descriptors expect.
-func TestDylibAnchorCarriesTemplate(t *testing.T) {
+// The anchor must pass Bao's ordinary pipeline and leave the image as one
+// 16 KiB-aligned, non-executable ELF section starting at its base symbol: Go's
+// Darwin linker then places it in the signed __TEXT segment.
+func TestDylibAnchorCarriesImage(t *testing.T) {
 	for _, arch := range []string{"arm64", "amd64"} {
-		img := make([]byte, 0x4040)
-		copy(img[0x4000:], "initial!")
-		d := &DylibImage{SHA256: "00", Image: img, TLV: &DylibTLV{Start: 0x4000, DataEnd: 0x4008, End: 0x4020, Alignment: 8}}
+		img := make([]byte, 0x8000)
+		copy(img, "image!")
+		d := &DylibImage{SHA256: "0123456789abcdef0123", Image: img}
 		p, err := LowerTLSKeeping(dylibAnchor(arch, d), nil)
 		if err != nil {
 			t.Fatalf("%s: %v", arch, err)
 		}
-		if p.Arch != arch || p.TemplateSize < 0x20 || p.Descriptors != 1 {
-			t.Fatalf("%s: template %d bytes, %d descriptors", arch, p.TemplateSize, p.Descriptors)
+		b, err := ELFContainer(p.Objects[0])
+		if err != nil {
+			t.Fatal(err)
 		}
-		m, err := readImage(p.Objects[0])
+		f, err := elf.NewFile(bytes.NewReader(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		syms, err := f.Symbols()
 		if err != nil {
 			t.Fatal(err)
 		}
 		found := false
-		for _, s := range m.sections {
-			if s.name == "__bao_template" {
-				found = bytes.HasPrefix(s.data, []byte("initial!"))
+		for _, sym := range syms {
+			if sym.Name != d.BaseSymbol() {
+				continue
 			}
+			s := f.Sections[sym.Section]
+			data, _ := s.Data()
+			found = s.Addralign == 16384 && s.Flags&elf.SHF_ALLOC != 0 && s.Flags&(elf.SHF_EXECINSTR|elf.SHF_WRITE) == 0 && sym.Value == 0 && bytes.HasPrefix(data, []byte("image!"))
 		}
 		if !found {
-			t.Fatalf("%s: dylib TLV initializer is not at template offset 0", arch)
+			t.Fatalf("%s: image section or base symbol missing", arch)
 		}
-	}
-	// A TLS-free dylib still gets the runtime, for imports and constructors.
-	if _, err := LowerTLSKeeping(dylibAnchor("arm64", &DylibImage{SHA256: "01"}), nil); err != nil {
-		t.Fatal(err)
 	}
 }
 

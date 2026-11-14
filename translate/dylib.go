@@ -836,33 +836,32 @@ func PrepareDylib(input []byte, symbols []string) (*DylibImage, Object, error) {
 	return d, dylibAnchor(arch, d), nil
 }
 
-// dylibAnchor builds the object that carries a dylib's TLV template.
+// dylibAnchor builds the object that carries the dylib's prepared image as
+// one 16 KiB-aligned read-only section. Go's Darwin linker places read-only
+// host sections in __TEXT,__rodata, inside the executable and signed __TEXT
+// segment, so the image's code runs where it is linked; the image needs no
+// link-time relocations, and its data pages are made writable at load. Only
+// .text alignment beyond 4 KiB triggers the runtime.text misplacement of the
+// 2026-11-14 text alignment entry. The object also links Bao's TLS runtime.
 func dylibAnchor(arch string, d *DylibImage) Object {
 	cpu, ret := macho.CpuArm64, []byte{0xc0, 0x03, 0x5f, 0xd6}
 	if arch == "amd64" {
 		cpu, ret = macho.CpuAmd64, []byte{0xc3, 0xcc, 0xcc, 0xcc}
 	}
-	// The digest keeps the anchor, and so the namespace, distinct per dylib.
-	sections := []anchorSection{{seg: "__TEXT", name: "__text", flags: 0x80000400, data: ret, align: 2}, {seg: "__TEXT", name: "__const", data: []byte(d.SHA256), align: 0}}
-	var syms []anchorSymbol
-	if t := d.TLV; t != nil {
-		align := uint8(0)
-		for uint64(1)<<align < t.Alignment {
-			align++
-		}
-		data := d.Image[t.Start:t.DataEnd]
-		if len(data) == 0 {
-			data = make([]byte, min(8, t.End-t.Start))
-		}
-		sections = append(sections,
-			anchorSection{seg: "__DATA", name: "__thread_data", flags: sThreadLocalRegular, data: data, align: align},
-			anchorSection{seg: "__DATA", name: "__thread_bss", flags: sThreadLocalZerofill, zero: t.End - t.Start - uint64(len(data)), align: 0},
-			anchorSection{seg: "__DATA", name: "__thread_vars", flags: sThreadLocalVars, data: make([]byte, 24), align: 3, relocs: []anchorReloc{{0, 0}, {16, 1}}})
-		syms = []anchorSymbol{{name: "__tlv_bootstrap", extern: true}, {name: "_bao_dylib_tlv", section: 3}}
+	sections := []anchorSection{
+		{seg: "__TEXT", name: "__text", flags: 0x80000400, data: ret, align: 2},
+		{seg: "__TEXT", name: "__bao_image", data: d.Image, align: 14},
 	}
-	syms = append(syms, anchorSymbol{name: "_bao_dylib_anchor", section: 1, global: true})
+	syms := []anchorSymbol{
+		{name: "_bao_dylib_anchor", section: 1, global: true},
+		{name: "_" + d.BaseSymbol(), section: 2, global: true},
+	}
 	return Object{Name: "bao-dylib-anchor.o", Data: machoObject(cpu, sections, syms)}
 }
+
+// BaseSymbol names the image's first byte; the dylib's digest keeps it
+// distinct for each dylib.
+func (d *DylibImage) BaseSymbol() string { return "bao_dylib_" + d.SHA256[:16] + "_image" }
 
 type anchorSection struct {
 	seg, name string
