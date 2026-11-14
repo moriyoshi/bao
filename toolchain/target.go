@@ -97,6 +97,19 @@ func Detect(path string) (target Target, archive bool, err error) {
 		target, err = ParseTarget("windows/" + arch)
 		return target, false, err
 	}
+	// A linked dylib is accepted as a whole input, never as an archive member.
+	if f, err := macho.NewFile(bytes.NewReader(b)); err == nil && f.Type == macho.TypeDylib {
+		f.Close()
+		switch {
+		case f.Cpu == macho.CpuArm64 && f.SubCpu&0xff == 0:
+			target, err = ParseTarget("darwin/arm64")
+		case f.Cpu == macho.CpuAmd64:
+			target, err = ParseTarget("darwin/amd64")
+		default:
+			err = fmt.Errorf("dylib input requires macOS arm64 or x86_64 (arm64e is unsupported)")
+		}
+		return target, false, err
+	}
 	target, err = detectObject(b)
 	return target, false, err
 }

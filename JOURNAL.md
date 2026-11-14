@@ -5121,3 +5121,269 @@ Go 1.26.11):
   so Go could run the DLL calls on several OS threads; each kept a TLS block,
   and Shutdown correctly refused. Run 4 passed by scheduling. The consumer now
   calls runtime.LockOSThread, as Bao's other Windows consumers do.
+
+## 2026-11-14: macOS dylib input
+
+Problem: the user asked for shared-object input on every platform; this entry
+covers Darwin (Linux is PR #8, Windows PR #9). The Linux approach, the image
+as one section of Go's text, fails here: a dylib's segments are contiguous,
+arm64 macOS pages are 16 KiB, and Go starts Darwin text at 0x100001000, so a
+16 KiB-aligned image would trigger the text-alignment bug of the earlier
+2026-11-14 entry, while 4 KiB alignment would put data on code pages. And
+arm64 macOS executes only signed pages, or MAP_JIT memory.
+
+Decision: as for Windows, load the prepared image at initialization into
+private memory: on arm64, MAP_JIT for the whole range, with every
+non-executable segment remapped MAP_FIXED as ordinary anonymous memory so its
+data stays writable while code runs; code is copied with
+`pthread_jit_write_protect_np(0)`, then the icache is invalidated. On x86_64,
+plain anonymous memory with mprotect.
+
+Change (`translate/dylib.go`, `translate/dylibunwind.go`, `cmd/bao/dylib.go`):
+- Parse: segments (no `__PAGEZERO`; `__TEXT` must map the header), chained
+  fixups for `DYLD_CHAINED_PTR_64`/`_64_OFFSET` with all three import
+  formats, or LC_DYLD_INFO rebase/bind/lazy-bind opcodes (weak binds keep the
+  dylib's own definitions), the export trie (re-exports and resolvers
+  skipped), TLV sections, `__mod_init_func`/`__init_offsets`. ObjC, Swift and
+  arm64e are rejected.
+- Unwind: libunwind uses compact unwind only through dyld's image list. The
+  two-level `__unwind_info` (regular and compressed pages, LSDA index,
+  personalities) is decoded and converted to DWARF appended after the image:
+  arm64 FRAME/FRAMELESS (factored from the object path), x86_64 RBP_FRAME,
+  STACK_IMMD and STACK_IND with ld64's register permutation, plus a zPLR CIE
+  per personality (indirect through the dylib's bound slot) and LSDA pointers;
+  absolute pointers are rebases. DWARF-mode entries and `__eh_frame`-only FDEs
+  register the dylib's own records.
+- TLS: an anchor Mach-O object carries the dylib's TLV template (and one
+  descriptor, which the object pipeline requires) through `LowerTLSKeeping`,
+  which links Bao's TLS runtime with the dylib's template at offset 0; the
+  loader points every dylib TLV descriptor at Bao's thunk.
+- Generated package: `dylibLoad` runs after TLS configuration and before
+  initializers; `SharedObjectExport`/`SharedObjectExports` and `-symbol`
+  accessors use load-time addresses. `toolchain.Detect` accepts dylibs, and
+  debug/bitcode stripping is skipped for them.
+- `bao-verify`'s Darwin suite gains a dylib leg (testdata/darwin_dylib.cpp,
+  linked with `xcrun clang++ -dynamiclib`) with negative controls that drop FDE
+  registration and the TLV descriptor setup.
+
+Verification so far, on the Linux arm64 host with Go 1.26.11: `go test ./...`
+and `go vet ./...` pass. Unit tests check the anchor through the ordinary
+pipeline for arm64 and amd64 (template at offset 0), arm64 compact CFI,
+x86_64 permutations against ld64's encoder for six register sets plus
+STACK_IND, and the export trie. No dylib has been loaded yet: no Apple linker
+or macOS host is available here, so the macOS CI legs are the first check.
+
+Superseding design, after review. CI run 2 of PR #10 (19789c1, the MAP_JIT
+loader above) passed the dylib leg on native macOS arm64 (macos-26) and on the
+Intel runner (macos-26-intel), Xcode 26.6 clang, Go 1.26.11, both negative
+controls included. It showed that the parsing, fixups, compact-unwind
+conversion and TLV redirection work on a real clang-built dylib, but the
+design was rejected on review: the dylib's code ran as unsigned JIT memory,
+which hardened-runtime apps may use only with the allow-jit entitlement, and
+code review found three defects the fixture did not exercise. Dependent
+libraries were never opened, binds ignored the two-level namespace, and the
+TLS template was copied from the image after its fixup slots were zeroed, so a
+thread-local initialized with an address became null. The user chose to keep
+the image inside the executable's signed text instead. A blog post on
+restoring dyld memory loading (patching dyld in-process and spoofing its
+code-signing checks; it needs allow-unsigned-executable-memory) was reviewed
+and rejected for the same reasons.
+
+New design: Go's Darwin linker places a read-only, non-executable host section
+in `__TEXT,__rodata`, inside the r-x, signed `__TEXT` segment (maxprot rwx).
+Checked here by cross-linking darwin/arm64 with Go 1.26.11 against an ELF
+object whose read-only section asks for 16 KiB alignment: the section landed in
+`__TEXT,__rodata` at 0x1000b0000, aligned, while `runtime.text` stayed at
+0x100001000. `.text` alignment beyond 4 KiB is what misplaces runtime.text, so
+the image avoids that bug. The anchor object now carries the prepared image
+as that section, with a per-dylib base symbol and no relocations. At load the
+generated package makes only the dylib's data segments (16 KiB-aligned in the
+image) read-write, applies rebases, opens each bind's library by install name
+and binds through that handle (self, flat and weak lookups use the dylib's own
+export, else any image), points TLV descriptors at Bao's thunk, restores the
+segments' protections, registers the FDEs, builds the TLS template from the
+fixed-up image for `bao_tls_configure`, and runs initializers after TLS
+configuration. No MAP_JIT and no entitlements.
+
+Verification: `go test ./...` and `go vet ./...` pass on the Linux arm64 host;
+a unit test checks the anchor's image section (16 KiB alignment, read-only,
+base symbol at offset 0) through the ordinary pipeline for both
+architectures. Whether macOS allows the `__TEXT` data pages to become writable
+is checked only by the macOS CI legs; hardened-runtime binaries are not
+checked.
+
+Follow-up (user request): `@rpath`, `@loader_path` and `@executable_path`
+dependencies. `dlopen` resolves them against its caller's image, which in a
+Go executable has no rpaths, so the loader expands them itself: the dylib's
+code is part of the executable, so `@executable_path` and `@loader_path` name
+the executable's directory (symlinks resolved), as dyld treats the main
+executable; `@rpath` tries the dylib's LC_RPATH entries in order, each
+expanded the same way, and a failed bind lists every path tried. The CI
+fixture links `libdep.dylib` (install name `@rpath/libdep.dylib`) with rpaths
+`@loader_path/missing` then `@executable_path`, and the consumer finds it next
+to itself. A new generated-package test (darwindylib) compiles the loader for
+darwin/arm64 at 40000 table entries; it caught a uintptr/int mismatch in the
+TLS template code that would have failed every dylib consumer's build.
+
+## 2026-11-14: Loading a dylib from an unlinked file (spike, negative)
+
+Question: Objective-C and Swift dylibs need dyld to load them, because libobjc
+and libswiftCore register images only through dyld's notifications. The user
+allows no provisional disk writes unless they are hardened. macOS has no
+memfd_create or O_TMPFILE; the closest candidate was a file created with
+`O_CREAT|O_EXCL|O_NOFOLLOW` in a fresh `0700` directory under `$TMPDIR`,
+unlinked (with its directory) before `dlopen("/dev/fd/N")`.
+
+Spike (scripts and logs in .work/spike-dyld-fd): a dylib with a C function, a
+constructor and an Objective-C class; a C host; an ad-hoc signed and an
+unsigned copy of the dylib; the host plain and with the hardened runtime
+(`codesign -s - -o runtime`); loads by original path, by a private copy's
+path, through `/dev/fd/N` with the file still linked, and through `/dev/fd/N`
+after unlinking. Run natively on an Intel MacBook Pro, macOS 26.6.2 (25G83),
+Apple clang 17.0.0 (clang-1700.6.3.2). x86_64 `ld` does not ad-hoc sign
+dylibs by default, so the first run's "signed" case was unsigned; the second
+run signs it explicitly.
+
+Results:
+- Plain host, signed or unsigned dylib: the original path, the private copy
+  and `/dev/fd/N` while the file was linked all loaded; the function, the
+  constructor and `objc_getClass` plus a message send worked, and `dladdr`
+  named the file. dyld resolves `/dev/fd/N` to the file's path (F_GETPATH)
+  even when the file is unlinked.
+- `/dev/fd/N` after unlinking (link count 0) was refused in every case, plain
+  host included, signed or not: "library load disallowed by system policy".
+- Hardened host: every load failed, the original path included. The ad-hoc
+  signed dylib failed library validation ("mapping process and mapped file
+  (non-platform) have different Team IDs"), and the unsigned one had no cdhash.
+
+Conclusion: dyld needs a linked file at `dlopen`, which a same-user process can
+replace before it is opened, and a hardened-runtime app would also need the
+dylib signed with its own Team ID. Neither meets the no-provisional-write
+requirement, so Objective-C and Swift dylibs stay unsupported. Not run: arm64
+macOS, which is expected to be stricter, not looser.
+
+## 2026-11-14: Objective-C dylibs
+
+Problem: after the spike above ruled out letting dyld load the dylib, the user
+asked for narrow Objective-C and Swift support; this entry covers
+Objective-C. libobjc registers images from dyld's notifications, and this
+image is part of the executable.
+
+Change: the parser records `__objc_imageinfo`, `__objc_selrefs`,
+`__objc_classlist`, `__objc_nlclslist`, `__objc_catlist`, `__objc_nlcatlist`,
+`__objc_protolist` and `__objc_protorefs`. After rebases and binds, while the
+data segments are writable, the generated loader calls only public libobjc
+functions:
+1. Selector references are uniqued with `sel_registerName`.
+2. Protocols reuse a registered one of the same name or are rebuilt with
+   `objc_allocateProtocol`, `protocol_addProtocol`,
+   `protocol_addMethodDescription` and `objc_registerProtocol`; protocol lists
+   and references are repointed. Class protocol lists are remapped by name in
+   libobjc.
+3. Classes are read superclass-first with `objc_readClassPair`, the public
+   entry point for images dyld did not load; a superclass from another image
+   is realized first with a message send.
+4. Categories attach methods with `class_replaceMethod` and protocols with
+   `class_addProtocol`.
+5. `+load` methods (classes, then categories) run before the initializers, as
+   dyld orders them.
+
+Method lists are read in both the pointer form (`{SEL, types, IMP}`, selector
+by string) and the relative form (bit 31 of the entry-size word; selector
+through a selector reference). Category properties and class properties are
+not attached.
+
+Verification: the generated loader compiles in the darwindylib
+generated-package test. On the Intel MacBook Pro of the spike entry (macOS
+26.6.2, Apple clang 17.0.0), testdata/darwin_dylib_objc.m was built with
+`xcrun clang -dynamiclib -fobjc-arc -O2 -framework Foundation`, translated
+there by a darwin/amd64 Bao built with Go 1.26.11 (`-sdk` from xcrun), and the
+consumer cross-built here ran natively with `[11 2 101 7 6 1 1]`: +load in the
+class and a category, a category method, a subclass through super, protocol
+conformance, a category on NSString, NSClassFromString and Foundation
+formatting. Negative control: without the registration and +load steps the
+consumer crashed (exit 2). Scripts: .work/objc/loop.sh. A CI leg with the
+same control is added to the Darwin suite; arm64 is checked only there.
+
+## 2026-11-14: Swift dylibs
+
+The second half of the user's narrow Objective-C/Swift request. libswiftCore
+exports registration functions for images it does not learn about from dyld:
+`swift_registerProtocols`, `swift_registerProtocolConformances` and
+`swift_registerTypeMetadataRecords`. The parser records `__swift5_protos`,
+`__swift5_proto`, `__swift5_types` and `__swift5_types2`; the loader passes
+them after the Objective-C step, since Swift classes are Objective-C classes
+on Apple platforms and objc_readClassPair reads them. `__swift5_replace`,
+`__swift5_replac2` and `__swift5_acfuncs` have no such entry point and are
+rejected.
+
+Verification on the Intel MacBook Pro (macOS 26.6.2, Swift 6.2.3):
+testdata/darwin_dylib_swift.swift built with `xcrun swiftc -emit-library -O
+-target x86_64-apple-macos14`, translated there, consumer cross-built here
+with Go 1.26.11, run natively: `[17 3 1 6 2 1 1]` (protocol dispatch over a
+struct and a final class, CaseIterable, a dynamic cast from Any to a protocol,
+a type name, a dictionary, a caught Swift error, and an enum's description,
+which reached its field metadata through the type descriptor). Negative
+control: without the registration only the dynamic cast failed
+(`[17 3 0 6 2 1 1]`), isolating the conformance registration. Scripts:
+.work/objc/swift-loop.sh. A CI leg with the same control is added to the
+Darwin suite; arm64 is checked only there.
+
+Follow-ups to the Objective-C entry:
+- Category properties (user request): instance properties go to the class and
+  class properties (present when the image info has
+  OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES, bit 6) to its metaclass, through
+  `class_replaceProperty`, with each attribute string split at commas into
+  one-letter names and values (type encodings contain no commas). Classes' own
+  properties were already realized by `objc_readClassPair`. On the Intel Mac
+  the extended fixture returned `[11 2 101 7 6 1 1 1 1]`, the last two being a
+  readonly category instance property (with its `R` attribute) and a category
+  class property found by `class_getProperty`; without the property step they
+  were `0 0` and the rest unchanged.
+- CI failure on b96b5a6 (darwin-arm64): a C/C++ dylib's package did not
+  compile (`use of untyped nil in variable declaration`): with no Objective-C
+  metadata the generator emitted `var dylibObjC = nil`. The generated-package
+  test only covered a plan with Objective-C sections; a darwindylibc variant
+  without Objective-C or Swift now compiles too, and it fails with the same
+  message when the fix is reverted.
+
+Swift follow-up (user request, after a review of the remaining limits): a
+probe on the Intel Mac found that libswiftCore exports no registration for
+dynamic replacements (`swift_registerDynamicReplacements`) or accessible
+functions (`swift_registerAccessibleFunctions`), so those stay rejected, while
+libobjc exports `_objc_realizeClassFromSwift`. The fixture gained an NSObject
+subclass with an `@objc` method (called, found with NSClassFromString and
+answering `respondsToSelector:`), a generic class, an actor driven from a
+detached Task, a JSONEncoder subclass, and a subclass of `open class Base:
+NSObject` from a resilient framework (`BaoSwiftBase`, built with
+`-enable-library-evolution`, loaded through `@rpath`). The last one makes
+swiftc emit `__objc_stublist`, confirmed with otool; the loader does not
+process that section, and the class still worked, including lookup by name
+before its first Swift use: Swift registers stub-backed classes when it
+initializes their metadata, and its class lookup hook finds them through the
+registered type records. Result on the Intel Mac: `[17 3 1 6 2 1 1 3 1 6 5 5
+17]`. The JSONEncoder subclass alone emitted no stubs (a native Swift class
+initialized lazily). Not covered: Objective-C code in the same image naming a
+stub-backed class.
+
+CI on 6c95e5b, darwin-arm64: the C/C++ and Objective-C legs passed on native
+arm64. The Swift leg failed only in its consumer: widening the Objective-C
+consumer to 9 slots had also widened the Swift one, so the expected 7 values
+did not match `[17 3 1 6 2 1 1 0 0]`. The first 7 values, all Swift checks of
+that commit, were correct on arm64.
+
+Dynamic replacements and accessible functions (user question): libswiftCore
+enables an image's `__swift5_replace` record (flags, scope count, relative
+pointers to scopes) by enabling each scope, the operation the exported
+`swift_enableDynamicReplacementScope` performs under the runtime's lock; the
+loader now does that. Opaque-result replacements (`__swift5_replac2`) go into
+a runtime-private table, and accessible functions (`__swift5_acfuncs`, only
+for distributed actors) are found by `swift_findAccessibleFunction` only in
+sections dyld registered; neither has an exported registration, so both stay
+rejected. Check on the Intel Mac: `BaoSwiftBase` gained `public dynamic func
+greeting()` (returns 1) and `callGreeting()`, which calls it from inside that
+framework; the fixture adds `@_dynamicReplacement(for: greeting())` returning
+42. The consumer read 42 through `callGreeting()`, so the replacement held
+process-wide; without enabling the scopes it read 1, the rest unchanged.
+Helper functions the Swift step uses are now emitted for every dylib, and a
+generated-package variant without Objective-C image info compiles.

@@ -845,6 +845,78 @@ of leaving a dangling reference. The build log reports the dropped bytes, and
 COFF always drops `.llvmbc`/`.llvmcmd` and other `IMAGE_SCN_LNK_REMOVE` sections,
 so `-strip-bitcode=false` is rejected for Windows targets.
 
+### macOS dylibs
+
+A linked arm64 or x86_64 dylib can be the input instead of objects or an
+archive:
+
+```sh
+bao build -target darwin/arm64 -symbol python_entry -o ./py libpython3.13.dylib
+```
+
+A linked dylib reaches its data through PC-relative instructions without
+relocations, so Bao keeps its image together and lets it run where Go links it:
+- **Placement:** the image is one 16 KiB-aligned read-only section. Go's Darwin
+  linker places such host sections in `__TEXT,__rodata`, inside the
+  executable's `__TEXT` segment, so the dylib's code runs from signed pages of
+  the executable. The image needs no link-time relocations.
+- **Data pages:** the dylib's data segments are 16 KiB-aligned within the image,
+  so they never share a page with its code. At initialization they are made
+  read-write, fixed up, and `__DATA_CONST` is made read-only again. Code pages
+  are never written.
+- **Fixups:** chained fixups (`DYLD_CHAINED_PTR_64` and `_64_OFFSET`) or
+  `LC_DYLD_INFO` rebase and bind opcodes; lazy binds are bound eagerly. Each
+  bind resolves in the library its two-level namespace names, opened with
+  `dlopen` by its install name. A missing weak import is null.
+- **Library paths:** the dylib's code is part of the executable, so
+  `@executable_path` and `@loader_path` both name the executable's directory,
+  as dyld treats the main executable. `@rpath` tries the dylib's `LC_RPATH`
+  entries in order, each expanded the same way. The libraries must exist there
+  at run time, for example shipped next to the executable.
+- **TLS:** thread-local variables use Bao's Darwin TLS runtime. The template is
+  copied from the fixed-up image, so initializers may hold addresses, and each
+  TLV descriptor's thunk is replaced.
+- **Unwinding:** libunwind finds no compact unwind information for this code,
+  so `__unwind_info` is converted to DWARF FDEs. That covers arm64
+  `FRAME`/`FRAMELESS` and x86_64 `RBP_FRAME`/`STACK_IMMD`/`STACK_IND`,
+  including personality and LSDA. The FDEs are registered with
+  `__register_frame`, together with the dylib's own `__eh_frame` records.
+- **Initializers:** `__mod_init_func` or `__init_offsets` run in order, after
+  TLS is configured.
+- **Objective-C:** libobjc learns about images from dyld, so the loader
+  registers the dylib's metadata through libobjc's public API. It uniques
+  selector references (`sel_registerName`), registers protocols (or uses an
+  existing one of the same name), reads classes superclass-first with
+  `objc_readClassPair`, attaches categories' methods and protocols
+  (`class_replaceMethod`, `class_addProtocol`), and runs `+load` before the
+  initializers. Categories on other images' classes work, and their instance
+  and class properties are attached with `class_replaceProperty`.
+- **Swift:** the loader passes the image's protocol, conformance and type
+  records (`__swift5_protos`, `__swift5_proto`, `__swift5_types`) to
+  libswiftCore's `swift_registerProtocols`,
+  `swift_registerProtocolConformances` and `swift_registerTypeMetadataRecords`,
+  after the Objective-C step (Swift classes are Objective-C classes there).
+  Dynamic casts to protocols, generics, enums, errors, actors, NSObject
+  subclasses with `@objc` members, and subclasses of classes from resilient
+  frameworks (Objective-C class stubs) work. Automatic dynamic replacements
+  (`@_dynamicReplacement`, `__swift5_replace`) are enabled with
+  `swift_enableDynamicReplacementScope`, including replacements of functions in
+  other images. Replacements of functions with opaque result types
+  (`__swift5_replac2`) and distributed actors' accessible functions
+  (`__swift5_acfuncs`) are rejected: libswiftCore registers them only from
+  dyld's image callback. Runtime lookups that scan every image's reflection
+  sections by name do not see this one.
+- **Exports:** `SharedObjectExport(name)`, `SharedObjectExports()` and
+  `-symbol` accessors return the image's addresses.
+
+Not supported:
+- arm64e dylibs, and tagged or multi-start chained fixups.
+- Relocatable code combined with a dylib.
+
+`dladdr` reports the executable for the dylib's code, `__mod_term_func` does not
+run, and weak definitions are not coalesced across images. Making the
+`__TEXT` data pages writable has run only without the hardened runtime.
+
 ### Linux arm64 / ELF
 
 `translate -target linux/arm64` handles native Linux AArch64 ELF64 relocatable code, independently

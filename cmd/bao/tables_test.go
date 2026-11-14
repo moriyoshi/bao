@@ -90,6 +90,31 @@ func syntheticDarwinPlan(n int) *translate.TLSProbe {
 	return p
 }
 
+// syntheticDylibPlan adds a dylib image with fixups, binds by library and
+// @rpath, TLV descriptors, FDEs, initializers and exports.
+func syntheticDylibPlan(n int) *translate.TLSProbe {
+	p := syntheticDarwinPlan(n)
+	d := &translate.DylibImage{SHA256: "0123456789abcdef0123456789abcdef", Size: 0x40000, RPaths: []string{"@executable_path/lib", "@loader_path/../Frameworks"},
+		Segments: []translate.DylibSegment{{Name: "__TEXT", Start: 0, End: 0x4000, Protect: 5}, {Name: "__DATA", Start: 0x4000, End: 0x40000, Protect: 3}},
+		TLV:      &translate.DylibTLV{Descriptors: []uint64{0x4000}, Start: 0x5000, DataEnd: 0x5008, End: 0x5020, Alignment: 8},
+		Unwind:   &translate.DylibUnwind{}, Selected: []uint64{0x100}}
+	for i := 0; i < n; i++ {
+		d.Rebases = append(d.Rebases, translate.DylibRebase{Slot: uint64(0x6000 + 8*i), Target: uint64(16 * i)})
+		lib := []string{"", "/usr/lib/libz.1.dylib", "@rpath/libdep.dylib"}[i%3]
+		d.Binds = append(d.Binds, translate.DylibBind{Slot: uint64(0x20000 + 8*i), Name: fmt.Sprintf("import%d", i), Library: lib, Weak: i%2 == 0})
+		d.Exports = append(d.Exports, translate.DylibExport{Name: fmt.Sprintf("export%06d", i), Offset: uint64(16 * i), Function: true})
+		d.Unwind.FDEs = append(d.Unwind.FDEs, uint64(0x30000+32*i))
+		d.Initializers = append(d.Initializers, uint64(0x200+4*i))
+	}
+	r := func(start uint64) translate.DylibRange {
+		return translate.DylibRange{Start: start, End: start + 8*uint64(n)}
+	}
+	d.ObjC = &translate.DylibObjC{ImageInfo: 0x7000, SelRefs: r(0x8000), Classes: r(0x9000), LoadClasses: r(0xa000), Categories: r(0xb000), LoadCats: r(0xc000), Protocols: r(0xd000), ProtoRefs: r(0xe000)}
+	d.Swift = &translate.DylibSwift{Protocols: r(0xf000), Conformances: r(0x10000), Types: r(0x11000), Replacements: r(0x12000)}
+	p.Dylib = d
+	return p
+}
+
 type generatedPackage struct {
 	name, goos, goarch, file string
 	source                   func(n int) ([]byte, []byte, error)
@@ -107,6 +132,21 @@ func generatedPackages() []generatedPackage {
 	}})
 	packages = append(packages, generatedPackage{"linuxso", "linux", "arm64", "symbols_linux_arm64", func(n int) ([]byte, []byte, error) {
 		return linuxSource(syntheticSharedObjectPlan(n), "linuxso", []string{"answer"})
+	}})
+	packages = append(packages, generatedPackage{"darwindylib", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
+		return darwinSource(syntheticDylibPlan(n), "darwindylib", []string{"answer"}, nil, true)
+	}})
+	// Swift metadata without Objective-C image info.
+	packages = append(packages, generatedPackage{"darwindylibswift", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
+		p := syntheticDylibPlan(n)
+		p.Dylib.ObjC = nil
+		return darwinSource(p, "darwindylibswift", []string{"answer"}, nil, true)
+	}})
+	// A C/C++ dylib has no Objective-C or Swift metadata.
+	packages = append(packages, generatedPackage{"darwindylibc", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
+		p := syntheticDylibPlan(n)
+		p.Dylib.ObjC, p.Dylib.Swift = nil, nil
+		return darwinSource(p, "darwindylibc", []string{"answer"}, nil, true)
 	}})
 	packages = append(packages, generatedPackage{"darwin", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
 		return darwinSource(syntheticDarwinPlan(n), "darwin", []string{"answer"}, nil, true)
@@ -186,6 +226,12 @@ func RegisterFunc(fptr any, cfn uintptr) {}
 func Dlsym(handle uintptr, name string) (uintptr, error) { return 0, nil }
 
 func SyscallN(fn uintptr, args ...uintptr) (r1, r2, err uintptr) { return }
+
+const RTLD_NOW, RTLD_LOCAL, RTLD_GLOBAL = 2, 4, 8
+
+func Dlopen(path string, mode int) (uintptr, error) { return 0, nil }
+
+func RegisterLibFunc(fptr any, handle uintptr, name string) {}
 `
 
 // TestLargeGeneratedPackagesCompile compiles generated packages with tens of

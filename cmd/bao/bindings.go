@@ -70,9 +70,9 @@ func generateWithBindings(o nativeFlags, target toolchain.Target, input, output 
 		return err
 	}
 	translated := original
-	// A shared object's debug data and bitcode lie outside its load image,
-	// which is all Bao carries.
-	if linuxelf.IsSharedObject(original) {
+	// A shared object's or dylib's debug data and bitcode lie outside its load
+	// image, which is all Bao carries.
+	if linuxelf.IsSharedObject(original) || translate.IsDylib(original) {
 		o.stripDebug, o.stripBitcode = false, false
 	}
 	removed, bitcodeSections := 0, 0
