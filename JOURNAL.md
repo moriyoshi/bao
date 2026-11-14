@@ -5106,3 +5106,12 @@ Go 1.26.11):
   Finish now releases that block before checking; both helper objects were
   regenerated (Debian clang 19.1.7). `DllMain` detach also now runs before the
   helper's TLS teardown, as FreeLibrary orders it.
+- Run 4 (759433a): both Windows suites passed. The DLL leg (testdata/
+  windows_dll.cpp; 8 threads, C++ throw/catch, DllMain, static construction,
+  imports, exported data, run at GOMAXPROCS 1 and 4, then Shutdown) passed
+  natively with LLVM-MinGW 23.1.5, MSVC and MinGW GCC on windows/amd64, and
+  with LLVM-MinGW and MSVC on windows/arm64, each with the negative controls
+  failing as expected: without the function table registration, and (where
+  TLS array loads were patched) without the TLS patches. The existing Windows
+  COFF suites passed with the regenerated helper. Not run: Wine, other DLLs
+  (no real-world library such as python313.dll yet), and clang-cl-built DLLs.
