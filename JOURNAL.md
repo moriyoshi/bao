@@ -4666,3 +4666,108 @@ consumers ran natively; there was no emulation.
 - Not run: loong64/ppc64le/amd64 execution of template pointers (amd64 is
   unit-tested only), the Linux cpp/cross suites, Bazel, and pythago's full
   libpython build.
+
+## 2026-11-14: GNU2 TLSDESC on Linux amd64
+
+Problem: the linux/amd64 translator accepted only GD/LD TLS through
+`__tls_get_addr` and rejected `R_X86_64_GOTPC32_TLSDESC` and
+`R_X86_64_TLSDESC_CALL`, so any object built with `-mtls-dialect=gnu2`
+(GCC or Clang) failed, although linux/arm64 already lowers TLSDESC. Unmodified
+Bao (6ba2de6) rejected all three fixture archives below with
+`unsupported AMD64 TLS model/relocation R_X86_64_GOTPC32_TLSDESC; requires GD/LD`.
+
+Change:
+- `linuxelf/cross.go`: the amd64 dynamic-TLS pass retargets each
+  `lea x@tlsdesc(%rip), %reg` (REX.W 8D /r, RIP-relative, -4 bias) to a private
+  16-byte descriptor with a PC32 relocation and leaves the instruction bytes
+  unchanged. The descriptor's first word is an ABS64 relocation to the runtime
+  thunk, and its second word is the template offset. The `@tlscall` marker is
+  validated as `CALL *(%rax)` (FF 10) and dropped. Local-dynamic TLSDESC uses
+  the undefined `_TLS_MODULE_BASE_` with offset 0; DTPOFF32/64 folding was
+  already in place. That symbol is retired after lowering, so it is never bound
+  as a system import, and any other reference fails as an undefined local.
+  GD and TLSDESC descriptors for the same symbol stay separate.
+- `linuxelf/native/amd64/thunk.S` (new) implements the TLSDESC ABI: the
+  descriptor arrives in RAX and the offset from `%fs:0` returns in RAX. It
+  saves the other GPRs and flags, then XSAVE (mask 0xE7: x87, SSE, AVX, opmask,
+  ZMM_Hi256, Hi16_ZMM, never AMX tile data) into a 64-byte-aligned stack area
+  sized from CPUID leaf 0xD. It falls back to FXSAVE without OSXSAVE. The size
+  is probed once and cached. It then calls `bao_tls_lookup` and subtracts
+  `%fs:0`. On Linux the `_cgo_init` hook makes Go skip `settls` and starts Ms
+  through pthread_create (bindings/hooks.go), so `%fs` is a glibc TCB in native
+  code. `tls.c` is unchanged.
+- `cmd/bao-native` assembles and partially links the amd64 thunk, as for
+  ppc64le. The amd64 helper was regenerated in bao-cpp-cross:20261108 with
+  Debian x86_64-linux-gnu-gcc 14.2.0-19 and binutils 2.44. It was previously
+  built with GCC 14.4.0, so `tls.c` object code changed too. runtime.bin
+  sha256 is 44bd90db...acd6.
+- Initial/local exec stay rejected. Both bake a fixed thread-pointer offset
+  into code (a GOT constant or an immediate), but Bao's per-thread blocks are
+  heap allocations at a different offset on every thread. Supporting them
+  would need instruction rewriting, not relocation lowering.
+
+Verification. Host: Linux 7.0.0 aarch64. Docker daemon: linux/arm64; this
+daemon cannot run linux/amd64 containers. Go 1.27.4 from the host toolchain,
+not the pinned 1.26.11. Producer: linux/arm64 bao. Cross toolchain:
+bao-cpp-cross:20261108, built locally from testdata/toolchains/linux-cross.Dockerfile.
+- `go test ./...` and `go vet ./...` passed. New linuxelf unit tests cover
+  instruction preservation, descriptor and thunk relocations, module-base
+  folding and retirement, descriptor sharing and GD/TLSDESC separation, and
+  eleven rejected variants. Each rejection was checked against its intended
+  error message. Bazel was not available locally and was not run.
+- Fixture (scratch, .work/tlsdesc/src): global GD TLS, two static LD
+  variables, a 128-byte-aligned 512-byte initialized block, 8 pthreads plus
+  the main thread, and an assembly probe. The probe loads patterns into
+  RBX..R15 and XMM/YMM0-15, makes the first TLSDESC access of a new thread
+  (allocation and template copy), and compares every value. It was built
+  three ways: GCC 14.2 `-mtls-dialect=gnu2`, GCC default GD with the
+  hand-written TLSDESC probe linked in, and Clang 19.1.7 `-mtls-dialect=gnu2`.
+  Relocation inventories confirmed `_TLS_MODULE_BASE_` TLSDESC in both gnu2
+  builds. `bao build -target linux/amd64 -sysroot /usr/x86_64-linux-gnu` was
+  run in the container. CGO_ENABLED=0 purego consumers ran under emulated
+  qemu-x86_64 10.0.13 with `QEMU_CPU=max` (AVX2, no AVX-512) and `qemu64`
+  (no OSXSAVE, so the FXSAVE path), at GOMAXPROCS 1 and 4. All 12 runs
+  passed, with 10 TLS blocks freed and 0 live after explicit main-thread
+  finalization. Driver: .work/tlsdesc/run.sh.
+- Negative controls (helper rebuilt the same way): a thunk that does not
+  restore R11 failed with failure mask 0x100 on both CPU models. A thunk that
+  forces `vzeroupper` after the lookup on the FXSAVE path failed with
+  0xffff0000 (all YMM upper lanes). The same forced `vzeroupper` on the XSAVE
+  path passed.
+- Limitation found: a thunk using only FXSAVE also passed under QEMU `max`.
+  An all-assembly check showed that glibc 2.41's `memcpy` there clobbers the
+  lower 128 bits of XMM0-8 but leaves the YMM upper lanes alone (it picked a
+  legacy-SSE variant). So this environment never exercised the real lookup
+  path clobbering upper lanes; only the forced control above shows XRSTOR
+  restoring them. AVX-512 state, native amd64 hardware, the Linux cpp suite on
+  linux/amd64 (native Docker, hosted CI) and the rebuilt helper's GD path on
+  native hardware were not run. The verifier's amd64 C++ flags still select
+  GD; no hosted check builds TLSDESC on amd64 yet.
+
+## 2026-11-14: Investigate PR #5 conflict after PR #6
+
+PR #6 (merge dabf36c) and PR #5 (head a992112) both descend from 6ba2de6.
+`git merge-tree 6ba2de6 a992112 dabf36c` reports textual conflicts in
+README.md and JOURNAL.md. Both journal entries should be retained. The README
+needs the GNU2 TLSDESC description from PR #5 and the TLS-template pointer
+support from PR #6; PR #5's statement that TLS-template relocations remain
+unsupported is now too broad. Both branches change linuxelf/cross.go, but its
+changes merge without conflict.
+
+For an integration check, an archive of a992112 in .work/pr5-integration/tree
+was combined with the clean three-way merge of linuxelf/cross.go and the
+linuxelf/translate.go and linuxelf/translate_test.go files from dabf36c. On
+macOS Darwin arm64 with Go 1.27.3, `GOTOOLCHAIN=local
+GOCACHE=/Users/moriyoshi/Source/bao/.work/pr5-integration/gocache go test ./...`
+passed in that scratch tree. This checks the combined source through the Go
+test suite, not a completed Git merge or native linux/amd64 execution. The
+pinned Go 1.26.11 was not used. No branch was merged or pushed.
+
+## 2026-11-14: Resolve PR #5 after PR #6
+
+Rebased the GNU2 TLSDESC change onto PR #6, retaining both journal entries and
+updating the amd64 README to reflect TLS-template pointer support. The code
+merged without textual conflicts. On macOS Darwin arm64 with Go 1.27.3,
+`GOTOOLCHAIN=local GOCACHE=/Users/moriyoshi/Source/bao/.work/pr5-integration/gocache go test ./...`
+passed on the resolved working tree. This does not verify native Linux amd64
+execution or the pinned Go 1.26.11 toolchain.

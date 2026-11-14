@@ -77,7 +77,7 @@ func build(ctx context.Context, root, target string) error {
 			sources = []string{"../tls.c"}
 			outputs = []string{"runtime.bin"}
 			flags = []string{"-O2", "-fPIC", "-fno-omit-frame-pointer", "-c"}
-			if target == "linux/ppc64le" {
+			if target == "linux/ppc64le" || target == "linux/amd64" {
 				sources = []string{"../tls.c", "thunk.S"}
 				outputs = []string{"tls.o", "thunk.o"}
 			}
@@ -104,7 +104,7 @@ func build(ctx context.Context, root, target string) error {
 			return err
 		}
 	}
-	if target == "linux/arm64" || target == "linux/ppc64le" {
+	if target == "linux/arm64" || target == "linux/ppc64le" || target == "linux/amd64" {
 		if _, err := run(linker, "-r", filepath.Join(work, "tls.o"), filepath.Join(work, "thunk.o"), "-o", filepath.Join(work, "runtime.bin")); err != nil {
 			return err
 		}

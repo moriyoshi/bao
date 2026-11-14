@@ -70,22 +70,29 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 	}
 	desc := m.addSection(section{name: ".bao.tls_descriptors", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8})
 	type key struct {
-		sym uint32
-		add int64
-		ld  bool
+		sym  uint32
+		add  int64
+		ld   bool
+		gnu2 bool
 	}
 	descriptors := map[key]uint32{}
-	index := func(r reloc, ld bool) (uint32, error) {
+	thunk := uint32(0)
+	// GNU2 descriptors begin with the thunk that the compiler calls through;
+	// resolver-call descriptors leave that module word unused.
+	index := func(r reloc, ld, gnu2 bool) (uint32, error) {
 		s := m.symbols[r.sym]
-		base, ok := offsets[s.sect]
-		if !ok || elf.ST_TYPE(s.info) != elf.STT_TLS {
-			return 0, fmt.Errorf("TLS access requires local image TLS definition")
+		offset := int64(0)
+		if !(gnu2 && amd64TLSModuleBase(s) && r.add == 0) {
+			base, ok := offsets[s.sect]
+			if !ok || elf.ST_TYPE(s.info) != elf.STT_TLS {
+				return 0, fmt.Errorf("TLS access requires local image TLS definition")
+			}
+			offset = int64(base+s.value) + r.add
+			if offset < 0 || uint64(offset) >= uint64(len(template)) {
+				return 0, fmt.Errorf("TLS offset outside template")
+			}
 		}
-		offset := int64(base+s.value) + r.add
-		if offset < 0 || uint64(offset) >= uint64(len(template)) {
-			return 0, fmt.Errorf("TLS offset outside template")
-		}
-		k := key{r.sym, r.add, ld}
+		k := key{r.sym, r.add, ld, gnu2}
 		if old, ok := descriptors[k]; ok {
 			return old, nil
 		}
@@ -94,6 +101,12 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 		d.data = append(d.data, make([]byte, 16)...)
 		if !ld {
 			binary.LittleEndian.PutUint64(d.data[off+8:], uint64(offset))
+		}
+		if gnu2 {
+			if thunk == 0 {
+				thunk = m.addSymbol(p.Runtime("tls_thunk"), 0, 0, 0)
+			}
+			d.relocs = append(d.relocs, reloc{off: off, sym: thunk, typ: elf.R_AARCH64(elf.R_X86_64_64)})
 		}
 		d.size = uint64(len(d.data))
 		idx := m.addSymbol(fmt.Sprintf("%stls_desc_%d", p.Namespace, len(descriptors)), desc, off, 16)
@@ -127,7 +140,7 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 					}
 					operand := r
 					operand.add = 0 // The -4 in ELF is the RIP displacement bias.
-					idx, err := index(operand, t == elf.R_X86_64_TLSLD)
+					idx, err := index(operand, t == elf.R_X86_64_TLSLD, false)
 					if err != nil {
 						return err
 					}
@@ -142,8 +155,30 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 					}
 					continue
 				}
-				if t >= elf.R_X86_64_DTPMOD64 && t <= elf.R_X86_64_TPOFF32 || t == elf.R_X86_64_GOTPC32_TLSDESC || t == elf.R_X86_64_TLSDESC_CALL || t == elf.R_X86_64_TLSDESC {
-					return fmt.Errorf("unsupported AMD64 TLS model/relocation %s; requires GD/LD", t)
+				if t == elf.R_X86_64_GOTPC32_TLSDESC {
+					if err := validateAMD64TLSDescriptorLEA(s, r); err != nil {
+						return err
+					}
+					operand := r
+					operand.add = 0
+					idx, err := index(operand, false, true)
+					if err != nil {
+						return err
+					}
+					r.typ, r.sym = elf.R_AARCH64(elf.R_X86_64_PC32), idx
+					out = append(out, r)
+					continue
+				}
+				if t == elf.R_X86_64_TLSDESC_CALL {
+					// A marker for linker relaxation only. The unchanged
+					// CALL *(%rax) enters the thunk stored in the descriptor.
+					if err := validateAMD64TLSDescriptorCall(s, r, m.symbols); err != nil {
+						return err
+					}
+					continue
+				}
+				if t >= elf.R_X86_64_DTPMOD64 && t <= elf.R_X86_64_TPOFF32 || t == elf.R_X86_64_TLSDESC {
+					return fmt.Errorf("unsupported AMD64 TLS model/relocation %s; requires GD/LD or GNU2 TLSDESC", t)
 				}
 			}
 			if m.effectiveMachine() == elf.EM_LOONGARCH && (elf.R_LARCH(r.typ) == elf.R_LARCH_TLS_GD_PC_HI20 || elf.R_LARCH(r.typ) == elf.R_LARCH_TLS_LD_PC_HI20) {
@@ -169,7 +204,7 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 				}
 				// LLVM's local-dynamic form addresses one symbol's descriptor
 				// directly; unlike PPC64, it has no subsequent DTPREL offset.
-				idx, err := index(r, false)
+				idx, err := index(r, false, false)
 				if err != nil {
 					return err
 				}
@@ -206,7 +241,7 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 					if binary.LittleEndian.Uint32(s.data[r.off:])&0xfc1f0000 != 0x3c020000 || binary.LittleEndian.Uint32(s.data[lo.off:])&0xfc1f0000 != (0x38000000|(binary.LittleEndian.Uint32(s.data[r.off:])>>21&31)<<16) {
 						return fmt.Errorf("unsupported PowerPC GD/LD TLS instructions at %s: %#x %#x", s.name, binary.LittleEndian.Uint32(s.data[r.off:]), binary.LittleEndian.Uint32(s.data[lo.off:]))
 					}
-					idx, err := index(r, ld)
+					idx, err := index(r, ld, false)
 					if err != nil {
 						return err
 					}
@@ -247,6 +282,13 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 			out = append(out, r)
 		}
 		m.sections[si].relocs = out
+	}
+	// Every module-base use is now a private descriptor. Retire the linker
+	// symbol; any other reference remains an undefined local and is rejected.
+	for i := range m.symbols {
+		if amd64TLSModuleBase(m.symbols[i]) {
+			m.symbols[i] = symbol{name: "$d.bao.ignored", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE)}
+		}
 	}
 	p.TLSDescriptors = len(descriptors)
 	return nil
