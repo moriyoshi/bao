@@ -39,6 +39,37 @@ func validateAMD64TLSCall(s *section, address, call reloc, symbols []symbol, res
 	return nil
 }
 
+// GNU2 TLSDESC addresses a descriptor with LEA disp32(%rip) into any 64-bit
+// register. The compiler then calls through the descriptor's first word with
+// the descriptor in RAX; the result is an offset from the thread pointer.
+func validateAMD64TLSDescriptorLEA(s *section, r reloc) error {
+	if r.add != -4 || r.off < 3 || r.off+4 > uint64(len(s.data)) {
+		return fmt.Errorf("unsupported AMD64 TLSDESC descriptor LEA")
+	}
+	b := s.data[r.off-3 : r.off]
+	if b[0]&0xfb != 0x48 || b[1] != 0x8d || b[2]&0xc7 != 0x05 {
+		return fmt.Errorf("unsupported AMD64 TLSDESC descriptor LEA")
+	}
+	return nil
+}
+
+func validateAMD64TLSDescriptorCall(s *section, r reloc, symbols []symbol) error {
+	sym := symbols[r.sym]
+	if r.add != 0 || r.off+2 > uint64(len(s.data)) || !bytes.Equal(s.data[r.off:r.off+2], []byte{0xff, 0x10}) {
+		return fmt.Errorf("unsupported AMD64 TLSDESC call; requires CALL *(%%rax)")
+	}
+	if !amd64TLSModuleBase(sym) && (sym.sect == 0 || elf.ST_TYPE(sym.info) != elf.STT_TLS) {
+		return fmt.Errorf("AMD64 TLSDESC call target is not local image TLS")
+	}
+	return nil
+}
+
+// Local-dynamic TLSDESC computes this image's TLS block base, then adds
+// DTPOFF offsets. The linker would define this symbol at the module's TLS start.
+func amd64TLSModuleBase(s symbol) bool {
+	return s.name == "_TLS_MODULE_BASE_" && s.sect == 0
+}
+
 func foldAMD64TLSOffset(s *section, r reloc, symbols []symbol, offsets map[uint16]uint64, size uint64) error {
 	sym := symbols[r.sym]
 	base, ok := offsets[sym.sect]

@@ -917,8 +917,15 @@ native image. Both runtime registration and DWARF-inferred assembly bindings
 are checked. See the [Docker examples](examples/cpp_linux/README.md), which also
 cover Linux arm64 with both compilers.
 
-The amd64 TLS profile uses general/local dynamic TLS with ordinary SysV
-`__tls_get_addr` calls. GNU2 TLSDESC, initial/local exec TLS, native IFUNC
+The amd64 TLS profile accepts general/local dynamic TLS with ordinary SysV
+`__tls_get_addr` calls and GNU2 TLSDESC (`-mtls-dialect=gnu2`), including
+local-dynamic `_TLS_MODULE_BASE_` sequences. TLSDESC calls enter a Bao thunk
+that preserves the other general registers, flags, x87/MXCSR and XSAVE
+AVX/AVX-512 state. GCC 14.2 and Clang 19.1.7 TLSDESC output has run only under
+QEMU 10.0.13 (AVX2 and SSE-only CPU models); AVX-512 preservation is
+unverified. Initial/local exec TLS (`R_X86_64_GOTTPOFF`, `R_X86_64_TPOFF32`)
+is rejected: it assumes the image's TLS sits at a fixed offset from the
+thread pointer, which Bao's per-thread blocks cannot provide. Native IFUNC
 definitions, preinit arrays, static musl and arbitrary shared-library inputs
 remain unsupported. Rust std is checked in the
 [static-runtime profile](#can-linux-packages-bundle-c-and-rust-runtimes);

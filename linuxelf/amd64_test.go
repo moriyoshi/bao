@@ -43,7 +43,7 @@ func TestAMD64DynamicTLSIsDirectDescriptorNotGoTLS(t *testing.T) {
 }
 
 func TestAMD64TLSRejectsUnmodeledSequences(t *testing.T) {
-	for _, kind := range []string{"lea-register", "rip-bias", "wrong-call", "call-prefix", "initial-exec", "local-exec", "gnu2-desc", "offset-overflow", "symbol-wrap"} {
+	for _, kind := range []string{"lea-register", "rip-bias", "wrong-call", "call-prefix", "initial-exec", "local-exec", "offset-overflow", "symbol-wrap"} {
 		t.Run(kind, func(t *testing.T) {
 			m, p := amd64TLSFixture(true)
 			s := &m.sections[1]
@@ -72,6 +72,140 @@ func TestAMD64TLSRejectsUnmodeledSequences(t *testing.T) {
 				t.Fatal("unsupported TLS form accepted")
 			}
 		})
+	}
+}
+
+// lea desc(%rip), %rax; call *(%rax); then either mov %fs:(%rax), %eax or,
+// for local-dynamic, mov x@dtpoff(%rax), %edx after the module-base call.
+func amd64TLSDescriptorFixture(ld bool) (*image, *Plan) {
+	p := &Plan{Namespace: "amd_"}
+	code := []byte{0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xff, 0x10, 0x64, 0x8b, 0x00}
+	symbols := []symbol{{}, {name: "tls", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_TLS), sect: 2, value: 8, size: 8}}
+	relocs := []reloc{{off: 3, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_GOTPC32_TLSDESC), add: -4}, {off: 7, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_TLSDESC_CALL)}}
+	if ld {
+		code = []byte{0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xff, 0x10, 0x8b, 0x90, 0, 0, 0, 0}
+		symbols = append(symbols, symbol{name: "_TLS_MODULE_BASE_", info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_TLS)})
+		relocs = []reloc{{off: 3, sym: 2, typ: elf.R_AARCH64(elf.R_X86_64_GOTPC32_TLSDESC), add: -4}, {off: 7, sym: 2, typ: elf.R_AARCH64(elf.R_X86_64_TLSDESC_CALL)}, {off: 11, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_DTPOFF32)}}
+	}
+	m := &image{machine: elf.EM_X86_64, sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 16, size: uint64(len(code)), data: code, relocs: relocs}, {name: ".tbss", typ: elf.SHT_NOBITS, flags: elf.SHF_ALLOC | elf.SHF_TLS | elf.SHF_WRITE, align: 128, size: 16}}, symbols: symbols}
+	return m, p
+}
+
+func TestAMD64TLSDescriptorKeepsInstructionsAndCallsThunk(t *testing.T) {
+	for _, ld := range []bool{false, true} {
+		m, p := amd64TLSDescriptorFixture(ld)
+		before := bytes.Clone(m.sections[1].data[:11])
+		if err := p.lowerTLSForMachine(m); err != nil {
+			t.Fatal(err)
+		}
+		text := m.sections[1]
+		if !bytes.Equal(before, text.data[:11]) || len(text.relocs) != 1 || elf.R_X86_64(text.relocs[0].typ) != elf.R_X86_64_PC32 || text.relocs[0].add != -4 || text.relocs[0].off != 3 {
+			t.Fatal("TLSDESC lowering changed instructions, kept the call marker, or lost RIP bias")
+		}
+		desc := m.sections[len(m.sections)-1]
+		if m.symbols[text.relocs[0].sym].sect != uint16(len(m.sections)-1) || p.TLSDescriptors != 1 || p.TLSTemplateAlignment != 128 {
+			t.Fatal("LEA does not address the private descriptor")
+		}
+		if len(desc.relocs) != 1 || desc.relocs[0].off != 0 || elf.R_X86_64(desc.relocs[0].typ) != elf.R_X86_64_64 || m.symbols[desc.relocs[0].sym].name != p.Runtime("tls_thunk") || m.symbols[desc.relocs[0].sym].sect != 0 {
+			t.Fatal("descriptor entry word does not reference the runtime thunk")
+		}
+		want := uint64(8)
+		if ld {
+			want = 0
+			if binary.LittleEndian.Uint32(text.data[11:]) != 8 {
+				t.Fatal("local-dynamic DTPOFF was not folded to the template offset")
+			}
+		}
+		if binary.LittleEndian.Uint64(desc.data[8:]) != want {
+			t.Fatal("descriptor argument must be the symbol offset, or zero for the module base")
+		}
+	}
+}
+
+func TestAMD64TLSDescriptorSharesAndSeparatesDescriptors(t *testing.T) {
+	m, p := amd64TLSDescriptorFixture(false)
+	s := &m.sections[1]
+	s.data = append(s.data, s.data...)
+	s.size = uint64(len(s.data))
+	s.relocs = append(s.relocs, reloc{off: 15, sym: 1, typ: s.relocs[0].typ, add: -4}, reloc{off: 19, sym: 1, typ: s.relocs[1].typ})
+	if err := p.lowerTLSForMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	if p.TLSDescriptors != 1 || m.sections[1].relocs[0].sym != m.sections[1].relocs[1].sym {
+		t.Fatal("same TLSDESC target did not share one descriptor")
+	}
+	// A GD resolver-call descriptor must not alias a GNU2 descriptor.
+	gd, p := amd64TLSFixture(false)
+	gd.sections[1].data = append(gd.sections[1].data, 0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xff, 0x10)
+	gd.sections[1].size = uint64(len(gd.sections[1].data))
+	gd.sections[1].relocs = append(gd.sections[1].relocs[:2], reloc{off: 22, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_GOTPC32_TLSDESC), add: -4}, reloc{off: 26, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_TLSDESC_CALL)})
+	if err := p.lowerTLSForMachine(gd); err != nil {
+		t.Fatal(err)
+	}
+	desc := gd.sections[len(gd.sections)-1]
+	if p.TLSDescriptors != 2 || len(desc.relocs) != 1 || desc.relocs[0].off != 16 {
+		t.Fatal("GD and GNU2 descriptors were merged")
+	}
+}
+
+func TestAMD64TLSDescriptorRejectsUnmodeledSequences(t *testing.T) {
+	for _, kind := range []string{"mov-not-lea", "absolute-not-rip", "no-rex-w", "rip-bias", "call-register", "call-indirect-rip", "call-addend", "call-non-tls", "module-base-gd", "initial-exec-after"} {
+		t.Run(kind, func(t *testing.T) {
+			m, p := amd64TLSDescriptorFixture(kind == "module-base-gd")
+			s := &m.sections[1]
+			switch kind {
+			case "mov-not-lea":
+				s.data[1] = 0x8b
+			case "absolute-not-rip":
+				s.data[2] = 0x04
+			case "no-rex-w":
+				s.data[0] = 0x40
+			case "rip-bias":
+				s.relocs[0].add = 0
+			case "call-register":
+				s.data[8] = 0xd0
+			case "call-indirect-rip":
+				s.data[8] = 0x15
+			case "call-addend":
+				s.relocs[1].add = 4
+			case "call-non-tls":
+				m.symbols[1].info = byte(elf.STB_LOCAL)<<4 | byte(elf.STT_OBJECT)
+				s.relocs[0].typ = elf.R_AARCH64(elf.R_X86_64_NONE)
+			case "module-base-gd":
+				// Only the GNU2 form has a module-base descriptor here.
+				s.data = append([]byte{0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0}, s.data...)
+				s.size = uint64(len(s.data))
+				m.symbols = append(m.symbols, symbol{name: p.Runtime("tls_lookup"), info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC)})
+				s.relocs = []reloc{{off: 3, sym: 2, typ: elf.R_AARCH64(elf.R_X86_64_TLSGD), add: -4}, {off: 8, sym: 3, typ: elf.R_AARCH64(elf.R_X86_64_PLT32), add: -4}}
+			case "initial-exec-after":
+				s.relocs = append(s.relocs, reloc{off: 3, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_GOTTPOFF), add: -4})
+			}
+			if err := p.lowerTLSForMachine(m); err == nil {
+				t.Fatal("unsupported TLSDESC form accepted")
+			}
+		})
+	}
+}
+
+func TestAMD64TLSModuleBaseIsRetiredAfterLowering(t *testing.T) {
+	m, p := amd64TLSDescriptorFixture(true)
+	if err := p.lowerTLSForMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range m.symbols {
+		if s.name == "_TLS_MODULE_BASE_" {
+			t.Fatal("linker-defined TLS module base would leak as a system import")
+		}
+	}
+	// A non-TLSDESC use cannot bind to the retired symbol.
+	m, p = amd64TLSDescriptorFixture(true)
+	m.symbols[2].info = byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_NOTYPE)
+	m.sections[1].relocs = append(m.sections[1].relocs, reloc{off: 11, sym: 2, typ: elf.R_AARCH64(elf.R_X86_64_PC32), add: -4})
+	if err := p.lowerTLSForMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.bindAMD64([]*image{m}, nil); err == nil {
+		t.Fatal("ordinary reference to the TLS module base accepted")
 	}
 }
 
