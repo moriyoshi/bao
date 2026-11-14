@@ -891,12 +891,20 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   (`class_replaceMethod`, `class_addProtocol`), and runs `+load` before the
   initializers. Categories on other images' classes work. Category properties
   and class properties are not attached.
+- **Swift:** the loader passes the image's protocol, conformance and type
+  records (`__swift5_protos`, `__swift5_proto`, `__swift5_types`) to
+  libswiftCore's `swift_registerProtocols`,
+  `swift_registerProtocolConformances` and `swift_registerTypeMetadataRecords`,
+  after the Objective-C step (Swift classes are Objective-C classes there).
+  Dynamic casts to protocols, generics, enums and errors work. Dynamic
+  replacements (`__swift5_replace`) and accessible functions
+  (`__swift5_acfuncs`) are rejected, and runtime lookups that scan every image's
+  reflection sections by name do not see this one.
 - **Exports:** `SharedObjectExport(name)`, `SharedObjectExports()` and
   `-symbol` accessors return the image's addresses.
 
 Not supported:
-- arm64e dylibs, Swift images (libswiftCore registers images through dyld),
-  and tagged or multi-start chained fixups.
+- arm64e dylibs, and tagged or multi-start chained fixups.
 - Relocatable code combined with a dylib.
 
 `dladdr` reports the executable for the dylib's code, `__mod_term_func` does not

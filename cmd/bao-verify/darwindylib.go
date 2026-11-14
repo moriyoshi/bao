@@ -131,3 +131,56 @@ func main() {
 	fmt.Println("PASS: Objective-C dylib")
 }
 `
+
+// darwinDylibSwift links testdata/darwin_dylib_swift.swift and checks the
+// Swift registration; the negative control skips it, which a dynamic cast
+// to a protocol detects.
+func (h *harness) darwinDylibSwift(arch, sdk string) {
+	triple := map[string]string{"arm64": "arm64-apple-macos14", "amd64": "x86_64-apple-macos14"}[arch]
+	dylib := filepath.Join(h.dst, "swift.dylib")
+	h.run("dylib-swift-link.log", h.dst, nil, "xcrun", "swiftc", "-emit-library", "-O", "-target", triple, "-module-name", "BaoSwift", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib_swift.swift"))
+	app := filepath.Join(h.dst, "dylib-swift")
+	require(os.Mkdir(app, 0o755))
+	h.run("dylib-swift-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "swift_check", "-o", filepath.Join(app, "native"), dylib)
+	h.module(app, "bao-dylib-swift-check", "")
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(darwinDylibSwiftConsumer), 0o644))
+	exe := filepath.Join(h.dst, "dylib-swift-check")
+	h.consumer("dylib-swift-build.log", app, h.goTool, "build", "-o", exe, ".")
+	out, err := h.command("dylib-swift-run.log", h.root, nil, exe)
+	check(err == nil && strings.Contains(string(out), "PASS: Swift dylib"), "Swift dylib consumer failed: %v\n%s", err, out)
+	negative := filepath.Join(h.dst, "dylib-swift-negative")
+	copyTree(app, negative)
+	path := filepath.Join(negative, "native", "symbols_darwin_"+arch+".go")
+	code := string(read(path))
+	edit := "\tdylibSwiftRegister(base)\n"
+	check(strings.Contains(code, edit), "no Swift registration to disable")
+	require(os.WriteFile(path, []byte(strings.Replace(code, edit, "\t_ = base\n", 1)), 0o644))
+	negativeExe := filepath.Join(h.dst, "dylib-swift-negative")
+	h.consumer("dylib-swift-negative-build.log", negative, h.goTool, "build", "-o", negativeExe, ".")
+	out, err = h.command("dylib-swift-negative-run.log", h.root, nil, negativeExe)
+	check(err != nil && !strings.Contains(string(out), "PASS:"), "Swift registration control did not fail: %s", out)
+	h.results["darwin_dylib_swift"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "protocol dispatch over a struct and a final class, dynamic cast to a protocol, CaseIterable, type name, dictionary, thrown error, enum description; negative control skips registration"}
+}
+
+const darwinDylibSwiftConsumer = `package main
+
+import (
+	"fmt"
+	"os"
+	"unsafe"
+
+	"bao-dylib-swift-check/native"
+	"github.com/ebitengine/purego"
+)
+
+func main() {
+	var out [7]int32
+	purego.SyscallN(native.SymbolAddr0(), uintptr(unsafe.Pointer(&out[0])))
+	got := fmt.Sprint(out)
+	fmt.Println("swift:", got)
+	if got != "[17 3 1 6 2 1 1]" {
+		os.Exit(1)
+	}
+	fmt.Println("PASS: Swift dylib")
+}
+`

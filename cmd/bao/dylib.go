@@ -87,6 +87,17 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 		src.WriteString("\ntype dylibObjCSections struct{}\n\nfunc dylibObjCRegister(uintptr, *dylibObjCSections) {}\n\nfunc dylibObjCLoad(uintptr, *dylibObjCSections) {}\n")
 	}
 	fmt.Fprintf(src, "\nvar dylibObjC = %s\n", objc)
+	swift := "[...][2]dylibRange{}"
+	if w := d.Swift; w != nil {
+		r := func(x translate.DylibRange) string { return fmt.Sprintf("{%#x,%#x}", x.Start, x.End) }
+		// protocols, conformances, type metadata (__swift5_types, __swift5_types2)
+		swift = fmt.Sprintf("[...][2]dylibRange{{%s, {}}, {%s, {}}, {%s, %s}}", r(w.Protocols), r(w.Conformances), r(w.Types), r(w.Types2))
+	}
+	if d.ObjC == nil {
+		src.WriteString("\ntype dylibRange struct{ start, end uint64 }\n")
+	}
+	fmt.Fprintf(src, "\nvar dylibSwift = %s\n", swift)
+	src.WriteString(dylibSwiftSource)
 	fmt.Fprintf(src, `
 // dylibTLSTemplate holds the dylib's TLS initializer after its fixups, since
 // a thread-local variable may be initialized with an address.
@@ -138,8 +149,10 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 		*word(b.slot) = uint64(address)
 	}
 	for _, d := range dylibTLVDescriptors { *word(d), *word(d + 8) = uint64(tlsAddress_thunk()), 0 }
-	// libobjc may write the image's selector and protocol references.
+	// libobjc may write the image's selector and protocol references. Swift
+	// classes are Objective-C classes, so libobjc reads them first.
 	dylibObjCRegister(base, dylibObjC)
+	dylibSwiftRegister(base)
 	for _, s := range dylibDataSegments {
 		if mprotect(base+uintptr(s.start), uintptr(s.end-s.start), s.prot) != 0 { panic("bao: dylib page protection failed") }
 	}
@@ -352,6 +365,29 @@ func dylibObjCLoad(base uintptr, s *dylibObjCSections) {
 		var call func(uintptr, uintptr)
 		purego.RegisterFunc(&call, l[1])
 		call(l[0], load)
+	}
+}
+`
+
+// dylibSwiftSource hands the image's Swift protocol, conformance and type
+// records to libswiftCore.
+const dylibSwiftSource = `
+func dylibSwiftRegister(base uintptr) {
+	empty := true
+	for _, kind := range dylibSwift {
+		for _, r := range kind {
+			empty = empty && r.end == r.start
+		}
+	}
+	if empty { return }
+	lib, err := purego.Dlopen("/usr/lib/swift/libswiftCore.dylib", purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	if err != nil { panic(err) }
+	for i, name := range []string{"swift_registerProtocols", "swift_registerProtocolConformances", "swift_registerTypeMetadataRecords"} {
+		var register func(uintptr, uintptr)
+		purego.RegisterLibFunc(&register, lib, name)
+		for _, r := range dylibSwift[i] {
+			if r.end > r.start { register(base+uintptr(r.start), base+uintptr(r.end)) }
+		}
 	}
 }
 `

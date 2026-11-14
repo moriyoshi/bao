@@ -110,6 +110,7 @@ func syntheticDylibPlan(n int) *translate.TLSProbe {
 		return translate.DylibRange{Start: start, End: start + 8*uint64(n)}
 	}
 	d.ObjC = &translate.DylibObjC{ImageInfo: 0x7000, SelRefs: r(0x8000), Classes: r(0x9000), LoadClasses: r(0xa000), Categories: r(0xb000), LoadCats: r(0xc000), Protocols: r(0xd000), ProtoRefs: r(0xe000)}
+	d.Swift = &translate.DylibSwift{Protocols: r(0xf000), Conformances: r(0x10000), Types: r(0x11000)}
 	p.Dylib = d
 	return p
 }

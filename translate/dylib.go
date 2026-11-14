@@ -39,6 +39,7 @@ type DylibImage struct {
 	EHFrame       DylibRange
 	CompactUnwind DylibRange
 	ObjC          *DylibObjC
+	Swift         *DylibSwift
 	Unwind        *DylibUnwind
 	Image         []byte `json:"-"`
 }
@@ -130,8 +131,9 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 		return nil, "", fmt.Errorf("unsupported dylib CPU %v/%#x (arm64e is unsupported)", f.Cpu, f.SubCpu)
 	}
 	for _, s := range f.Sections {
-		if strings.HasPrefix(s.Name, "__swift5_") {
-			return nil, "", fmt.Errorf("Swift dylibs need runtime registration Bao does not provide yet (%s,%s)", s.Seg, s.Name)
+		switch s.Name {
+		case "__swift5_replace", "__swift5_replac2", "__swift5_acfuncs":
+			return nil, "", fmt.Errorf("Swift %s needs dyld image registration, which a dylib inside the executable lacks", s.Name)
 		}
 	}
 	d := &DylibImage{Arch: arch}
@@ -359,6 +361,21 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 			d.EHFrame = DylibRange{off, off + s.Size}
 		case s.Seg == "__TEXT" && s.Name == "__unwind_info":
 			d.CompactUnwind = DylibRange{off, off + s.Size}
+		case s.Name == "__swift5_protos" || s.Name == "__swift5_proto" || s.Name == "__swift5_types" || s.Name == "__swift5_types2":
+			if d.Swift == nil {
+				d.Swift = &DylibSwift{}
+			}
+			r := DylibRange{off, off + s.Size}
+			switch s.Name {
+			case "__swift5_protos":
+				d.Swift.Protocols = r
+			case "__swift5_proto":
+				d.Swift.Conformances = r
+			case "__swift5_types":
+				d.Swift.Types = r
+			default:
+				d.Swift.Types2 = r
+			}
 		case strings.HasPrefix(s.Name, "__objc_"):
 			if d.ObjC == nil {
 				d.ObjC = &DylibObjC{}
@@ -1038,4 +1055,13 @@ func (o *DylibObjC) section(name string, r DylibRange) error {
 		return fmt.Errorf("Objective-C list %s is not a pointer array", name)
 	}
 	return nil
+}
+
+// DylibSwift locates the Swift records the generated loader registers with
+// libswiftCore's exported registration functions, which exist for images the
+// runtime does not learn about from dyld. Each is an array of 32-bit records.
+// Type descriptors reach their field metadata directly; lookups that scan
+// every image's reflection sections by name do not see this image.
+type DylibSwift struct {
+	Protocols, Conformances, Types, Types2 DylibRange
 }

@@ -5304,3 +5304,27 @@ conformance, a category on NSString, NSClassFromString and Foundation
 formatting. Negative control: without the registration and +load steps the
 consumer crashed (exit 2). Scripts: .work/objc/loop.sh. A CI leg with the
 same control is added to the Darwin suite; arm64 is checked only there.
+
+## 2026-11-14: Swift dylibs
+
+The second half of the user's narrow Objective-C/Swift request. libswiftCore
+exports registration functions for images it does not learn about from dyld:
+`swift_registerProtocols`, `swift_registerProtocolConformances` and
+`swift_registerTypeMetadataRecords`. The parser records `__swift5_protos`,
+`__swift5_proto`, `__swift5_types` and `__swift5_types2`; the loader passes
+them after the Objective-C step, since Swift classes are Objective-C classes
+on Apple platforms and objc_readClassPair reads them. `__swift5_replace`,
+`__swift5_replac2` and `__swift5_acfuncs` have no such entry point and are
+rejected.
+
+Verification on the Intel MacBook Pro (macOS 26.6.2, Swift 6.2.3):
+testdata/darwin_dylib_swift.swift built with `xcrun swiftc -emit-library -O
+-target x86_64-apple-macos14`, translated there, consumer cross-built here
+with Go 1.26.11, run natively: `[17 3 1 6 2 1 1]` (protocol dispatch over a
+struct and a final class, CaseIterable, a dynamic cast from Any to a protocol,
+a type name, a dictionary, a caught Swift error, and an enum's description,
+which reached its field metadata through the type descriptor). Negative
+control: without the registration only the dynamic cast failed
+(`[17 3 0 6 2 1 1]`), isolating the conformance registration. Scripts:
+.work/objc/swift-loop.sh. A CI leg with the same control is added to the
+Darwin suite; arm64 is checked only there.
