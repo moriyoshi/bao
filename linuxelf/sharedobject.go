@@ -100,6 +100,64 @@ func IsSharedObject(b []byte) bool {
 	return f.Type == elf.ET_DYN
 }
 
+// Dynamic relocation kinds of a shared object, per architecture.
+type soKind int
+
+const (
+	soUnknown soKind = iota
+	soNone
+	soRelative   // image base + addend
+	soAbsolute   // symbol + addend: ABS64, GLOB_DAT, JUMP_SLOT
+	soModule     // TLS module ID for __tls_get_addr; Bao's resolver ignores it
+	soTLSOffset  // offset within the module's TLS block
+	soDescriptor // TLS descriptor: resolver, then its argument
+	soStaticTLS  // initial-exec thread-pointer offset
+	soIndirect   // IFUNC
+	soCopy       // copy relocation
+)
+
+// Marker relocations for TLS slots in a shared-object image. The TLS
+// lowering pass replaces them once the template layout is known.
+const (
+	relocImageTLSOffset     = elf.R_AARCH64(0x7fff0001) // 64-bit template offset of the symbol + addend
+	relocImageTLSDescriptor = elf.R_AARCH64(0x7fff0002) // Bao's descriptor thunk, then the template offset
+)
+
+type soArch struct {
+	abs         elf.R_AARCH64 // the image's link-time 64-bit absolute relocation
+	kinds       map[uint32]soKind
+	name        func(uint32) string
+	descriptors bool // Bao's helper provides a TLS descriptor thunk
+	resolver    bool // __tls_get_addr is redirected to Bao's resolver
+}
+
+var soArches = map[elf.Machine]soArch{
+	elf.EM_AARCH64: {elf.R_AARCH64_ABS64, map[uint32]soKind{
+		uint32(elf.R_AARCH64_NONE): soNone, uint32(elf.R_AARCH64_RELATIVE): soRelative, uint32(elf.R_AARCH64_ABS64): soAbsolute,
+		uint32(elf.R_AARCH64_GLOB_DAT): soAbsolute, uint32(elf.R_AARCH64_JUMP_SLOT): soAbsolute, uint32(elf.R_AARCH64_TLS_DTPMOD64): soModule,
+		uint32(elf.R_AARCH64_TLS_DTPREL64): soTLSOffset, uint32(elf.R_AARCH64_TLS_TPREL64): soStaticTLS, uint32(elf.R_AARCH64_TLSDESC): soDescriptor,
+		uint32(elf.R_AARCH64_IRELATIVE): soIndirect, uint32(elf.R_AARCH64_COPY): soCopy,
+	}, func(t uint32) string { return elf.R_AARCH64(t).String() }, true, false},
+	elf.EM_X86_64: {elf.R_AARCH64(elf.R_X86_64_64), map[uint32]soKind{
+		uint32(elf.R_X86_64_NONE): soNone, uint32(elf.R_X86_64_RELATIVE): soRelative, uint32(elf.R_X86_64_64): soAbsolute,
+		uint32(elf.R_X86_64_GLOB_DAT): soAbsolute, uint32(elf.R_X86_64_JMP_SLOT): soAbsolute, uint32(elf.R_X86_64_DTPMOD64): soModule,
+		uint32(elf.R_X86_64_DTPOFF64): soTLSOffset, uint32(elf.R_X86_64_TPOFF64): soStaticTLS, uint32(elf.R_X86_64_TLSDESC): soDescriptor,
+		uint32(elf.R_X86_64_IRELATIVE): soIndirect, uint32(elf.R_X86_64_COPY): soCopy,
+	}, func(t uint32) string { return elf.R_X86_64(t).String() }, true, true},
+	elf.EM_LOONGARCH: {elf.R_AARCH64(elf.R_LARCH_64), map[uint32]soKind{
+		uint32(elf.R_LARCH_NONE): soNone, uint32(elf.R_LARCH_RELATIVE): soRelative, uint32(elf.R_LARCH_64): soAbsolute,
+		uint32(elf.R_LARCH_JUMP_SLOT): soAbsolute, uint32(elf.R_LARCH_TLS_DTPMOD64): soModule, uint32(elf.R_LARCH_TLS_DTPREL64): soTLSOffset,
+		uint32(elf.R_LARCH_TLS_TPREL64): soStaticTLS, uint32(elf.R_LARCH_TLS_DESC64): soDescriptor, uint32(elf.R_LARCH_IRELATIVE): soIndirect,
+		uint32(elf.R_LARCH_COPY): soCopy,
+	}, func(t uint32) string { return elf.R_LARCH(t).String() }, false, true},
+	elf.EM_PPC64: {elf.R_AARCH64(elf.R_PPC64_ADDR64), map[uint32]soKind{
+		uint32(elf.R_PPC64_NONE): soNone, uint32(elf.R_PPC64_RELATIVE): soRelative, uint32(elf.R_PPC64_ADDR64): soAbsolute,
+		uint32(elf.R_PPC64_GLOB_DAT): soAbsolute, uint32(elf.R_PPC64_JMP_SLOT): soAbsolute, uint32(elf.R_PPC64_DTPMOD64): soModule,
+		uint32(elf.R_PPC64_DTPREL64): soTLSOffset, uint32(elf.R_PPC64_TPREL64): soStaticTLS, uint32(elf.R_PPC64_IRELATIVE): soIndirect,
+		uint32(elf.R_PPC64_COPY): soCopy,
+	}, func(t uint32) string { return elf.R_PPC64(t).String() }, false, true},
+}
+
 type delinked struct {
 	m       *image
 	info    *SharedObject
@@ -107,10 +165,11 @@ type delinked struct {
 }
 
 type dynReloc struct {
-	off uint64
-	typ elf.R_AARCH64
-	sym uint32
-	add int64
+	relr bool // packed relative relocation
+	off  uint64
+	typ  elf.R_AARCH64
+	sym  uint32
+	add  int64
 }
 
 func delink(data []byte, ns string) (*delinked, error) {
@@ -122,8 +181,16 @@ func delink(data []byte, ns string) (*delinked, error) {
 	if f.Class != elf.ELFCLASS64 || f.Data != elf.ELFDATA2LSB || f.Type != elf.ET_DYN {
 		return nil, fmt.Errorf("requires a little-endian ELF64 shared object, not %s/%s/%s", f.Class, f.Data, f.Type)
 	}
-	if f.Machine != elf.EM_AARCH64 {
-		return nil, fmt.Errorf("shared-object input supports Linux arm64 only, not %s", f.Machine)
+	arch, ok := soArches[f.Machine]
+	if !ok {
+		return nil, fmt.Errorf("unsupported shared-object machine %s", f.Machine)
+	}
+	flags := binary.LittleEndian.Uint32(data[48:])
+	if f.Machine == elf.EM_PPC64 && flags&3 != 2 {
+		return nil, fmt.Errorf("requires PowerPC64 ELFv2 ABI")
+	}
+	if f.Machine == elf.EM_LOONGARCH && (flags&7 != 3 || flags&0xc0 != 0x40) {
+		return nil, fmt.Errorf("requires LoongArch LP64D object ABI v1")
 	}
 	var loads []*elf.Prog
 	var tls, relro, ehHdr, dynamic *elf.Prog
@@ -298,7 +365,7 @@ func delink(data []byte, ns string) (*delinked, error) {
 				if off+8 < off || off+8 > end {
 					return nil, fmt.Errorf("RELR relocation outside the loaded image")
 				}
-				relocs = append(relocs, dynReloc{off: off, typ: elf.R_AARCH64_RELATIVE, add: int64(binary.LittleEndian.Uint64(img[off:]))})
+				relocs = append(relocs, dynReloc{off: off, relr: true, add: int64(binary.LittleEndian.Uint64(img[off:]))})
 			}
 		}
 	}
@@ -308,7 +375,7 @@ func delink(data []byte, ns string) (*delinked, error) {
 		return nil, err
 	}
 	blob := section{name: ".bao.shared_object", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4096}
-	m := &image{machine: elf.EM_AARCH64, sections: []section{{}, blob}, symbols: []symbol{{}, {info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_SECTION), sect: 1}}}
+	m := &image{machine: f.Machine, flags: flags, sections: []section{{}, blob}, symbols: []symbol{{}, {info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_SECTION), sect: 1}}}
 	const blobSect, blobSym = 1, 1
 	var tlsSect uint16
 	var tlsSym uint32
@@ -346,70 +413,94 @@ func delink(data []byte, ns string) (*delinked, error) {
 	slots := map[uint64]reloc{}
 	var out, template []reloc
 	for _, r := range relocs {
+		kind, name := arch.kinds[uint32(r.typ)], arch.name(uint32(r.typ))
+		if r.relr {
+			kind, name = soRelative, "RELR"
+		}
 		width := uint64(8)
-		if r.typ == elf.R_AARCH64_TLSDESC {
+		if kind == soDescriptor {
 			width = 16
 		}
-		if r.typ == elf.R_AARCH64_NONE {
+		if kind == soNone {
 			continue
 		}
-		info.Relocations[r.typ.String()]++
+		info.Relocations[name]++
 		if r.off%8 != 0 || !segment(r.off, width, elf.PF_W) {
-			return nil, fmt.Errorf("%s at %#x is not an aligned slot in a writable segment; text relocations are unsupported", r.typ, r.off)
+			return nil, fmt.Errorf("%s at %#x is not an aligned slot in a writable segment; text relocations are unsupported", name, r.off)
 		}
 		var sym elf.Symbol
 		if r.sym != 0 {
 			if int(r.sym) > len(syms) {
-				return nil, fmt.Errorf("%s at %#x names an invalid dynamic symbol", r.typ, r.off)
+				return nil, fmt.Errorf("%s at %#x names an invalid dynamic symbol", name, r.off)
 			}
 			sym = syms[r.sym-1]
 		}
-		q := reloc{off: r.off, sym: blobSym, typ: elf.R_AARCH64_ABS64, add: r.add}
-		switch r.typ {
-		case elf.R_AARCH64_RELATIVE:
+		q := reloc{off: r.off, sym: blobSym, typ: arch.abs, add: r.add}
+		switch kind {
+		case soRelative:
 			if r.sym != 0 {
-				return nil, fmt.Errorf("R_AARCH64_RELATIVE at %#x names a symbol", r.off)
+				return nil, fmt.Errorf("%s at %#x names a symbol", name, r.off)
 			}
-		case elf.R_AARCH64_ABS64, elf.R_AARCH64_GLOB_DAT, elf.R_AARCH64_JUMP_SLOT:
+		case soAbsolute:
 			if r.sym == 0 {
-				return nil, fmt.Errorf("%s at %#x has no symbol", r.typ, r.off)
+				return nil, fmt.Errorf("%s at %#x has no symbol", name, r.off)
 			}
 			switch {
 			case sym.Section == elf.SHN_UNDEF:
+				if sym.Name == "__tls_get_addr_opt" {
+					return nil, fmt.Errorf("shared object uses __tls_get_addr_opt; link it with --no-tls-get-addr-optimize")
+				}
 				q.sym = importSym(sym)
 			case elf.ST_TYPE(sym.Info) == elf.STT_TLS:
-				return nil, fmt.Errorf("%s at %#x takes the address of thread-local %s", r.typ, r.off, sym.Name)
+				return nil, fmt.Errorf("%s at %#x takes the address of thread-local %s", name, r.off, sym.Name)
 			case elf.ST_TYPE(sym.Info) == elf.STT_GNU_IFUNC:
-				return nil, fmt.Errorf("%s at %#x refers to indirect function %s, which is unsupported", r.typ, r.off, sym.Name)
+				return nil, fmt.Errorf("%s at %#x refers to indirect function %s, which is unsupported", name, r.off, sym.Name)
 			case sym.Section == elf.SHN_ABS:
 				binary.LittleEndian.PutUint64(img[r.off:], sym.Value+uint64(r.add))
 				continue
 			case sym.Section >= elf.SHN_LORESERVE:
-				return nil, fmt.Errorf("%s at %#x refers to unsupported symbol %s", r.typ, r.off, sym.Name)
+				return nil, fmt.Errorf("%s at %#x refers to unsupported symbol %s", name, r.off, sym.Name)
 			default:
 				q.add += int64(sym.Value)
 			}
-		case elf.R_AARCH64_TLSDESC:
+		case soModule, soTLSOffset, soDescriptor:
+			if kind == soDescriptor && !arch.descriptors || kind != soDescriptor && !arch.resolver {
+				return nil, fmt.Errorf("shared object uses %s, which Bao's %s TLS runtime does not provide", name, f.Machine)
+			}
 			offset := r.add
 			if r.sym != 0 {
 				if sym.Section == elf.SHN_UNDEF {
 					return nil, fmt.Errorf("thread-local %s is imported from another shared object, which is unsupported", sym.Name)
 				}
 				if elf.ST_TYPE(sym.Info) != elf.STT_TLS {
-					return nil, fmt.Errorf("TLS descriptor at %#x names non-TLS symbol %s", r.off, sym.Name)
+					return nil, fmt.Errorf("%s at %#x names non-TLS symbol %s", name, r.off, sym.Name)
 				}
 				offset += int64(sym.Value)
 			}
-			if tls == nil || offset < 0 || uint64(offset) >= max(tls.Memsz, 1) {
-				return nil, fmt.Errorf("TLS descriptor at %#x is outside the TLS segment", r.off)
+			if kind == soModule {
+				// Bao's resolver reads only the offset word.
+				clear(img[r.off : r.off+8])
+				if _, dup := slots[r.off]; dup {
+					return nil, fmt.Errorf("overlapping dynamic relocations at %#x", r.off)
+				}
+				slots[r.off] = reloc{}
+				continue
 			}
-			q = reloc{off: r.off, sym: tlsSym, typ: elf.R_AARCH64_TLSDESC, add: offset}
-		case elf.R_AARCH64_TLS_DTPMOD64, elf.R_AARCH64_TLS_DTPREL64, elf.R_AARCH64_TLS_TPREL64:
-			return nil, fmt.Errorf("shared object uses %s; only TLS descriptors (the AArch64 default for -fPIC) are supported", r.typ)
-		case elf.R_AARCH64_IRELATIVE:
-			return nil, fmt.Errorf("shared object uses indirect functions (R_AARCH64_IRELATIVE), which are unsupported")
+			if tls == nil || offset < 0 || uint64(offset) >= max(tls.Memsz, 1) {
+				return nil, fmt.Errorf("%s at %#x is outside the TLS segment", name, r.off)
+			}
+			q = reloc{off: r.off, sym: tlsSym, typ: relocImageTLSOffset, add: offset}
+			if kind == soDescriptor {
+				q.typ = relocImageTLSDescriptor
+			}
+		case soStaticTLS:
+			return nil, fmt.Errorf("shared object uses initial-exec TLS (%s), which needs a fixed thread-pointer offset; build it with the default global-dynamic model", name)
+		case soIndirect:
+			return nil, fmt.Errorf("shared object uses indirect functions (%s), which are unsupported", name)
+		case soCopy:
+			return nil, fmt.Errorf("shared object uses copy relocations (%s), which are unsupported", name)
 		default:
-			return nil, fmt.Errorf("unsupported dynamic relocation %s at %#x", r.typ, r.off)
+			return nil, fmt.Errorf("unsupported dynamic relocation %s at %#x", name, r.off)
 		}
 		for w := uint64(0); w < width; w += 8 {
 			if _, dup := slots[r.off+w]; dup {
@@ -420,7 +511,7 @@ func delink(data []byte, ns string) (*delinked, error) {
 		clear(img[r.off : r.off+width])
 		out = append(out, q)
 		// TLS initializers are relocated in the per-thread template as well.
-		if tls != nil && q.typ == elf.R_AARCH64_ABS64 && r.off >= tls.Vaddr && r.off < tls.Vaddr+tls.Filesz {
+		if tls != nil && q.typ == arch.abs && r.off >= tls.Vaddr && r.off < tls.Vaddr+tls.Filesz {
 			if r.off+8 > tls.Vaddr+tls.Filesz {
 				return nil, fmt.Errorf("relocation at %#x crosses the end of the TLS initializer", r.off)
 			}
@@ -458,7 +549,7 @@ func delink(data []byte, ns string) (*delinked, error) {
 		var targets []uint64
 		for off := addr; off < addr+size; off += 8 {
 			r, ok := slots[off]
-			if !ok || r.sym != blobSym || r.typ != elf.R_AARCH64_ABS64 {
+			if !ok || r.sym != blobSym || r.typ != arch.abs {
 				return nil, fmt.Errorf("%s entry at %#x is not a relocated pointer into the image", addrTag, off)
 			}
 			if err := code(addrTag.String(), uint64(r.add)); err != nil {
@@ -504,7 +595,7 @@ func delink(data []byte, ns string) (*delinked, error) {
 		}
 		s := section{name: t.name, typ: t.typ, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8, size: uint64(len(t.targets) * 8), data: make([]byte, len(t.targets)*8)}
 		for i, target := range t.targets {
-			s.relocs = append(s.relocs, reloc{off: uint64(i * 8), sym: blobSym, typ: elf.R_AARCH64_ABS64, add: int64(target)})
+			s.relocs = append(s.relocs, reloc{off: uint64(i * 8), sym: blobSym, typ: arch.abs, add: int64(target)})
 		}
 		m.addSection(s)
 	}
@@ -659,12 +750,48 @@ func delink(data []byte, ns string) (*delinked, error) {
 	sort.Slice(info.Versions, func(i, j int) bool { return info.Versions[i].Name < info.Versions[j].Name })
 	info.ImageSize = end + sharedObjectPad
 	info.CheckOffset = (end + 7) &^ 7
-	out = append(out, reloc{off: info.CheckOffset, sym: blobSym, typ: elf.R_AARCH64_ABS64})
+	out = append(out, reloc{off: info.CheckOffset, sym: blobSym, typ: arch.abs})
 	b := &m.sections[blobSect]
 	b.data = append(img, make([]byte, sharedObjectPad)...)
 	b.size = uint64(len(b.data))
 	b.relocs = out
 	return d, nil
+}
+
+// lowerImageTLS fills a shared-object image's TLS slots once the template
+// layout is known: offset words for Bao's __tls_get_addr resolver, and
+// descriptors whose first word calls Bao's thunk. It counts both.
+func lowerImageTLS(m *image, offsets map[uint16]uint64, size uint64, thunk func() uint32) (int, error) {
+	descriptors := 0
+	for si := range m.sections {
+		s := &m.sections[si]
+		if s.writable == nil {
+			continue
+		}
+		out := s.relocs[:0]
+		for _, r := range s.relocs {
+			if r.typ != relocImageTLSOffset && r.typ != relocImageTLSDescriptor {
+				out = append(out, r)
+				continue
+			}
+			sym := m.symbols[r.sym]
+			base, ok := offsets[sym.sect]
+			word := r.off
+			if r.typ == relocImageTLSDescriptor {
+				word += 8
+			}
+			if !ok || r.add < 0 || base+sym.value+uint64(r.add) >= size || word+8 > uint64(len(s.data)) {
+				return 0, fmt.Errorf("shared-object TLS slot at %#x is outside the TLS template", r.off)
+			}
+			binary.LittleEndian.PutUint64(s.data[word:], base+sym.value+uint64(r.add))
+			if r.typ == relocImageTLSDescriptor {
+				out = append(out, reloc{off: r.off, sym: thunk(), typ: soArches[m.effectiveMachine()].abs})
+			}
+			descriptors++
+		}
+		s.relocs = out
+	}
+	return descriptors, nil
 }
 
 // merge appends a relocatable image's sections and symbols to m.
@@ -706,6 +833,35 @@ func (m *image) merge(o *image) error {
 			s.sect += sections
 		}
 		m.symbols = append(m.symbols, s)
+	}
+	return nil
+}
+
+// checkImageCalls rejects direct PowerPC64 calls from relocatable code into
+// a shared-object image. The image's functions derive their own TOC from r12
+// at the global entry point, which a direct branch does not set; Go's linker
+// has no cross-TOC call stubs. Calls through function pointers work.
+func checkImageCalls(m *image) error {
+	if m.effectiveMachine() != elf.EM_PPC64 {
+		return nil
+	}
+	inImage := map[string]bool{}
+	for _, q := range m.symbols {
+		if q.sect != 0 && q.sect < uint16(elf.SHN_LORESERVE) && m.sections[q.sect].writable != nil && elf.ST_BIND(q.info) != elf.STB_LOCAL {
+			inImage[q.name] = true
+		}
+	}
+	for _, s := range m.sections {
+		if s.writable != nil {
+			continue
+		}
+		for _, r := range s.relocs {
+			t := elf.R_PPC64(r.typ)
+			target := m.symbols[r.sym]
+			if (t == elf.R_PPC64_REL24 || t == elf.R_PPC64_REL24_NOTOC || t == elf.R_PPC64_REL14) && (target.sect != 0 && target.sect < uint16(elf.SHN_LORESERVE) && m.sections[target.sect].writable != nil || target.sect == 0 && inImage[target.name]) {
+				return fmt.Errorf("on ppc64le, %s calls shared-object function %s directly; call it through a function pointer", s.name, m.symbols[r.sym].name)
+			}
+		}
 	}
 	return nil
 }

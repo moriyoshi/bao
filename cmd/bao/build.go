@@ -56,7 +56,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.UintVar(&o.windowsMaxDataAlignment, "windows-max-data-alignment", 0, "link read-only data requesting more alignment at this value; only 32 is supported, and capped sections are recorded in the manifest")
 	fs.Var(&o.linuxSystemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
 	fs.UintVar(&o.linuxMaxTextAlignment, "linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported, and capped sections are recorded in the manifest")
-	fs.StringVar(&o.linuxSharedObject, "linux-shared-object", "", "linked PIC shared object (linux/arm64) to translate with the input, which may reference its exports; a shared object can also be the input itself")
+	fs.StringVar(&o.linuxSharedObject, "linux-shared-object", "", "linked PIC shared object to translate with the input, which may reference its exports; a shared object can also be the input itself")
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
 	fs.StringVar(&o.windowsCRT, "windows-crt", "ucrt", "Windows system C runtime: ucrt or msvcrt; match the producer toolchain")
 	o.diagnostics.register(fs)

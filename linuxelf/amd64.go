@@ -209,13 +209,9 @@ func (p *Plan) bindAMD64(images []*image, index map[string]string) error {
 				}
 				if b, ok := imports[sym.name]; ok {
 					if t == elf.R_X86_64_64 {
-						if s.flags&elf.SHF_WRITE == 0 {
-							return fmt.Errorf("dynamic absolute pointer must be writable native data")
+						if err := p.importFixup(m, si, r, b); err != nil {
+							return err
 						}
-						name := fmt.Sprintf("%sfixup_%d", p.Namespace, len(p.Fixups))
-						m.addSymbol(name, uint16(si), r.off, 8)
-						p.Fixups = append(p.Fixups, Fixup{Location: name, Import: b.Local, Addend: r.add})
-						binary.LittleEndian.PutUint64(s.data[r.off:], 0)
 						continue
 					}
 					if t == elf.R_X86_64_PC32 || t == elf.R_X86_64_PC64 {

@@ -13,7 +13,8 @@ import (
 // writable segment at rw holding .dynamic, .init_array, GOT slots, data and
 // the TLS initializer.
 type soFixture struct {
-	codeEnd  uint64 // end of the executable segment's memory
+	machine  elf.Machine // AArch64 when zero
+	codeEnd  uint64      // end of the executable segment's memory
 	rw       uint64
 	pie      bool
 	textrel  bool
@@ -39,7 +40,22 @@ const (
 	soFileSize = soTData + 8 + 16 // a little trailing data
 )
 
+// soType returns the lowest dynamic relocation type of a kind on a machine.
+func soType(machine elf.Machine, kind soKind) elf.R_AARCH64 {
+	best := uint32(1 << 31)
+	for t, k := range soArches[machine].kinds {
+		if k == kind && t < best {
+			best = t
+		}
+	}
+	return elf.R_AARCH64(best)
+}
+
 func (o soFixture) build() []byte {
+	if o.machine == 0 {
+		o.machine = elf.EM_AARCH64
+	}
+	typ := func(k soKind) elf.R_AARCH64 { return soType(o.machine, k) }
 	if o.codeEnd == 0 {
 		o.codeEnd = 0x1000
 	}
@@ -74,14 +90,19 @@ func (o soFixture) build() []byte {
 	delta := int32(soEHFrame - (soEHHdr + 4))
 	le.PutUint32(rx[soEHHdr+4:], uint32(delta)) // eh_frame_ptr
 	relocs := []dynReloc{
-		{off: o.rw + soInitOff, typ: elf.R_AARCH64_RELATIVE, add: soText},
-		{off: o.rw + soGOT, typ: elf.R_AARCH64_GLOB_DAT, sym: 1},
-		{off: o.rw + soDesc, typ: elf.R_AARCH64_TLSDESC, sym: 4},
-		{off: o.rw + soPtr, typ: elf.R_AARCH64_RELATIVE, add: int64(o.rw + soObj)},
-		{off: o.rw + soTData, typ: elf.R_AARCH64_RELATIVE, add: soText + 4},
+		{off: o.rw + soInitOff, typ: typ(soRelative), add: soText},
+		{off: o.rw + soGOT, typ: typ(soAbsolute), sym: 1},
+		{off: o.rw + soPtr, typ: typ(soRelative), add: int64(o.rw + soObj)},
+		{off: o.rw + soTData, typ: typ(soRelative), add: soText + 4},
+	}
+	// A descriptor where Bao has a thunk, else a __tls_get_addr pair.
+	if soArches[o.machine].descriptors {
+		relocs = append(relocs, dynReloc{off: o.rw + soDesc, typ: typ(soDescriptor), sym: 4})
+	} else {
+		relocs = append(relocs, dynReloc{off: o.rw + soDesc, typ: typ(soModule), sym: 4}, dynReloc{off: o.rw + soDesc + 8, typ: typ(soTLSOffset), sym: 4})
 	}
 	if o.textrel {
-		relocs = append(relocs, dynReloc{off: soText, typ: elf.R_AARCH64_RELATIVE})
+		relocs = append(relocs, dynReloc{off: soText, typ: typ(soRelative)})
 	}
 	relocs = append(relocs, o.extra...)
 	for i, r := range relocs {
@@ -161,7 +182,8 @@ func (o soFixture) build() []byte {
 
 	copy(out, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
 	le.PutUint16(out[16:], uint16(elf.ET_DYN))
-	le.PutUint16(out[18:], uint16(elf.EM_AARCH64))
+	le.PutUint16(out[18:], uint16(o.machine))
+	le.PutUint32(out[48:], map[elf.Machine]uint32{elf.EM_PPC64: 2, elf.EM_LOONGARCH: 0x43}[o.machine])
 	le.PutUint32(out[20:], 1)
 	le.PutUint64(out[32:], 64) // phoff
 	le.PutUint64(out[40:], shoff)
@@ -194,7 +216,13 @@ func (o soFixture) build() []byte {
 }
 
 func TestDelinkSharedObject(t *testing.T) {
-	in := soFixture{}.build()
+	for _, machine := range []elf.Machine{elf.EM_AARCH64, elf.EM_X86_64, elf.EM_LOONGARCH, elf.EM_PPC64} {
+		t.Run(machine.String(), func(t *testing.T) { testDelink(t, machine) })
+	}
+}
+
+func testDelink(t *testing.T, machine elf.Machine) {
+	in := soFixture{machine: machine}.build()
 	if !IsSharedObject(in) {
 		t.Fatal("fixture is not ET_DYN")
 	}
@@ -203,24 +231,29 @@ func TestDelinkSharedObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	m, info := d.m, d.info
+	abs := soArches[machine].abs
 	blob := m.sections[1]
-	if blob.flags != elf.SHF_ALLOC|elf.SHF_EXECINSTR || blob.align != 4096 || uint64(len(blob.data)) != 0x20200+sharedObjectPad || info.ImageSize != uint64(len(blob.data)) {
+	if m.machine != machine || blob.flags != elf.SHF_ALLOC|elf.SHF_EXECINSTR || blob.align != 4096 || uint64(len(blob.data)) != 0x20200+sharedObjectPad || info.ImageSize != uint64(len(blob.data)) {
 		t.Fatalf("image section %+v", blob.flags)
 	}
 	if binary.LittleEndian.Uint32(blob.data[soText:]) != 0xd65f03c0 {
 		t.Fatal("code not carried at its image offset")
 	}
 	want := map[uint64]reloc{
-		0x20000 + soInitOff: {typ: elf.R_AARCH64_ABS64, sym: 1, add: soText},
-		0x20000 + soPtr:     {typ: elf.R_AARCH64_ABS64, sym: 1, add: 0x20000 + soObj},
-		0x20000 + soTData:   {typ: elf.R_AARCH64_ABS64, sym: 1, add: soText + 4},
-		0x20000 + soDesc:    {typ: elf.R_AARCH64_TLSDESC, add: 8},
-		0x20200:             {typ: elf.R_AARCH64_ABS64, sym: 1}, // PIE check
+		0x20000 + soInitOff: {typ: abs, sym: 1, add: soText},
+		0x20000 + soPtr:     {typ: abs, sym: 1, add: 0x20000 + soObj},
+		0x20000 + soTData:   {typ: abs, sym: 1, add: soText + 4},
+		0x20200:             {typ: abs, sym: 1}, // PIE check
+	}
+	if soArches[machine].descriptors {
+		want[0x20000+soDesc] = reloc{typ: relocImageTLSDescriptor, add: 8}
+	} else {
+		want[0x20000+soDesc+8] = reloc{typ: relocImageTLSOffset, add: 8}
 	}
 	for _, r := range blob.relocs {
 		if r.off == 0x20000+soGOT {
-			if s := m.symbols[r.sym]; s.name != "puts" || s.sect != 0 || r.typ != elf.R_AARCH64_ABS64 {
-				t.Fatalf("GLOB_DAT import became %+v against %+v", r, s)
+			if s := m.symbols[r.sym]; s.name != "puts" || s.sect != 0 || r.typ != abs {
+				t.Fatalf("GOT import became %+v against %+v", r, s)
 			}
 			continue
 		}
@@ -228,8 +261,8 @@ func TestDelinkSharedObject(t *testing.T) {
 		if !ok || r.typ != w.typ || r.add != w.add || (w.sym != 0 && r.sym != w.sym) {
 			t.Fatalf("unexpected image relocation %+v", r)
 		}
-		if r.typ == elf.R_AARCH64_TLSDESC && (m.symbols[r.sym].sect == 0 || m.sections[m.symbols[r.sym].sect].flags&elf.SHF_TLS == 0) {
-			t.Fatal("TLS descriptor does not name the TLS template")
+		if (r.typ == relocImageTLSDescriptor || r.typ == relocImageTLSOffset) && (m.symbols[r.sym].sect == 0 || m.sections[m.symbols[r.sym].sect].flags&elf.SHF_TLS == 0) {
+			t.Fatal("TLS slot does not name the TLS template")
 		}
 		delete(want, r.off)
 	}
@@ -282,9 +315,13 @@ func TestDelinkRejects(t *testing.T) {
 	}{
 		"text relocation": {soFixture{textrel: true}, "text relocations are unsupported"},
 		"ifunc":           {soFixture{extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64_IRELATIVE}}}, "indirect functions"},
-		"initial-exec":    {soFixture{extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64_TLS_TPREL64, sym: 4}}}, "only TLS descriptors"},
+		"initial-exec":    {soFixture{extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64_TLS_TPREL64, sym: 4}}}, "initial-exec TLS"},
 		"overlap":         {soFixture{extra: []dynReloc{{off: 0x20000 + soPtr, typ: elf.R_AARCH64_RELATIVE}}}, "overlapping"},
 		"tls address":     {soFixture{extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64_ABS64, sym: 4}}}, "thread-local"},
+		"copy":            {soFixture{extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64_COPY, sym: 3}}}, "copy relocations"},
+		"arm64 resolver":  {soFixture{extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64_TLS_DTPMOD64, sym: 4}}}, "TLS runtime does not provide"},
+		"loong64 desc":    {soFixture{machine: elf.EM_LOONGARCH, extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64(elf.R_LARCH_TLS_DESC64), sym: 4}}}, "TLS runtime does not provide"},
+		"amd64 ifunc":     {soFixture{machine: elf.EM_X86_64, extra: []dynReloc{{off: 0x20000 + soObj + 8, typ: elf.R_AARCH64(elf.R_X86_64_IRELATIVE)}}}, "indirect functions"},
 		"pie":             {soFixture{pie: true}, "position-independent executable"},
 		"no headers":      {soFixture{noShdrs: true}, "section headers"},
 	} {
@@ -363,5 +400,25 @@ func TestIsSharedObjectRejectsRelocatable(t *testing.T) {
 	b, err := m.encode()
 	if err != nil || IsSharedObject(b) || IsSharedObject(bytes.Repeat([]byte{0}, 64)) {
 		t.Fatal("relocatable or garbage input reported as a shared object")
+	}
+}
+
+func TestPPC64DirectCallsIntoImageRejected(t *testing.T) {
+	d, err := delink(soFixture{machine: elf.EM_PPC64}.build(), "t_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(typ elf.R_PPC64) *image {
+		return &image{machine: elf.EM_PPC64, sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 8, data: make([]byte, 8), relocs: []reloc{{off: 0, sym: 1, typ: elf.R_AARCH64(typ)}}}},
+			symbols: []symbol{{}, {name: "fn", info: byte(elf.STB_GLOBAL) << 4}}}
+	}
+	if err := d.m.merge(call(elf.R_PPC64_ADDR64)); err != nil || checkImageCalls(d.m) != nil {
+		t.Fatalf("function pointer to the image rejected: %v", err)
+	}
+	if err := d.m.merge(call(elf.R_PPC64_REL24)); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkImageCalls(d.m); err == nil || !strings.Contains(err.Error(), "function pointer") {
+		t.Fatalf("direct call into the image accepted: %v", err)
 	}
 }

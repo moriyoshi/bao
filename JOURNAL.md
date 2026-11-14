@@ -4953,3 +4953,58 @@ CGO_ENABLED=0. Scratch inputs are in .work/so-e2e.
   suite, other architectures, the Linux cpp/cross suites and Bazel. Loading the
   library's own extension modules with `dlopen` is unsupported: the executable
   does not export the library's symbols dynamically.
+
+## 2026-11-14: Linux shared objects on amd64, loong64 and ppc64le
+
+Problem: the user asked for shared-object input on every supported target,
+following the linux/arm64 entry above. This entry covers the other Linux
+targets; Darwin and Windows are not done.
+
+Change:
+- `delink` takes a per-machine table of dynamic relocation kinds (relative,
+  absolute, TLS module, TLS offset, TLS descriptor, static TLS, IFUNC, copy)
+  and emits each machine's own 64-bit absolute relocation for the image
+  (`R_X86_64_64`, `R_LARCH_64`, `R_PPC64_ADDR64`). PPC64 must be ELFv2 and
+  LoongArch LP64D object ABI v1, as for relocatable input.
+- TLS slots become marker relocations that `lowerImageTLS` resolves from both
+  TLS passes once the template layout is known. A `__tls_get_addr` pair's
+  module word is zeroed (Bao's resolver reads only the offset) and its offset
+  word gets the template offset; the image's `__tls_get_addr` import is
+  already redirected to Bao's resolver on these targets. Descriptors are
+  supported where the helper has a thunk (arm64, amd64). loong64 TLS
+  descriptors, `__tls_get_addr_opt` on ppc64le, and initial-exec TLS are
+  rejected with specific errors. Both kinds of slot now count as TLS
+  descriptors in the plan.
+- The three `bind` paths share `importFixup`, which addresses image slots
+  from the base symbol.
+- On ppc64le, a direct call (`R_PPC64_REL24`/`REL24_NOTOC`/`REL14`) from
+  relocatable input into the image is rejected: the image's functions derive
+  their TOC from r12 at the global entry point, which a direct branch does not
+  set, and Go's linker has no cross-TOC stubs. Calls through function pointers
+  work.
+- `toolchain.Detect` maps shared objects for all four Linux machines.
+
+Verification (`.work/so-cross/run.sh .work/so-cross/bao .work/so-cross/out`):
+the arm64 entry's fixture (lib.c, cxx.cc, glue, control) cross-built in
+bao-cpp-cross:20261108 with Debian GCC 14.2.0 (`-O2 -fPIC -pthread`,
+`-Wl,-z,relro,-z,now`), translated by a linux/arm64 Bao built with Go 1.26.11
+against the container's `/usr/<triple>` sysroots, consumers cross-built with
+Go 1.26.11 and CGO_ENABLED=0, all run with QEMU user mode in the container on
+the arm64 host. This is emulated execution, not native.
+- amd64 default (2 DTPMOD64, 2 DTPOFF64), amd64 `-mtls-dialect=gnu2` (2
+  TLSDESC), loong64 (2 TLS_DTPMOD64, 2 TLS_DTPREL64) and ppc64le with
+  `-Wl,--no-tls-get-addr-optimize` (2 DTPMOD64, 2 DTPREL64) each printed the
+  native control's `ops=35 format=hello/7/5 env=1 threads=85 throw=24 glue=22
+  ctor=42`, then `fini=99`, on three runs each at GOMAXPROCS 1 and 4. ppc64le
+  glue called the image through a function pointer. Page limits: 8 KiB for
+  the amd64 objects (GNU ld 4 KiB default) and 64 KiB for loong64 and ppc64le.
+- Negative controls: ppc64le glue with a direct call is rejected, and with the
+  check disabled the same consumer faulted with a garbage PC on all three
+  runs. A ppc64le library linked with the default `__tls_get_addr_opt` and a
+  loong64 library built with `-mtls-dialect=desc` are rejected.
+- arm64 regressions after the refactor: `.work/so-e2e/run.sh` passed again
+  (fixture and four libpython runs). `go test ./...` and `go vet ./...` pass;
+  the synthetic shared-object tests now run for all four machines.
+- Not run: native (non-emulated) amd64, loong64 or ppc64le execution, real
+  libraries other than the fixture on those targets, and kernels with pages
+  larger than the host's.

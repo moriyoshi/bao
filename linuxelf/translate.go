@@ -373,6 +373,9 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 		if err := main.merge(glue); err != nil {
 			return nil, err
 		}
+		if err := checkImageCalls(main); err != nil {
+			return nil, err
+		}
 	default:
 		if main, err = parse(input); err != nil {
 			return nil, err
@@ -711,7 +714,10 @@ func (p *Plan) lowerTLS(m *image) error {
 		add int64
 	}
 	descriptors := map[target]uint32{}
-	slots := 0
+	slots, err := lowerImageTLS(m, offsets, uint64(len(template)), func() uint32 { return thunk })
+	if err != nil {
+		return err
+	}
 	for si := range m.sections {
 		if m.sections[si].flags&elf.SHF_ALLOC == 0 {
 			continue
@@ -720,19 +726,6 @@ func (p *Plan) lowerTLS(m *image) error {
 		var out []reloc
 		for ri := 0; ri < len(s.relocs); ri++ {
 			r := s.relocs[ri]
-			if r.typ == elf.R_AARCH64_TLSDESC {
-				// A linked shared object's descriptor slot already sits in
-				// the GOT its code loads: make it a Bao descriptor in place.
-				sym := m.symbols[r.sym]
-				base, ok := offsets[sym.sect]
-				if !ok || s.writable == nil || elf.ST_TYPE(sym.info) != elf.STT_TLS || r.add < 0 || base+sym.value+uint64(r.add) >= uint64(len(template)) || r.off+16 > uint64(len(s.data)) {
-					return fmt.Errorf("unsupported shared-object TLS descriptor at %#x", r.off)
-				}
-				binary.LittleEndian.PutUint64(s.data[r.off+8:], base+sym.value+uint64(r.add))
-				out = append(out, reloc{off: r.off, sym: thunk, typ: elf.R_AARCH64_ABS64})
-				slots++
-				continue
-			}
 			if r.typ == elf.R_AARCH64_TLSDESC_ADR_PAGE21 {
 				if ri+3 >= len(s.relocs) {
 					return fmt.Errorf("incomplete TLSDESC sequence")
@@ -1013,20 +1006,9 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 					}
 				}
 				if b, ok := bindings[sym.name]; ok && r.typ == elf.R_AARCH64_ABS64 {
-					if s.flags&elf.SHF_WRITE == 0 && !inRanges(s.writable, r.off, 8) || r.off+8 > uint64(len(s.data)) {
-						return fmt.Errorf("dynamic absolute pointer must be writable native data")
+					if err := p.importFixup(m, si, r, b); err != nil {
+						return err
 					}
-					if s.writable != nil {
-						// A symbol per GOT slot would overflow Go's function
-						// table, since the image is text to Go's linker.
-						p.Fixups = append(p.Fixups, Fixup{Location: p.SharedObject.BaseSymbol, Offset: r.off, Import: b.Local, Addend: r.add})
-						binary.LittleEndian.PutUint64(s.data[r.off:], 0)
-						continue
-					}
-					name := fmt.Sprintf("%sfixup_%d", p.Namespace, len(p.Fixups))
-					m.addSymbol(name, uint16(si), r.off, 8)
-					p.Fixups = append(p.Fixups, Fixup{Location: name, Import: b.Local, Addend: r.add})
-					binary.LittleEndian.PutUint64(s.data[r.off:], 0)
 					continue
 				}
 				if (r.typ == elf.R_AARCH64_ADR_GOT_PAGE || r.typ == elf.R_AARCH64_LD64_GOT_LO12_NC) && sym.sect != 0 {
@@ -1062,6 +1044,25 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 			}
 		}
 	}
+	return nil
+}
+
+// importFixup records an init-time pointer to an import at r.off. In a
+// shared-object image the slot is addressed from the image base: one symbol
+// per GOT slot would overflow Go's function table, since the image is text.
+func (p *Plan) importFixup(m *image, si int, r reloc, b Import) error {
+	s := &m.sections[si]
+	if s.flags&elf.SHF_WRITE == 0 && !inRanges(s.writable, r.off, 8) || r.off+8 > uint64(len(s.data)) {
+		return fmt.Errorf("dynamic absolute pointer must be writable native data")
+	}
+	if s.writable != nil {
+		p.Fixups = append(p.Fixups, Fixup{Location: p.SharedObject.BaseSymbol, Offset: r.off, Import: b.Local, Addend: r.add})
+	} else {
+		name := fmt.Sprintf("%sfixup_%d", p.Namespace, len(p.Fixups))
+		m.addSymbol(name, uint16(si), r.off, 8)
+		p.Fixups = append(p.Fixups, Fixup{Location: name, Import: b.Local, Addend: r.add})
+	}
+	binary.LittleEndian.PutUint64(s.data[r.off:], 0)
 	return nil
 }
 

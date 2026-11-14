@@ -77,6 +77,15 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 	}
 	descriptors := map[key]uint32{}
 	thunk := uint32(0)
+	slots, err := lowerImageTLS(m, offsets, uint64(len(template)), func() uint32 {
+		if thunk == 0 {
+			thunk = m.addSymbol(p.Runtime("tls_thunk"), 0, 0, 0)
+		}
+		return thunk
+	})
+	if err != nil {
+		return err
+	}
 	// GNU2 descriptors begin with the thunk that the compiler calls through;
 	// resolver-call descriptors leave that module word unused.
 	index := func(r reloc, ld, gnu2 bool) (uint32, error) {
@@ -290,7 +299,7 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 			m.symbols[i] = symbol{name: "$d.bao.ignored", info: byte(elf.STB_LOCAL)<<4 | byte(elf.STT_NOTYPE)}
 		}
 	}
-	p.TLSDescriptors = len(descriptors)
+	p.TLSDescriptors = len(descriptors) + slots
 	return nil
 }
 
@@ -609,13 +618,9 @@ func (p *Plan) bindCross(images []*image, index map[string]string) error {
 					return fmt.Errorf("unsupported reference to missing weak %s (reloc %d)", sym.name, r.typ)
 				}
 				if b, ok := bindings[sym.name]; ok && absolute {
-					if s.flags&elf.SHF_WRITE == 0 || r.off+8 > uint64(len(s.data)) {
-						return fmt.Errorf("dynamic absolute pointer must be writable native data")
+					if err := p.importFixup(m, si, r, b); err != nil {
+						return err
 					}
-					name := fmt.Sprintf("%sfixup_%d", p.Namespace, len(p.Fixups))
-					m.addSymbol(name, uint16(si), r.off, 8)
-					p.Fixups = append(p.Fixups, Fixup{Location: name, Import: b.Local, Addend: r.add})
-					binary.LittleEndian.PutUint64(s.data[r.off:], 0)
 					continue
 				}
 				if m.effectiveMachine() == elf.EM_LOONGARCH && sym.sect != 0 && (elf.R_LARCH(r.typ) == elf.R_LARCH_GOT_PC_HI20 || elf.R_LARCH(r.typ) == elf.R_LARCH_GOT_PC_LO12) {

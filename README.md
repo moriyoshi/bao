@@ -920,10 +920,11 @@ glibc sysroot, `sh ci/cgo-linux.sh` exercises fresh typed bindings with and
 without cgo, including a separate cgo package and native TLS cleanup. Results
 and generated inputs are left under `.work/`.
 
-#### Linux shared objects
+### Linux shared objects
 
-On linux/arm64, a linked PIC shared object, such as a distribution's
-`libpython3.13.so.1.0`, can be the input instead of an archive:
+On every Linux target (arm64, amd64, loong64 and ppc64le), a linked PIC shared
+object, such as a distribution's `libpython3.13.so.1.0`, can be the input
+instead of an archive:
 
 ```sh
 bao build -target linux/arm64 -sysroot / -o ./py libpython3.13.so.1.0
@@ -969,12 +970,26 @@ place.
   counts, versioned imports and exports.
 
 The largest supported page size is the smallest distance between a writable
-segment and executable code, at most 64 KiB, so that no page is both. Libraries
-linked with GNU ld's default 64 KiB AArch64 maximum page size allow every
-Linux page size; the generated package panics on a kernel with larger pages.
-Only TLS descriptors (the AArch64 `-fPIC` default) are supported for TLS;
-initial-exec TLS, `R_AARCH64_TLS_DTPMOD64`, text relocations, IFUNCs and copy
-relocations are rejected, as are PIEs and files without section headers. The
+segment and executable code, at most 64 KiB, so that no page is both. GNU ld's
+default maximum page size is 64 KiB on AArch64, LoongArch and PowerPC64, which
+allows every page size those kernels use, and 4 KiB on x86-64, where the
+fixture allowed 8 KiB pages. The generated package panics on a kernel with
+larger pages.
+
+Thread-local storage uses Bao's per-thread template:
+
+| Target | TLS in the shared object |
+| --- | --- |
+| arm64 | TLS descriptors, the `-fPIC` default |
+| amd64 | `__tls_get_addr` (the default) or GNU2 descriptors (`-mtls-dialect=gnu2`) |
+| loong64 | `__tls_get_addr`, the default; `-mtls-dialect=desc` is rejected |
+| ppc64le | `__tls_get_addr`; link with `-Wl,--no-tls-get-addr-optimize`, since `__tls_get_addr_opt` is rejected |
+
+Initial-exec TLS, text relocations, IFUNCs and copy relocations are rejected,
+as are PIEs and files without section headers. On ppc64le the image's
+functions set up their own TOC from `r12` at their global entry point, so
+relocatable input must call them through function pointers; a direct call is
+rejected, because Go's linker has no cross-TOC call stubs. The
 library's symbols bind within the image as `-Bsymbolic` would; nothing can
 interpose them. Loading the library's own extension modules with `dlopen`
 needs its exports in the executable's dynamic symbol table, which Bao does not
@@ -1003,8 +1018,8 @@ QEMU 10.0.13 (AVX2 and SSE-only CPU models); AVX-512 preservation is
 unverified. Initial/local exec TLS (`R_X86_64_GOTTPOFF`, `R_X86_64_TPOFF32`)
 is rejected: it assumes the image's TLS sits at a fixed offset from the
 thread pointer, which Bao's per-thread blocks cannot provide. Native IFUNC
-definitions, preinit arrays, static musl and arbitrary shared-library inputs
-remain unsupported. Rust std is checked in the
+definitions, preinit arrays and static musl remain unsupported; linked shared
+objects follow [Linux shared objects](#linux-shared-objects). Rust std is checked in the
 [static-runtime profile](#can-linux-packages-bundle-c-and-rust-runtimes);
 Clang with libc++ is unverified. Exceptions must stay inside native code;
 Go process exit does not run C++ static destructors. Explicit TLS/static
