@@ -4846,3 +4846,110 @@ the cap and, with `-linux-max-text-alignment 4096`, recorded the capped
 The pythago session separately reported, on the same 4 KiB-page host and
 with this branch before the rebase, that ctypes `CFUNCTYPE` callbacks and libc
 `qsort` with a Python comparator work under the cap; that was not rerun here.
+
+## 2026-11-14: Linux arm64 shared-object input
+
+Problem: pythago asked Bao to accept python-build-standalone's
+`libpython3.13.so.1.0` (PGO+LTO, with OpenSSL, sqlite, libffi, mimalloc and
+HACL statically linked) as input, so its producer would not need the LLVM
+bitcode archives and LTO lowering. A linked PIC shared object reaches its code,
+data and GOT through PC-relative instructions that no longer carry
+relocations, so its segments cannot become ordinary relocatable sections
+without disassembly. A spike earlier today (.work/so-delink) showed that one
+contiguous executable section works if the data pages are made writable at run
+time; without that `mprotect` the first `.data` write faulted.
+
+Decision (user): keep the whole load image as one section, linux/arm64 first,
+with an export address table, an optional relocatable glue input and
+per-function symbols in the first change.
+
+Change (`linuxelf/sharedobject.go`, wired through `TranslateWithOptions`):
+- Input forms: a shared object as the whole input, or relocatable input plus
+  `-linux-shared-object` (config `linux.shared_object`). The library's
+  sections come first, so its constructors run before the glue's.
+  `toolchain.Detect` accepts top-level AArch64 `ET_DYN`; `bao build` rejects
+  `-link-archive` with a shared-object input and skips debug and bitcode
+  stripping for it. bao-build.json records the library's path and hash.
+- Image: the `PT_LOAD` range [0, end) plus 64 KiB of padding, as one
+  4 KiB-aligned `SHF_ALLOC|SHF_EXECINSTR` section. 4 KiB keeps ADRP arithmetic
+  exact and stays within Go's safe text alignment (the earlier text alignment
+  entry today); the spike's 64 KiB alignment would have hit that Go linker bug.
+- Relocations: RELATIVE (and RELR) and ABS64/GLOB_DAT/JUMP_SLOT against
+  definitions become link-time ABS64 against the image; against imports they
+  become init-time fixups addressed as base symbol plus offset. A symbol per
+  GOT slot would exceed Go's findfunctab limit of 255 functions per 4 KiB,
+  because the image is text to Go's linker. TLSDESC slots become Bao
+  descriptors in place (`lowerTLS` writes the template offset and points word
+  0 at the thunk), and relocations inside the TLS initializer are repeated on a
+  `.tdata` template section. DTPMOD64/DTPREL64/TPREL64, IRELATIVE, COPY,
+  relocations outside writable segments, PIEs and files without section
+  headers are rejected (debug/elf returns no dynamic tags at all without
+  section headers).
+- Versioned imports: a first check that each required version was the same
+  code as the default failed for libpython on `exp`, `exp2`, `log`, `log2`,
+  `pow`, `fmod`, `hypot` (GLIBC_2.17 vs the 2.29 defaults without SVID error
+  handling) and `pthread_kill` (vs GLIBC_2.34). Fixups now bind versioned
+  imports with `dlvsym`; translation fails if the sysroot lacks a version.
+- Page protection: the generated init makes the writable segments read-write
+  (not executable) first, and makes `PT_GNU_RELRO` read-only after fixups. The
+  largest supported page size is the smallest gap between a writable segment
+  and executable code (including Go's code beyond the image), at most 64 KiB;
+  the package panics on a kernel with larger pages.
+- Constructors: `DT_INIT` then `DT_INIT_ARRAY`; `FinalizeRuntime` runs
+  `DT_FINI_ARRAY` backwards then `DT_FINI`. `.eh_frame` (found through
+  `PT_GNU_EH_FRAME`, which must be terminated) is registered in place.
+- Exports: default-version exported functions and data become native symbols,
+  plus a generated `SharedObjectExport(name)` / `SharedObjectExports()` table.
+  `.symtab` functions become local symbols, capped at 192 per 4 KiB bucket.
+- `-buildmode=pie` linked the fixture but crashed in init on an unrelocated
+  text pointer. The image now carries one self-pointer in its padding, and the
+  generated init panics with a build-mode message when it does not match.
+- General fix: the generated Linux package now requests every import library
+  with `//go:cgo_import_dynamic _ _ "lib"`. Go's linker records `DT_NEEDED`
+  only for libraries whose symbols code references, and a library reached only
+  through pointer fixups was not loaded: the fixture's first run panicked with
+  `undefined symbol: _ZNSt13runtime_errorC1EPKc` (libstdc++).
+
+Verification, native on Linux 7.0.0 aarch64 (4 KiB pages), Ubuntu GCC 13.3.0,
+GNU ld 2.42, glibc 2.39, Go 1.26.11 for Bao and consumers, purego v0.11.3,
+CGO_ENABLED=0. Scratch inputs are in .work/so-e2e.
+- `go test ./...` and `go vet ./...` pass. New unit tests build a synthetic
+  ET_DYN fixture: image layout and relocations, constructor and TLS template
+  relocation, exports, protection ranges, page-size limits (16 KiB gap gives
+  16 KiB; 2 KiB is rejected), seven rejections, TLS and fixup lowering, glue
+  merging, and generated-package compile/size tests for the shared-object
+  variant.
+- Fixture `libfix.so` (lib.c and cxx.cc; `gcc -shared -fPIC -O2
+  -Wl,-z,relro,-z,now ... -lstdc++ -lpthread`) plus glue `libglue.a`, built with
+  `bao build -target linux/arm64 -sysroot / -package fix -symbol glue_call
+  -symbol lib_threads -linux-shared-object ../libfix.so -o fix ../libglue.a`.
+  The consumer printed `ops=35 format=hello/7/5 env=1 threads=85 throw=24
+  glue=22 ctor=42`, identical to the native control linked against the .so,
+  then `fini=99` after `FinalizeRuntime`, on three runs. This covers function
+  and data imports, a RELRO function table, TLS with a pointer initializer
+  across 8 threads, a C++ exception thrown and caught in the image, a
+  constructor, a finalizer, and glue calling exports.
+- libpython3.13.so.1.0 from PBS 20261110, CPython 3.13.18 (sha256
+  91c5bd6cbea2b6a9...): `bao build -target linux/arm64 -sysroot / -package py
+  -o pkg libpython3.13.so.1.0` reported 4 TLS descriptors, 593 imports (589
+  versioned, 652 fixups), 1758 exports, 27674 function names and none dropped.
+  The relocation counts match pythago's (53400 RELATIVE, 5314 ABS64, 1323
+  JUMP_SLOT, 346 GLOB_DAT, 4 TLSDESC). A Go program calling `Py_Initialize`,
+  `PyRun_SimpleString` and `Py_FinalizeEx` through `SharedObjectExport` ran
+  smoke.py (ssl/OpenSSL 3.5.9, sqlite 3.53.1, lzma, bz2, decimal, asyncio, 16
+  threads, a traceback, versioned libm calls, ctypes `CFUNCTYPE` through libc
+  `qsort`) with exit 0 on 3 runs each for the default allocator and
+  `PYTHONMALLOC=mimalloc` at GOMAXPROCS 1 and 4. The same with a C glue
+  archive (an `atexit` wrapper and `glue_run` calling libpython) passed. The
+  executable's `DT_NEEDED` list has no libpython; `/proc/self/maps` showed
+  RELRO `r--p`, `.data`/`.bss` `rw-p` and no writable executable mapping;
+  `runtime.text` and `.text` are both 0x11000.
+- Negative controls: removing the writable `mprotect` from the generated
+  package faulted at the first fixup write (SIGSEGV in `tls_patch_pointer`);
+  removing the RELRO step left RELRO `rw-p`; `-buildmode=pie` panics with the
+  build-mode message.
+- Not run: kernels with 16/64 KiB pages, `perf` (`perf_event_paranoid` is 4
+  here; `go tool nm` shows the function names), pythago's own glue and test
+  suite, other architectures, the Linux cpp/cross suites and Bazel. Loading the
+  library's own extension modules with `dlopen` is unsupported: the executable
+  does not export the library's symbols dynamically.

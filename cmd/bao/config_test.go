@@ -42,7 +42,7 @@ func configFlags(t *testing.T, name, body string, args ...string) (*nativeFlags,
 
 func TestConfigSelectOnlyTheTargetSection(t *testing.T) {
 	body := `{"schema":1,"package":"gen","symbols":["a","b"],"strip_debug":false,"strip_bitcode":false,
-	"linux":{"sysroot":"/root","system_libraries":["libxcb.so.1"],"max_text_alignment":4096},
+	"linux":{"sysroot":"/root","system_libraries":["libxcb.so.1"],"max_text_alignment":4096,"shared_object":"/lib/libpython3.13.so.1.0"},
 	"windows":{"imports":{"Zed":"z.dll","Abc":"a.dll"},"cxx_runtime":"libc++","crt":"msvcrt","max_data_alignment":32}}`
 	o, _, _, err := configFlags(t, "build", body, "-target", "windows/arm64")
 	if err != nil {
@@ -54,14 +54,14 @@ func TestConfigSelectOnlyTheTargetSection(t *testing.T) {
 	if strings.Join(o.windowsImports, ",") != "Abc=a.dll,Zed=z.dll" || o.windowsCXXRuntime != "libc++" || o.windowsCRT != "msvcrt" || o.windowsMaxDataAlignment != 32 {
 		t.Fatalf("windows config: %+v", o)
 	}
-	if o.sysroot != "" || len(o.linuxSystemLibraries) != 0 || o.linuxMaxTextAlignment != 0 {
+	if o.sysroot != "" || len(o.linuxSystemLibraries) != 0 || o.linuxMaxTextAlignment != 0 || o.linuxSharedObject != "" {
 		t.Fatalf("linux section leaked into windows: %+v", o)
 	}
 	o, _, _, err = configFlags(t, "build", body, "-target", "linux/arm64")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.sysroot != "/root" || strings.Join(o.linuxSystemLibraries, ",") != "libxcb.so.1" || o.linuxMaxTextAlignment != 4096 || len(o.windowsImports) != 0 {
+	if o.sysroot != "/root" || strings.Join(o.linuxSystemLibraries, ",") != "libxcb.so.1" || o.linuxMaxTextAlignment != 4096 || o.linuxSharedObject != "/lib/libpython3.13.so.1.0" || len(o.windowsImports) != 0 {
 		t.Fatalf("linux config: %+v", o)
 	}
 }

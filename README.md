@@ -883,8 +883,9 @@ stronger alignment, such as libffi's static trampolines on kernels with pages
 larger than 4 KiB, is unverified under the cap.
 
 This path targets glibc/AArch64 and one combined native image. Other native TLS
-models, native IFUNC definitions, preinit arrays, static musl and arbitrary
-shared-library inputs are not supported. Other architectures use their
+models, native IFUNC definitions, preinit arrays and static musl are not
+supported. A linked shared object is accepted as described in
+[Linux shared objects](#linux-shared-objects). Other architectures use their
 separate target profiles.
 
 TLS initializers may hold absolute pointers to image data or system imports,
@@ -918,6 +919,68 @@ On a native Linux host with the pinned Go SDK, GCC, binutils and a compatible
 glibc sysroot, `sh ci/cgo-linux.sh` exercises fresh typed bindings with and
 without cgo, including a separate cgo package and native TLS cleanup. Results
 and generated inputs are left under `.work/`.
+
+#### Linux shared objects
+
+On linux/arm64, a linked PIC shared object, such as a distribution's
+`libpython3.13.so.1.0`, can be the input instead of an archive:
+
+```sh
+bao build -target linux/arm64 -sysroot / -o ./py libpython3.13.so.1.0
+```
+
+To add relocatable code that calls the library, such as an `atexit` wrapper or
+callback trampolines, pass that code as the input and the library with
+`-linux-shared-object` (config key `linux.shared_object`). The input is combined
+as usual and may reference the library's exports; the library's constructors
+run first.
+
+```sh
+bao build -target linux/arm64 -sysroot / -symbol glue_run \
+  -linux-shared-object libpython3.13.so.1.0 -o ./py libglue.a
+```
+
+The library's code reaches its data through PC-relative instructions that no
+longer carry relocations, so Bao keeps its whole load image together as one
+4 KiB-aligned executable section in Go's text. Dynamic relocations become
+link-time pointers, init-time import fixups and Bao TLS descriptors. The
+generated package makes the writable segments read-write, and not executable,
+before native code runs, then makes RELRO read-only again after the fixups. It
+runs `DT_INIT` and `.init_array` at package initialization; `FinalizeRuntime`
+runs `.fini_array` and `DT_FINI`. The library's `.eh_frame` is registered in
+place.
+
+- Every default-version export (functions and data) is a native symbol that
+  `-symbol` can select and the relocatable input can call.
+  `SharedObjectExport(name)` returns any export's run-time address, and
+  `SharedObjectExports()` lists the names.
+- Functions from the library's `.symtab` are named in the executable's symbol
+  table for tools such as `perf` and `addr2line`. Where Go's function lookup
+  table would overflow, some names are left out; the manifest counts them.
+- Versioned imports are bound with `dlvsym` to the version the library was
+  linked against. glibc's compatibility versions of `exp`, `log`, `pow` and
+  `pthread_kill` are different code from their current defaults. Translation
+  fails if the sysroot lacks a required version.
+- Imports resolve against the standard library set and
+  `-linux-system-library`, as for archives. A `DT_NEEDED` library outside that
+  set, such as `libutil.so.1` on an older sysroot, must be named.
+- `bao-manifest.json` records the library under `shared_object`: its image
+  size, writable and RELRO ranges, largest supported page size, relocation
+  counts, versioned imports and exports.
+
+The largest supported page size is the smallest distance between a writable
+segment and executable code, at most 64 KiB, so that no page is both. Libraries
+linked with GNU ld's default 64 KiB AArch64 maximum page size allow every
+Linux page size; the generated package panics on a kernel with larger pages.
+Only TLS descriptors (the AArch64 `-fPIC` default) are supported for TLS;
+initial-exec TLS, `R_AARCH64_TLS_DTPMOD64`, text relocations, IFUNCs and copy
+relocations are rejected, as are PIEs and files without section headers. The
+library's symbols bind within the image as `-Bsymbolic` would; nothing can
+interpose them. Loading the library's own extension modules with `dlopen`
+needs its exports in the executable's dynamic symbol table, which Bao does not
+provide. The consumer must use Go's default build mode: the image's pointers
+are applied in text, which `-buildmode=pie` leaves unrelocated, and the
+generated package panics at initialization if it finds them so.
 
 ### Linux amd64 / ELF
 
@@ -1303,7 +1366,7 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
 `require_static_runtime` and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
-`sysroot`, `ld`, `system_libraries` and `max_text_alignment`; `windows` takes `imports`,
+`sysroot`, `ld`, `system_libraries`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
 section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.

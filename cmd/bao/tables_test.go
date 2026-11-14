@@ -63,6 +63,21 @@ func syntheticLinuxPlan(n int) *linuxelf.Plan {
 	return p
 }
 
+// syntheticSharedObjectPlan adds a shared-object image whose import fixups
+// are image offsets, some of them versioned, and an export table.
+func syntheticSharedObjectPlan(n int) *linuxelf.Plan {
+	p := syntheticLinuxPlan(n)
+	p.Arch = "arm64"
+	p.Imports[1].Version = "GLIBC_2.17"
+	so := &linuxelf.SharedObject{BaseSymbol: "bao_test_so_base", MaxPageSize: 65536, Writable: []linuxelf.Range{{Start: 0x20000, End: 0x30000}}, RELRO: []linuxelf.Range{{Start: 0x20000, End: 0x24000}}}
+	for i := 0; i < n; i++ {
+		p.Fixups[i].Location, p.Fixups[i].Offset = so.BaseSymbol, uint64(0x20000+8*i)
+		so.Exports = append(so.Exports, linuxelf.Export{Name: fmt.Sprintf("Export%06d", i), Kind: "func", Offset: uint64(16 * i)})
+	}
+	p.SharedObject = so
+	return p
+}
+
 func syntheticDarwinPlan(n int) *translate.TLSProbe {
 	p := &translate.TLSProbe{Arch: "arm64", Namespace: "bao_test_", TemplateSymbol: "bao_test_tls", TemplateSize: 16, TemplateAlignment: 8,
 		Imports: []translate.ImportBinding{{Local: "bao_test_imp_a", Remote: "_a", Library: "/usr/lib/libSystem.B.dylib"}, {Local: "bao_test_imp_b", Remote: "_b", Library: "/usr/lib/libSystem.B.dylib"}}}
@@ -88,6 +103,9 @@ func generatedPackages() []generatedPackage {
 	}
 	packages = append(packages, generatedPackage{"linux", "linux", "amd64", "symbols_linux_amd64", func(n int) ([]byte, []byte, error) {
 		return linuxSource(syntheticLinuxPlan(n), "linux", []string{"answer"})
+	}})
+	packages = append(packages, generatedPackage{"linuxso", "linux", "arm64", "symbols_linux_arm64", func(n int) ([]byte, []byte, error) {
+		return linuxSource(syntheticSharedObjectPlan(n), "linuxso", []string{"answer"})
 	}})
 	packages = append(packages, generatedPackage{"darwin", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
 		return darwinSource(syntheticDarwinPlan(n), "darwin", []string{"answer"}, nil, true)
@@ -165,6 +183,8 @@ const RTLD_DEFAULT = 0
 func RegisterFunc(fptr any, cfn uintptr) {}
 
 func Dlsym(handle uintptr, name string) (uintptr, error) { return 0, nil }
+
+func SyscallN(fn uintptr, args ...uintptr) (r1, r2, err uintptr) { return }
 `
 
 // TestLargeGeneratedPackagesCompile compiles generated packages with tens of

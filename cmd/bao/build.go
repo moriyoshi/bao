@@ -33,6 +33,7 @@ type nativeFlags struct {
 	windowsMaxDataAlignment           uint
 	linuxSystemLibraries              symbolFlags
 	linuxMaxTextAlignment             uint
+	linuxSharedObject                 string
 	config                            string
 	inlineBindings                    []byte
 	diagnostics                       diagnosticFlags
@@ -55,6 +56,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.UintVar(&o.windowsMaxDataAlignment, "windows-max-data-alignment", 0, "link read-only data requesting more alignment at this value; only 32 is supported, and capped sections are recorded in the manifest")
 	fs.Var(&o.linuxSystemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
 	fs.UintVar(&o.linuxMaxTextAlignment, "linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported, and capped sections are recorded in the manifest")
+	fs.StringVar(&o.linuxSharedObject, "linux-shared-object", "", "linked PIC shared object (linux/arm64) to translate with the input, which may reference its exports; a shared object can also be the input itself")
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
 	fs.StringVar(&o.windowsCRT, "windows-crt", "ucrt", "Windows system C runtime: ucrt or msvcrt; match the producer toolchain")
 	o.diagnostics.register(fs)
@@ -121,6 +123,9 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 	}
 	if o.linuxMaxTextAlignment != 0 && !strings.HasPrefix(target.Name, "linux/") {
 		return usage("-linux-max-text-alignment requires a Linux target")
+	}
+	if o.linuxSharedObject != "" && !strings.HasPrefix(target.Name, "linux/") {
+		return usage("-linux-shared-object requires a Linux target")
 	}
 	if strings.HasPrefix(target.Name, "windows/") {
 		if !o.stripBitcode {
@@ -189,6 +194,9 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 		}
 		if o.linuxMaxTextAlignment != 0 {
 			args = append(args, "-linux-max-text-alignment", strconv.FormatUint(uint64(o.linuxMaxTextAlignment), 10))
+		}
+		if o.linuxSharedObject != "" {
+			args = append(args, "-linux-shared-object", o.linuxSharedObject)
 		}
 		return translateELF(append(args, "-sysroot", o.sysroot, input), stderr)
 	}
@@ -377,6 +385,10 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	sourceHash := fmt.Sprintf("%x", sha256.Sum256(inputBytes))
+	sharedInput := linuxelf.IsSharedObject(inputBytes)
+	if sharedInput && len(linkArchives) > 0 {
+		return usage("-link-archive cannot extend a shared-object input; pass relocatable code as the input and the library with -linux-shared-object")
+	}
 	type linkedInput struct {
 		Path     string `json:"path"`
 		SHA256   string `json:"sha256"`
@@ -421,6 +433,23 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	combined := nativeInput
+	var sharedObject *linkedInput
+	if o.linuxSharedObject != "" {
+		if sharedInput {
+			return usage("the input is already a shared object; -linux-shared-object needs relocatable input")
+		}
+		data, err := os.ReadFile(o.linuxSharedObject)
+		if err != nil {
+			return err
+		}
+		// Translate a private copy, as with the other native inputs.
+		snapshot := filepath.Join(work, "shared-object.so")
+		if err := writeNew(snapshot, data); err != nil {
+			return err
+		}
+		sharedObject = &linkedInput{Path: o.linuxSharedObject, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}
+		o.linuxSharedObject = snapshot
+	}
 	if archive && !strings.HasPrefix(target.Name, "windows/") || len(linkArchives) > 0 {
 		fmt.Fprintf(stderr, "Combining archive for %s\n", target.Name)
 		combined = filepath.Join(work, "combined.o")
@@ -468,9 +497,10 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		Symbols              []string            `json:"symbols"`
 		Commands             []toolchain.Command `json:"producer_commands"`
 		LinkedArchives       []linkedInput       `json:"linked_archives,omitempty"`
+		SharedObject         *linkedInput        `json:"linux_shared_object,omitempty"`
 		LinkedNotices        []linkedInput       `json:"linked_notices,omitempty"`
 		RequireStaticRuntime bool                `json:"require_static_runtime,omitempty"`
-	}{1, version, target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, notices, *requireStaticRuntime}
+	}{1, version, target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, notices, *requireStaticRuntime}
 	b, err := json.MarshalIndent(provenance, "", "  ")
 	if err != nil {
 		return err

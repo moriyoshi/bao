@@ -75,6 +75,18 @@ func Detect(path string) (target Target, archive bool, err error) {
 	if bytes.HasPrefix(b, []byte("!<thin>\n")) {
 		return target, true, fmt.Errorf("thin archives are unsupported; supply an ordinary archive or combined object")
 	}
+	if bytes.HasPrefix(b, []byte{0x7f, 'E', 'L', 'F'}) {
+		// Linked shared objects are accepted as a whole input, never as
+		// archive members.
+		if f, err := elf.NewFile(bytes.NewReader(b)); err == nil && f.Type == elf.ET_DYN {
+			f.Close()
+			if f.Class != elf.ELFCLASS64 || f.Data != elf.ELFDATA2LSB || f.Machine != elf.EM_AARCH64 {
+				return target, false, fmt.Errorf("shared-object input supports little-endian ELF64 AArch64 (linux/arm64), got %s/%s", f.Class, f.Machine)
+			}
+			target, err = ParseTarget("linux/arm64")
+			return target, false, err
+		}
+	}
 	target, err = detectObject(b)
 	return target, false, err
 }
