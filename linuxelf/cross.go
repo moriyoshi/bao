@@ -31,7 +31,7 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 		if s.flags&elf.SHF_TLS == 0 {
 			continue
 		}
-		if (s.typ != elf.SHT_PROGBITS && s.typ != elf.SHT_NOBITS) || len(s.relocs) != 0 {
+		if s.typ != elf.SHT_PROGBITS && s.typ != elf.SHT_NOBITS {
 			return fmt.Errorf("unsupported native TLS template %s", s.name)
 		}
 		alignment = max(alignment, s.align)
@@ -65,6 +65,9 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 	}
 	sec := m.addSection(section{name: ".bao.tls_template", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: alignment, size: uint64(len(template)), data: template})
 	m.addSymbol(p.TLSTemplateSymbol, sec, 0, uint64(len(template)))
+	if err := moveTemplateRelocs(m, offsets, sec); err != nil {
+		return err
+	}
 	desc := m.addSection(section{name: ".bao.tls_descriptors", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8})
 	type key struct {
 		sym uint32

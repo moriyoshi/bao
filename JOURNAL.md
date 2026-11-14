@@ -4594,3 +4594,75 @@ was gone, the consumer linked, and the executable ran natively in the
 container with exit 0. `go test ./...` and `go vet ./...` passed with Go
 1.26.11. Scratch files are in .work/go1.26.11/llvmopt. The Linux C++ suites
 themselves were not run locally; hosted CI is the check for them.
+
+## 2026-11-14: Linux TLS template pointers, AArch64 short branches and unused absolute symbols
+
+Problem: the pythago project (CPython 3.13 from python-build-standalone 20261110,
+embedded through Bao on linux/arm64) reported three translator rejections. It
+works around each of them.
+1. mimalloc's `__thread mi_heap_t *_mi_heap_default = &_mi_heap_empty` leaves
+   an `R_AARCH64_ABS64` in `.tdata`: "relocations in ELF TLS templates require
+   additional support". The workaround zeroes the initializer in IR, which is
+   safe only for pymalloc builds.
+2. OpenSSL perlasm `chacha-armv8-sve.o` defines an unreferenced local SHN_ABS
+   `mixin`: "unsupported absolute/common/extended symbol mixin".
+3. OpenSSL `poly1305-armv8.o` branches with `b.ne poly1305_emit` to a global
+   symbol in the same section: "unsupported allocated ELF relocation
+   R_AARCH64_CONDBR19".
+
+Change (`linuxelf`):
+- `moveTemplateRelocs` moves each absolute 64-bit pointer relocation from a TLS
+  section onto `.bao.tls_template`, at the section's template offset. This
+  covers arm64 `lowerTLS` and the amd64/loong64/ppc64le `lowerDynamicTLS`. Go's
+  linker resolves image-local targets. Imports become ordinary data fixups,
+  which the generated init applies before constructors and before any native
+  code copies the template (`bao_tls_configure` only records the pointer).
+  Other relocation types and pointers into TLS are rejected.
+- `resolveShortBranch` patches `R_AARCH64_CONDBR19` (B.cond, CBZ/CBNZ) and
+  `R_AARCH64_TSTBR14` (TBZ/TBNZ) in place when the target is in the same
+  executable section. It checks the opcode, alignment and range (±1 MiB /
+  ±32 KiB) and drops the relocation. Other targets fail with a message naming
+  the relocation and target.
+- The symbol pass moved into `normalizeSymbols`. It now retires local SHN_ABS
+  symbols that no allocated relocation references. A referenced absolute
+  symbol fails with "unsupported relocation against absolute symbol"; global
+  absolute symbols are still rejected.
+
+Verification. Host: Linux 7.0.0 aarch64 (SVE2 CPU), Ubuntu GCC 13.3.0,
+GNU ld 2.42, glibc 2.39, Go 1.27.4 (not the pinned 1.26.11). Producer and
+consumers ran natively; there was no emulation.
+- `go test ./...` and `go vet ./...` passed. New unit tests cover template
+  offsets, import fixups on the template, amd64 template pointers, five
+  rejected template forms, absolute-symbol retirement (including a debug-only
+  reference), forward and backward branch encoding, and six rejected branch
+  forms. Each rejection was checked against its intended message.
+- Fixture (.work/arm64-gaps/src): `__thread` pointers to a static object and
+  to glibc `environ`, checked and modified in 8 threads plus main, and an
+  assembly function with CBZ/TBNZ/B.EQ to global labels and `.set mixin`.
+  Unmodified Bao (6ba2de6) reproduced all three reported messages on the
+  fixture and on branch-only archives. The patched producer
+  (`bao build -target linux/arm64 -sysroot /`) built a CGO_ENABLED=0 purego
+  consumer that passed at GOMAXPROCS 1 and 4, freeing 9 TLS blocks with 0
+  live.
+- Negative controls: a producer that drops moved template relocations returned
+  result 2 (the zeroing-workaround symptom). A producer that drops branch
+  relocations without patching hung in a branch-to-self until a 120 s timeout.
+- Real input: unpatched PBS `libcrypto.a` (sha256 prefix f0e320293189e22d)
+  through `-link-archive`, with a C glue that runs ChaCha20-Poly1305. It
+  checked the RFC 8439 2.8.2 tag and ciphertext, a 4 KiB round trip and a
+  forged-tag rejection. Unmodified Bao failed on `mixin`. With the patch the
+  first remaining error was 10 unresolved outline-atomics helpers plus
+  `atexit`. Adding `-link-archive $(gcc -print-libgcc-file-name)` and an
+  `atexit` wrapper in the glue, the consumer passed at GOMAXPROCS 1 and 4. A
+  gcc-linked native control also passed. The image contains SVE code; whether
+  the SVE ChaCha path ran was not determined.
+- Finding: glibc 2.39 `libc_nonshared.a` `atexit` loads the value of
+  `__dso_handle` with an 8-byte LDR. Bao maps `__dso_handle` to the runtime's
+  one-byte `char bao_dso_handle`, so Go's linker rejected the misaligned
+  `R_AARCH64_LDST64_ABS_LO12_NC`. Compiler-generated C++ uses only
+  `&__dso_handle`. Making the runtime identity a pointer-sized self-pointer
+  would need `tls.c` changes and regenerating all four Linux helpers. This
+  was not done; the README documents the wrapper instead.
+- Not run: loong64/ppc64le/amd64 execution of template pointers (amd64 is
+  unit-tested only), the Linux cpp/cross suites, Bazel, and pythago's full
+  libpython build.
