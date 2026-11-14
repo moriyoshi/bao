@@ -17,6 +17,9 @@ type section struct {
 	link, info           uint32
 	data                 []byte
 	relocs               []reloc
+	// writable lists the offsets of a shared-object image that the generated
+	// package makes writable before native code runs.
+	writable []Range
 }
 type symbol struct {
 	name        string

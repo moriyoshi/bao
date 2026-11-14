@@ -883,8 +883,9 @@ stronger alignment, such as libffi's static trampolines on kernels with pages
 larger than 4 KiB, is unverified under the cap.
 
 This path targets glibc/AArch64 and one combined native image. Other native TLS
-models, native IFUNC definitions, preinit arrays, static musl and arbitrary
-shared-library inputs are not supported. Other architectures use their
+models, native IFUNC definitions, preinit arrays and static musl are not
+supported. A linked shared object is accepted as described in
+[Linux shared objects](#linux-shared-objects). Other architectures use their
 separate target profiles.
 
 TLS initializers may hold absolute pointers to image data or system imports,
@@ -919,6 +920,83 @@ glibc sysroot, `sh ci/cgo-linux.sh` exercises fresh typed bindings with and
 without cgo, including a separate cgo package and native TLS cleanup. Results
 and generated inputs are left under `.work/`.
 
+### Linux shared objects
+
+On every Linux target (arm64, amd64, loong64 and ppc64le), a linked PIC shared
+object, such as a distribution's `libpython3.13.so.1.0`, can be the input
+instead of an archive:
+
+```sh
+bao build -target linux/arm64 -sysroot / -o ./py libpython3.13.so.1.0
+```
+
+To add relocatable code that calls the library, such as an `atexit` wrapper or
+callback trampolines, pass that code as the input and the library with
+`-linux-shared-object` (config key `linux.shared_object`). The input is combined
+as usual and may reference the library's exports; the library's constructors
+run first.
+
+```sh
+bao build -target linux/arm64 -sysroot / -symbol glue_run \
+  -linux-shared-object libpython3.13.so.1.0 -o ./py libglue.a
+```
+
+The library's code reaches its data through PC-relative instructions that no
+longer carry relocations, so Bao keeps its whole load image together as one
+4 KiB-aligned executable section in Go's text. Dynamic relocations become
+link-time pointers, init-time import fixups and Bao TLS descriptors. The
+generated package makes the writable segments read-write, and not executable,
+before native code runs, then makes RELRO read-only again after the fixups. It
+runs `DT_INIT` and `.init_array` at package initialization; `FinalizeRuntime`
+runs `.fini_array` and `DT_FINI`. The library's `.eh_frame` is registered in
+place.
+
+- Every default-version export (functions and data) is a native symbol that
+  `-symbol` can select and the relocatable input can call.
+  `SharedObjectExport(name)` returns any export's run-time address, and
+  `SharedObjectExports()` lists the names.
+- Functions from the library's `.symtab` are named in the executable's symbol
+  table for tools such as `perf` and `addr2line`. Where Go's function lookup
+  table would overflow, some names are left out; the manifest counts them.
+- Versioned imports are bound with `dlvsym` to the version the library was
+  linked against. glibc's compatibility versions of `exp`, `log`, `pow` and
+  `pthread_kill` are different code from their current defaults. Translation
+  fails if the sysroot lacks a required version.
+- Imports resolve against the standard library set and
+  `-linux-system-library`, as for archives. A `DT_NEEDED` library outside that
+  set, such as `libutil.so.1` on an older sysroot, must be named.
+- `bao-manifest.json` records the library under `shared_object`: its image
+  size, writable and RELRO ranges, largest supported page size, relocation
+  counts, versioned imports and exports.
+
+The largest supported page size is the smallest distance between a writable
+segment and executable code, at most 64 KiB, so that no page is both. GNU ld's
+default maximum page size is 64 KiB on AArch64, LoongArch and PowerPC64, which
+allows every page size those kernels use, and 4 KiB on x86-64, where the
+fixture allowed 8 KiB pages. The generated package panics on a kernel with
+larger pages.
+
+Thread-local storage uses Bao's per-thread template:
+
+| Target | TLS in the shared object |
+| --- | --- |
+| arm64 | TLS descriptors, the `-fPIC` default |
+| amd64 | `__tls_get_addr` (the default) or GNU2 descriptors (`-mtls-dialect=gnu2`) |
+| loong64 | `__tls_get_addr`, the default; `-mtls-dialect=desc` is rejected |
+| ppc64le | `__tls_get_addr`; link with `-Wl,--no-tls-get-addr-optimize`, since `__tls_get_addr_opt` is rejected |
+
+Initial-exec TLS, text relocations, IFUNCs and copy relocations are rejected,
+as are PIEs and files without section headers. On ppc64le the image's
+functions set up their own TOC from `r12` at their global entry point, so
+relocatable input must call them through function pointers; a direct call is
+rejected, because Go's linker has no cross-TOC call stubs. The
+library's symbols bind within the image as `-Bsymbolic` would; nothing can
+interpose them. Loading the library's own extension modules with `dlopen`
+needs its exports in the executable's dynamic symbol table, which Bao does not
+provide. The consumer must use Go's default build mode: the image's pointers
+are applied in text, which `-buildmode=pie` leaves unrelocated, and the
+generated package panics at initialization if it finds them so.
+
 ### Linux amd64 / ELF
 
 `build -target linux/amd64 -sysroot /` accepts PIC ELF64 archives with a target
@@ -940,8 +1018,8 @@ QEMU 10.0.13 (AVX2 and SSE-only CPU models); AVX-512 preservation is
 unverified. Initial/local exec TLS (`R_X86_64_GOTTPOFF`, `R_X86_64_TPOFF32`)
 is rejected: it assumes the image's TLS sits at a fixed offset from the
 thread pointer, which Bao's per-thread blocks cannot provide. Native IFUNC
-definitions, preinit arrays, static musl and arbitrary shared-library inputs
-remain unsupported. Rust std is checked in the
+definitions, preinit arrays and static musl remain unsupported; linked shared
+objects follow [Linux shared objects](#linux-shared-objects). Rust std is checked in the
 [static-runtime profile](#can-linux-packages-bundle-c-and-rust-runtimes);
 Clang with libc++ is unverified. Exceptions must stay inside native code;
 Go process exit does not run C++ static destructors. Explicit TLS/static
@@ -1303,7 +1381,7 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
 `require_static_runtime` and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
-`sysroot`, `ld`, `system_libraries` and `max_text_alignment`; `windows` takes `imports`,
+`sysroot`, `ld`, `system_libraries`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
 section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.

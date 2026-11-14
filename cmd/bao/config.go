@@ -49,6 +49,7 @@ type buildConfig struct {
 		Linker           string   `json:"ld"`
 		SystemLibraries  []string `json:"system_libraries"`
 		MaxTextAlignment *uint    `json:"max_text_alignment"`
+		SharedObject     string   `json:"shared_object"`
 	} `json:"linux"`
 	Windows *struct {
 		platformLinkConfig
@@ -251,6 +252,7 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 				}
 				return set("linux-max-text-alignment", strconv.FormatUint(uint64(*s.Linux.MaxTextAlignment), 10))
 			},
+			func() error { return setPaths("linux-shared-object", s.Linux.SharedObject) },
 		}
 		steps = append(steps, link(s.Linux.platformLinkConfig)...)
 	case strings.HasPrefix(target.Name, "windows/") && s.Windows != nil:

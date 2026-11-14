@@ -6,7 +6,6 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -29,6 +28,9 @@ type Import struct {
 	Local   string `json:"go_symbol"`
 	Remote  string `json:"dynamic_symbol"`
 	Library string `json:"library"`
+	// Version is the symbol version a shared-object input requires; fixups
+	// then bind it with dlvsym rather than by name.
+	Version string `json:"version,omitempty"`
 }
 
 // ValidateSysroot checks the target shared-library export metadata required by
@@ -40,8 +42,10 @@ func ValidateSysroot(root string) error {
 
 type Fixup struct {
 	Location string `json:"location_symbol"`
-	Import   string `json:"import_symbol"`
-	Addend   int64  `json:"addend"`
+	// Offset locates a slot inside a shared-object image from its base symbol.
+	Offset uint64 `json:"location_offset,omitempty"`
+	Import string `json:"import_symbol"`
+	Addend int64  `json:"addend"`
 }
 type Table struct {
 	Symbol   string `json:"symbol"`
@@ -84,6 +88,7 @@ type Plan struct {
 	Fixups               []Fixup           `json:"pointer_fixups"`
 	WeakZero             []string          `json:"unavailable_weak_symbols"`
 	CappedTextAlignments []CappedAlignment `json:"linux_capped_text_alignments,omitempty"`
+	SharedObject         *SharedObject     `json:"shared_object,omitempty"`
 	Artifacts            map[string]string `json:"artifact_sha256"`
 	Objects              [][]byte          `json:"-"`
 }
@@ -171,14 +176,7 @@ func systemSymbolsMachine(root string, machine elf.Machine, extra ...string) (ma
 	// The glibc/C++ runtime set stays first: an extra library cannot replace one
 	// of its symbols, because the first exporter of a name wins below.
 	for _, name := range append([]string{"libc.so.6", "libm.so.6", "libgcc_s.so.1", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libstdc++.so.6", "ld64.so.2", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1", "ld-linux-loongarch-lp64d.so.1"}, extra...) {
-		var path string
-		for _, dir := range []string{"lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu", "lib/loongarch64-linux-gnu", "usr/lib/loongarch64-linux-gnu", "lib/powerpc64le-linux-gnu", "usr/lib/powerpc64le-linux-gnu", "lib64", "lib", "usr/lib64", "usr/lib"} {
-			candidate := filepath.Join(root, dir, name)
-			if _, err := os.Stat(candidate); err == nil {
-				path = candidate
-				break
-			}
-		}
+		path := sysrootLibrary(root, name)
 		if path == "" {
 			if required[name] {
 				return nil, fmt.Errorf("missing target library %s", name)
@@ -212,12 +210,15 @@ func systemSymbolsMachine(root string, machine elf.Machine, extra ...string) (ma
 	return index, nil
 }
 
+// sysrootLibraryDirs are searched in order for target shared objects.
+var sysrootLibraryDirs = []string{"lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu", "lib/loongarch64-linux-gnu", "usr/lib/loongarch64-linux-gnu", "lib/powerpc64le-linux-gnu", "usr/lib/powerpc64le-linux-gnu", "lib64", "lib", "usr/lib64", "usr/lib"}
+
 // sysrootObjects lists shared objects in a sysroot's library directories for one
 // machine, in search order. A base name found earlier hides later copies.
 func sysrootObjects(root string, machine elf.Machine) ([]string, error) {
 	var out []string
 	seen := map[string]bool{}
-	for _, dir := range []string{"lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu", "lib/loongarch64-linux-gnu", "usr/lib/loongarch64-linux-gnu", "lib/powerpc64le-linux-gnu", "usr/lib/powerpc64le-linux-gnu", "lib64", "lib", "usr/lib64", "usr/lib"} {
+	for _, dir := range sysrootLibraryDirs {
 		matches, err := filepath.Glob(filepath.Join(root, dir, "*.so.*"))
 		if err != nil {
 			return nil, err
@@ -323,6 +324,10 @@ type Options struct {
 	// SystemLibraries names additional sysroot shared objects, such as
 	// libxcb.so.1, whose exports may satisfy native imports. Each must exist.
 	SystemLibraries []string
+	// SharedObject is a linked shared object to translate together with a
+	// relocatable input that may reference its exports. A shared object can
+	// also be the input itself.
+	SharedObject []byte
 }
 
 func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
@@ -333,9 +338,48 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 	if opts.MaxTextAlignment != 0 && opts.MaxTextAlignment != MaxSafeTextAlignment {
 		return nil, fmt.Errorf("unsupported Linux maximum text alignment %d; only %d is supported", opts.MaxTextAlignment, MaxSafeTextAlignment)
 	}
-	main, err := parse(input)
-	if err != nil {
-		return nil, err
+	digest := fmt.Sprintf("%x", sha256.Sum256(input))
+	namespace := digest
+	if opts.SharedObject != nil {
+		h := sha256.New()
+		h.Write(input)
+		h.Write(opts.SharedObject)
+		namespace = fmt.Sprintf("%x", h.Sum(nil))
+	}
+	ns := "bao_elf_" + namespace[:12] + "_"
+	var main *image
+	var so *delinked
+	var err error
+	switch {
+	case IsSharedObject(input):
+		if opts.SharedObject != nil {
+			return nil, fmt.Errorf("the input is already a shared object; pass relocatable code with a separate shared object")
+		}
+		if so, err = delink(input, ns); err != nil {
+			return nil, err
+		}
+		main = so.m
+	case opts.SharedObject != nil:
+		if so, err = delink(opts.SharedObject, ns); err != nil {
+			return nil, fmt.Errorf("shared object: %w", err)
+		}
+		glue, err := parse(input)
+		if err != nil {
+			return nil, err
+		}
+		// The shared object's sections come first, so its constructors run
+		// before code that uses it.
+		main = so.m
+		if err := main.merge(glue); err != nil {
+			return nil, err
+		}
+		if err := checkImageCalls(main); err != nil {
+			return nil, err
+		}
+	default:
+		if main, err = parse(input); err != nil {
+			return nil, err
+		}
 	}
 	runtimeData := runtimeObject
 	switch main.effectiveMachine() {
@@ -350,8 +394,10 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 	if err != nil {
 		return nil, err
 	}
-	digest := fmt.Sprintf("%x", sha256.Sum256(input))
-	p := &Plan{Arch: main.arch(), Status: "TRANSLATED: target link and execution require separate verification", Namespace: "bao_elf_" + digest[:12] + "_", InputSHA256: digest, Artifacts: map[string]string{}}
+	p := &Plan{Arch: main.arch(), Status: "TRANSLATED: target link and execution require separate verification", Namespace: ns, InputSHA256: digest, Artifacts: map[string]string{}}
+	if so != nil {
+		p.SharedObject = so.info
+	}
 	images := []*image{main, helper}
 	defined := map[string]bool{}
 	for _, m := range images {
@@ -483,6 +529,10 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 			return nil, err
 		}
 	}
+	if so != nil && so.ehFrame >= 0 {
+		main.addSymbol(so.info.UnwindSymbol, 1, uint64(so.ehFrame), 0)
+		p.Unwind = append([]string{so.info.UnwindSymbol}, p.Unwind...)
+	}
 	sort.SliceStable(p.Constructors, func(i, j int) bool { return p.Constructors[i].Priority < p.Constructors[j].Priority })
 	for i, j := 0, len(p.Finalizers)-1; i < j; i, j = i+1, j-1 {
 		p.Finalizers[i], p.Finalizers[j] = p.Finalizers[j], p.Finalizers[i]
@@ -494,6 +544,18 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 	}
 	if err := p.bind(images, index); err != nil {
 		return nil, err
+	}
+	if so != nil {
+		if err := checkVersions(sysroot, p.Imports, so.info.Versions); err != nil {
+			return nil, err
+		}
+		versions := map[string]string{}
+		for _, v := range so.info.Versions {
+			versions[v.Name] = v.Version
+		}
+		for i := range p.Imports {
+			p.Imports[i].Version = versions[p.Imports[i].Remote]
+		}
 	}
 	for i, m := range images {
 		b, err := m.encode()
@@ -652,6 +714,10 @@ func (p *Plan) lowerTLS(m *image) error {
 		add int64
 	}
 	descriptors := map[target]uint32{}
+	slots, err := lowerImageTLS(m, offsets, uint64(len(template)), func() uint32 { return thunk })
+	if err != nil {
+		return err
+	}
 	for si := range m.sections {
 		if m.sections[si].flags&elf.SHF_ALLOC == 0 {
 			continue
@@ -721,7 +787,7 @@ func (p *Plan) lowerTLS(m *image) error {
 		}
 		m.sections[si].relocs = out
 	}
-	p.TLSDescriptors = len(descriptors)
+	p.TLSDescriptors = len(descriptors) + slots
 	return nil
 }
 
@@ -940,13 +1006,9 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 					}
 				}
 				if b, ok := bindings[sym.name]; ok && r.typ == elf.R_AARCH64_ABS64 {
-					if s.flags&elf.SHF_WRITE == 0 || r.off+8 > uint64(len(s.data)) {
-						return fmt.Errorf("dynamic absolute pointer must be writable native data")
+					if err := p.importFixup(m, si, r, b); err != nil {
+						return err
 					}
-					name := fmt.Sprintf("%sfixup_%d", p.Namespace, len(p.Fixups))
-					m.addSymbol(name, uint16(si), r.off, 8)
-					p.Fixups = append(p.Fixups, Fixup{Location: name, Import: b.Local, Addend: r.add})
-					binary.LittleEndian.PutUint64(s.data[r.off:], 0)
 					continue
 				}
 				if (r.typ == elf.R_AARCH64_ADR_GOT_PAGE || r.typ == elf.R_AARCH64_LD64_GOT_LO12_NC) && sym.sect != 0 {
@@ -983,4 +1045,32 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// importFixup records an init-time pointer to an import at r.off. In a
+// shared-object image the slot is addressed from the image base: one symbol
+// per GOT slot would overflow Go's function table, since the image is text.
+func (p *Plan) importFixup(m *image, si int, r reloc, b Import) error {
+	s := &m.sections[si]
+	if s.flags&elf.SHF_WRITE == 0 && !inRanges(s.writable, r.off, 8) || r.off+8 > uint64(len(s.data)) {
+		return fmt.Errorf("dynamic absolute pointer must be writable native data")
+	}
+	if s.writable != nil {
+		p.Fixups = append(p.Fixups, Fixup{Location: p.SharedObject.BaseSymbol, Offset: r.off, Import: b.Local, Addend: r.add})
+	} else {
+		name := fmt.Sprintf("%sfixup_%d", p.Namespace, len(p.Fixups))
+		m.addSymbol(name, uint16(si), r.off, 8)
+		p.Fixups = append(p.Fixups, Fixup{Location: name, Import: b.Local, Addend: r.add})
+	}
+	binary.LittleEndian.PutUint64(s.data[r.off:], 0)
+	return nil
+}
+
+func inRanges(ranges []Range, off, n uint64) bool {
+	for _, r := range ranges {
+		if off >= r.Start && off+n <= r.End {
+			return true
+		}
+	}
+	return false
 }
