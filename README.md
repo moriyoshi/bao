@@ -883,12 +883,20 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   `__register_frame`, together with the dylib's own `__eh_frame` records.
 - **Initializers:** `__mod_init_func` or `__init_offsets` run in order, after
   TLS is configured.
+- **Objective-C:** libobjc learns about images from dyld, so the loader
+  registers the dylib's metadata through libobjc's public API. It uniques
+  selector references (`sel_registerName`), registers protocols (or uses an
+  existing one of the same name), reads classes superclass-first with
+  `objc_readClassPair`, attaches categories' methods and protocols
+  (`class_replaceMethod`, `class_addProtocol`), and runs `+load` before the
+  initializers. Categories on other images' classes work. Category properties
+  and class properties are not attached.
 - **Exports:** `SharedObjectExport(name)`, `SharedObjectExports()` and
   `-symbol` accessors return the image's addresses.
 
 Not supported:
-- arm64e dylibs, Objective-C and Swift images (their runtimes register images
-  through dyld), and tagged or multi-start chained fixups.
+- arm64e dylibs, Swift images (libswiftCore registers images through dyld),
+  and tagged or multi-start chained fixups.
 - Relocatable code combined with a dylib.
 
 `dladdr` reports the executable for the dylib's code, `__mod_term_func` does not

@@ -5261,3 +5261,46 @@ replace before it is opened, and a hardened-runtime app would also need the
 dylib signed with its own Team ID. Neither meets the no-provisional-write
 requirement, so Objective-C and Swift dylibs stay unsupported. Not run: arm64
 macOS, which is expected to be stricter, not looser.
+
+## 2026-11-14: Objective-C dylibs
+
+Problem: after the spike above ruled out letting dyld load the dylib, the user
+asked for narrow Objective-C and Swift support; this entry covers
+Objective-C. libobjc registers images from dyld's notifications, and this
+image is part of the executable.
+
+Change: the parser records `__objc_imageinfo`, `__objc_selrefs`,
+`__objc_classlist`, `__objc_nlclslist`, `__objc_catlist`, `__objc_nlcatlist`,
+`__objc_protolist` and `__objc_protorefs`. After rebases and binds, while the
+data segments are writable, the generated loader calls only public libobjc
+functions:
+1. Selector references are uniqued with `sel_registerName`.
+2. Protocols reuse a registered one of the same name or are rebuilt with
+   `objc_allocateProtocol`, `protocol_addProtocol`,
+   `protocol_addMethodDescription` and `objc_registerProtocol`; protocol lists
+   and references are repointed. Class protocol lists are remapped by name in
+   libobjc.
+3. Classes are read superclass-first with `objc_readClassPair`, the public
+   entry point for images dyld did not load; a superclass from another image
+   is realized first with a message send.
+4. Categories attach methods with `class_replaceMethod` and protocols with
+   `class_addProtocol`.
+5. `+load` methods (classes, then categories) run before the initializers, as
+   dyld orders them.
+
+Method lists are read in both the pointer form (`{SEL, types, IMP}`, selector
+by string) and the relative form (bit 31 of the entry-size word; selector
+through a selector reference). Category properties and class properties are
+not attached.
+
+Verification: the generated loader compiles in the darwindylib
+generated-package test. On the Intel MacBook Pro of the spike entry (macOS
+26.6.2, Apple clang 17.0.0), testdata/darwin_dylib_objc.m was built with
+`xcrun clang -dynamiclib -fobjc-arc -O2 -framework Foundation`, translated
+there by a darwin/amd64 Bao built with Go 1.26.11 (`-sdk` from xcrun), and the
+consumer cross-built here ran natively with `[11 2 101 7 6 1 1]`: +load in the
+class and a category, a category method, a subclass through super, protocol
+conformance, a category on NSString, NSClassFromString and Foundation
+formatting. Negative control: without the registration and +load steps the
+consumer crashed (exit 2). Scripts: .work/objc/loop.sh. A CI leg with the
+same control is added to the Darwin suite; arm64 is checked only there.

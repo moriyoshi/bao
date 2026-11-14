@@ -79,3 +79,55 @@ func main() {
 	fmt.Println("PASS: Darwin dylib")
 }
 `
+
+// darwinDylibObjC links testdata/darwin_dylib_objc.m and checks the
+// Objective-C registration; the negative control skips it.
+func (h *harness) darwinDylibObjC(arch, sdk string) {
+	ldarch := map[string]string{"arm64": "arm64", "amd64": "x86_64"}[arch]
+	dylib := filepath.Join(h.dst, "objc.dylib")
+	h.run("dylib-objc-link.log", h.dst, nil, "xcrun", "clang", "-dynamiclib", "-fobjc-arc", "-O2", "-arch", ldarch, "-framework", "Foundation", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib_objc.m"))
+	app := filepath.Join(h.dst, "dylib-objc")
+	require(os.Mkdir(app, 0o755))
+	h.run("dylib-objc-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "objc_check", "-o", filepath.Join(app, "native"), dylib)
+	h.module(app, "bao-dylib-objc-check", "")
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(darwinDylibObjCConsumer), 0o644))
+	exe := filepath.Join(h.dst, "dylib-objc-check")
+	h.consumer("dylib-objc-build.log", app, h.goTool, "build", "-o", exe, ".")
+	out, err := h.command("dylib-objc-run.log", h.root, nil, exe)
+	check(err == nil && strings.Contains(string(out), "PASS: Objective-C dylib"), "Objective-C dylib consumer failed: %v\n%s", err, out)
+	negative := filepath.Join(h.dst, "dylib-objc-negative")
+	copyTree(app, negative)
+	path := filepath.Join(negative, "native", "symbols_darwin_"+arch+".go")
+	code := string(read(path))
+	edit := "dylibObjCRegister(base, dylibObjC)"
+	check(strings.Contains(code, edit), "no Objective-C registration to disable")
+	require(os.WriteFile(path, []byte(strings.Replace(code, edit, "_ = dylibObjC", 1)), 0o644))
+	negativeExe := filepath.Join(h.dst, "dylib-objc-negative")
+	h.consumer("dylib-objc-negative-build.log", negative, h.goTool, "build", "-o", negativeExe, ".")
+	out, err = h.command("dylib-objc-negative-run.log", h.root, nil, negativeExe)
+	check(err != nil || !strings.Contains(string(out), "PASS:"), "Objective-C registration control did not fail: %s", out)
+	h.results["darwin_dylib_objc"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "class with protocol, +load in class and category, category methods, subclass via super, category on NSString, NSClassFromString, Foundation; negative control skips registration"}
+}
+
+const darwinDylibObjCConsumer = `package main
+
+import (
+	"fmt"
+	"os"
+	"unsafe"
+
+	"bao-dylib-objc-check/native"
+	"github.com/ebitengine/purego"
+)
+
+func main() {
+	var out [7]int32
+	purego.SyscallN(native.SymbolAddr0(), uintptr(unsafe.Pointer(&out[0])))
+	got := fmt.Sprint(out)
+	fmt.Println("objc:", got)
+	if got != "[11 2 101 7 6 1 1]" {
+		os.Exit(1)
+	}
+	fmt.Println("PASS: Objective-C dylib")
+}
+`

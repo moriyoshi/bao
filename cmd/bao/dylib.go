@@ -77,6 +77,16 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 		names[i], offsets[i] = e.Name, e.Offset
 	}
 	fmt.Fprintf(src, "\nvar dylibExportNames = [...]string{%s}\nvar dylibExportOffsets = [...]uint64{%s}\n", goList(names, strconv.Quote), goList(offsets, hex))
+	fmt.Fprintf(src, "\nconst dylibImageSize = %#x\n", d.Size)
+	objc := "nil"
+	if o := d.ObjC; o != nil {
+		r := func(x translate.DylibRange) string { return fmt.Sprintf("dylibRange{%#x,%#x}", x.Start, x.End) }
+		objc = fmt.Sprintf("&dylibObjCSections{imageInfo: %#x, selRefs: %s, classes: %s, loadClasses: %s, categories: %s, loadCategories: %s, protocols: %s, protoRefs: %s}", o.ImageInfo, r(o.SelRefs), r(o.Classes), r(o.LoadClasses), r(o.Categories), r(o.LoadCats), r(o.Protocols), r(o.ProtoRefs))
+		src.WriteString(dylibObjCSource)
+	} else {
+		src.WriteString("\ntype dylibObjCSections struct{}\n\nfunc dylibObjCRegister(uintptr, *dylibObjCSections) {}\n\nfunc dylibObjCLoad(uintptr, *dylibObjCSections) {}\n")
+	}
+	fmt.Fprintf(src, "\nvar dylibObjC = %s\n", objc)
 	fmt.Fprintf(src, `
 // dylibTLSTemplate holds the dylib's TLS initializer after its fixups, since
 // a thread-local variable may be initialized with an address.
@@ -128,6 +138,8 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 		*word(b.slot) = uint64(address)
 	}
 	for _, d := range dylibTLVDescriptors { *word(d), *word(d + 8) = uint64(tlsAddress_thunk()), 0 }
+	// libobjc may write the image's selector and protocol references.
+	dylibObjCRegister(base, dylibObjC)
 	for _, s := range dylibDataSegments {
 		if mprotect(base+uintptr(s.start), uintptr(s.end-s.start), s.prot) != 0 { panic("bao: dylib page protection failed") }
 	}
@@ -170,6 +182,8 @@ func dylibSearchPaths(name string) []string {
 func dylibInitialize() {
 	var callConstructor func(uintptr)
 	purego.RegisterFunc(&callConstructor, nativeDylibConstructorCaller())
+	// dyld runs an image's +load methods before its initializers.
+	dylibObjCLoad(dylibImageBase(), dylibObjC)
 	for _, f := range dylibInitializers { callConstructor(dylibImageBase() + uintptr(f)) }
 }
 
@@ -184,3 +198,160 @@ func SharedObjectExport(name string) (uintptr, bool) {
 func SharedObjectExports() []string { return append([]string(nil), dylibExportNames[:]...) }
 `, d.Size, tlsStart, tlsData, tlsEnd, tlsAlign)
 }
+
+// dylibObjCSource registers a dylib's Objective-C metadata with libobjc
+// through its public API, in the order libobjc's own image loading uses:
+// selectors, protocols, classes (superclasses first), categories, then +load.
+const dylibObjCSource = `
+type dylibRange struct{ start, end uint64 }
+
+type dylibObjCSections struct {
+	imageInfo                                                                   uint64
+	selRefs, classes, loadClasses, categories, loadCategories, protocols, protoRefs dylibRange
+}
+
+var dylibObjCRuntime struct {
+	once                                                    bool
+	selRegisterName                                         func(string) uintptr
+	readClassPair                                           func(uintptr, uintptr) uintptr
+	getProtocol, allocateProtocol                           func(string) uintptr
+	addMethodDescription                                    func(uintptr, uintptr, uintptr, bool, bool)
+	addProtocolToProtocol                                   func(uintptr, uintptr)
+	registerProtocol                                        func(uintptr)
+	replaceMethod                                           func(uintptr, uintptr, uintptr, uintptr) uintptr
+	addProtocol                                             func(uintptr, uintptr) bool
+	getClass                                                func(uintptr) uintptr
+	msgSend                                                 func(uintptr, uintptr) uintptr
+	loads                                                   [][2]uintptr // receiver, IMP
+}
+
+func dylibWord(p uintptr) uintptr  { return *(*uintptr)(unsafe.Pointer(p)) }
+func dylibU32(p uintptr) uint32    { return *(*uint32)(unsafe.Pointer(p)) }
+func dylibI32(p uintptr) uintptr   { return uintptr(int64(*(*int32)(unsafe.Pointer(p)))) }
+func dylibString(p uintptr) string {
+	n := 0
+	for *(*byte)(unsafe.Pointer(p + uintptr(n))) != 0 { n++ }
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(p)), n))
+}
+
+// dylibClassRO returns a class's class_ro_t; the data word's low bits are flags.
+func dylibClassRO(cls uintptr) uintptr { return dylibWord(cls+32) & 0x00007ffffffffff8 }
+
+// dylibMethods visits a method_list_t: pointer entries {SEL, types, IMP}, or
+// relative entries {selector reference, types, IMP} when bit 31 of the
+// entry size word is set. Pointer entries name their selector by string.
+func dylibMethods(list uintptr, f func(sel, imp, types uintptr)) {
+	if list == 0 { return }
+	o := &dylibObjCRuntime
+	flags, count := dylibU32(list), uintptr(dylibU32(list+4))
+	size := uintptr(flags & 0xfffc)
+	for i := uintptr(0); i < count; i++ {
+		m := list + 8 + i*size
+		if flags&0x80000000 != 0 {
+			f(dylibWord(m+dylibI32(m)), m+8+dylibI32(m+8), m+4+dylibI32(m+4))
+		} else {
+			f(o.selRegisterName(dylibString(dylibWord(m))), dylibWord(m+16), dylibWord(m+8))
+		}
+	}
+}
+
+func dylibObjCRegister(base uintptr, s *dylibObjCSections) {
+	o := &dylibObjCRuntime
+	libobjc, err := purego.Dlopen("/usr/lib/libobjc.A.dylib", purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	if err != nil { panic(err) }
+	for name, f := range map[string]any{"sel_registerName": &o.selRegisterName, "objc_readClassPair": &o.readClassPair, "objc_getProtocol": &o.getProtocol, "objc_allocateProtocol": &o.allocateProtocol, "protocol_addMethodDescription": &o.addMethodDescription, "protocol_addProtocol": &o.addProtocolToProtocol, "objc_registerProtocol": &o.registerProtocol, "class_replaceMethod": &o.replaceMethod, "class_addProtocol": &o.addProtocol, "object_getClass": &o.getClass, "objc_msgSend": &o.msgSend} {
+		purego.RegisterLibFunc(f, libobjc, name)
+	}
+	each := func(r dylibRange, f func(slot uintptr)) {
+		for off := r.start; off < r.end; off += 8 { f(base + uintptr(off)) }
+	}
+	inImage := func(p uintptr) bool { return p >= base && p < base+dylibImageSize }
+	// Selector references hold method-name strings until uniqued.
+	each(s.selRefs, func(slot uintptr) { *(*uintptr)(unsafe.Pointer(slot)) = o.selRegisterName(dylibString(dylibWord(slot))) })
+	// Protocols: an existing protocol of the same name wins, as in libobjc.
+	protocols := map[uintptr]uintptr{}
+	var protocol func(p uintptr) uintptr
+	protocol = func(p uintptr) uintptr {
+		if !inImage(p) { return p }
+		if r, ok := protocols[p]; ok { return r }
+		name := dylibString(dylibWord(p + 8))
+		if r := o.getProtocol(name); r != 0 {
+			protocols[p] = r
+			return r
+		}
+		r := o.allocateProtocol(name)
+		if r == 0 { panic("bao: Objective-C protocol " + name + " cannot be allocated") }
+		protocols[p] = r
+		if list := dylibWord(p + 16); list != 0 {
+			for i := uintptr(0); i < dylibWord(list); i++ { o.addProtocolToProtocol(r, protocol(dylibWord(list+8+8*i))) }
+		}
+		for i, kind := range [4][2]bool{{true, true}, {true, false}, {false, true}, {false, false}} {
+			dylibMethods(dylibWord(p+24+8*uintptr(i)), func(sel, imp, types uintptr) { o.addMethodDescription(r, sel, types, kind[0], kind[1]) })
+		}
+		o.registerProtocol(r)
+		return r
+	}
+	each(s.protocols, func(slot uintptr) { *(*uintptr)(unsafe.Pointer(slot)) = protocol(dylibWord(slot)) })
+	each(s.protoRefs, func(slot uintptr) { *(*uintptr)(unsafe.Pointer(slot)) = protocol(dylibWord(slot)) })
+	// Classes: superclasses first; a superclass from another image must be
+	// realized, which a message send ensures.
+	loadIMP := func(list uintptr) uintptr {
+		load, imp := o.selRegisterName("load"), uintptr(0)
+		dylibMethods(list, func(sel, i, _ uintptr) {
+			if sel == load { imp = i }
+		})
+		return imp
+	}
+	loads := map[uintptr]uintptr{}
+	each(s.loadClasses, func(slot uintptr) {
+		cls := dylibWord(slot)
+		loads[cls] = loadIMP(dylibWord(dylibClassRO(dylibWord(cls)) + 32))
+	})
+	done := map[uintptr]bool{}
+	var read func(cls uintptr)
+	read = func(cls uintptr) {
+		if done[cls] { return }
+		done[cls] = true
+		if super := dylibWord(cls + 8); super != 0 {
+			if inImage(super) {
+				read(super)
+			} else {
+				o.msgSend(super, o.selRegisterName("self"))
+			}
+		}
+		if o.readClassPair(cls, base+uintptr(s.imageInfo)) != cls {
+			panic("bao: libobjc did not read Objective-C class " + dylibString(dylibWord(dylibClassRO(cls)+24)))
+		}
+		if imp := loads[cls]; imp != 0 { o.loads = append(o.loads, [2]uintptr{cls, imp}) }
+	}
+	each(s.classes, func(slot uintptr) { read(dylibWord(slot)) })
+	// Categories replace and add methods, as attached categories do.
+	isLoadCategory := map[uintptr]bool{}
+	each(s.loadCategories, func(slot uintptr) { isLoadCategory[dylibWord(slot)] = true })
+	each(s.categories, func(slot uintptr) {
+		cat := dylibWord(slot)
+		cls := dylibWord(cat + 8)
+		if cls == 0 { panic("bao: Objective-C category " + dylibString(dylibWord(cat)) + " names an unavailable class") }
+		meta := o.getClass(cls)
+		dylibMethods(dylibWord(cat+16), func(sel, imp, types uintptr) { o.replaceMethod(cls, sel, imp, types) })
+		dylibMethods(dylibWord(cat+24), func(sel, imp, types uintptr) { o.replaceMethod(meta, sel, imp, types) })
+		if list := dylibWord(cat + 32); list != 0 {
+			for i := uintptr(0); i < dylibWord(list); i++ { o.addProtocol(cls, protocol(dylibWord(list+8+8*i))) }
+		}
+		if isLoadCategory[cat] {
+			if imp := loadIMP(dylibWord(cat + 24)); imp != 0 { o.loads = append(o.loads, [2]uintptr{cls, imp}) }
+		}
+	})
+}
+
+// dylibObjCLoad runs +load methods: classes, superclasses first, then categories.
+func dylibObjCLoad(base uintptr, s *dylibObjCSections) {
+	o := &dylibObjCRuntime
+	load := o.selRegisterName("load")
+	for _, l := range o.loads {
+		var call func(uintptr, uintptr)
+		purego.RegisterFunc(&call, l[1])
+		call(l[0], load)
+	}
+}
+`

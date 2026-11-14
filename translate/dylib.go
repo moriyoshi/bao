@@ -38,6 +38,7 @@ type DylibImage struct {
 	Terminators   []uint64
 	EHFrame       DylibRange
 	CompactUnwind DylibRange
+	ObjC          *DylibObjC
 	Unwind        *DylibUnwind
 	Image         []byte `json:"-"`
 }
@@ -129,8 +130,8 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 		return nil, "", fmt.Errorf("unsupported dylib CPU %v/%#x (arm64e is unsupported)", f.Cpu, f.SubCpu)
 	}
 	for _, s := range f.Sections {
-		if strings.HasPrefix(s.Name, "__objc_") || strings.HasPrefix(s.Name, "__swift5_") {
-			return nil, "", fmt.Errorf("Objective-C and Swift dylibs need runtime registration Bao cannot provide (%s,%s)", s.Seg, s.Name)
+		if strings.HasPrefix(s.Name, "__swift5_") {
+			return nil, "", fmt.Errorf("Swift dylibs need runtime registration Bao does not provide yet (%s,%s)", s.Seg, s.Name)
 		}
 	}
 	d := &DylibImage{Arch: arch}
@@ -358,6 +359,13 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 			d.EHFrame = DylibRange{off, off + s.Size}
 		case s.Seg == "__TEXT" && s.Name == "__unwind_info":
 			d.CompactUnwind = DylibRange{off, off + s.Size}
+		case strings.HasPrefix(s.Name, "__objc_"):
+			if d.ObjC == nil {
+				d.ObjC = &DylibObjC{}
+			}
+			if err := d.ObjC.section(s.Name, DylibRange{off, off + s.Size}); err != nil {
+				return nil, "", err
+			}
 		}
 	}
 	for _, target := range append(append([]uint64(nil), d.Initializers...), d.Terminators...) {
@@ -978,4 +986,56 @@ func machoObject(cpu macho.Cpu, sections []anchorSection, symbols []anchorSymbol
 	binary.LittleEndian.PutUint32(out[stroffAt-4:], uint32(len(out)))
 	binary.LittleEndian.PutUint32(out[stroffAt:], uint32(len(strtab)))
 	return append(out, strtab...)
+}
+
+// DylibObjC locates the Objective-C metadata the generated loader registers
+// with libobjc. dyld normally hands an image to libobjc; this image is part of
+// the executable, so the loader uniques selectors, reads classes with the
+// public objc_readClassPair (which exists for images dyld did not load),
+// registers protocols, attaches categories and runs +load itself.
+type DylibObjC struct {
+	ImageInfo   uint64
+	SelRefs     DylibRange
+	Classes     DylibRange // __objc_classlist
+	LoadClasses DylibRange // __objc_nlclslist: classes with +load
+	Categories  DylibRange // __objc_catlist
+	LoadCats    DylibRange // __objc_nlcatlist
+	Protocols   DylibRange // __objc_protolist
+	ProtoRefs   DylibRange
+}
+
+func (o *DylibObjC) section(name string, r DylibRange) error {
+	switch name {
+	case "__objc_imageinfo":
+		if r.End-r.Start < 8 {
+			return fmt.Errorf("short __objc_imageinfo")
+		}
+		o.ImageInfo = r.Start
+		return nil
+	case "__objc_selrefs":
+		o.SelRefs = r
+	case "__objc_classlist":
+		o.Classes = r
+	case "__objc_nlclslist":
+		o.LoadClasses = r
+	case "__objc_catlist", "__objc_catlist2":
+		if o.Categories.End != 0 {
+			return fmt.Errorf("multiple Objective-C category lists are unsupported")
+		}
+		o.Categories = r
+	case "__objc_nlcatlist":
+		o.LoadCats = r
+	case "__objc_protolist":
+		o.Protocols = r
+	case "__objc_protorefs":
+		o.ProtoRefs = r
+	default:
+		// Strings, method lists, class data and references are reached
+		// through the lists above or need no registration.
+		return nil
+	}
+	if (r.End-r.Start)%8 != 0 {
+		return fmt.Errorf("Objective-C list %s is not a pointer array", name)
+	}
+	return nil
 }
