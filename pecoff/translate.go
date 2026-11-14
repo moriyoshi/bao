@@ -66,6 +66,8 @@ type Plan struct {
 	TLSCallbacks, TLSInitializers []Table
 	DataImports                   []DataImport
 	Notices                       map[string]string
+	// DLL is a DLL image the generated package loads at initialization.
+	DLL *DLLImage
 }
 
 //go:embed native/amd64/runtime.bin

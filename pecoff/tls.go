@@ -78,6 +78,14 @@ func (o *object) patchTLSReads(si int, arch string) (int, error) {
 }
 
 func amd64TLSThunk(reg int, helper uint32) section {
+	code, call := amd64TLSThunkCode(reg, false)
+	return section{name: ".text", flags: pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ | 0x500000, size: uint32(len(code)), data: code, relocs: []pe.Reloc{{VirtualAddress: uint32(call + 1), SymbolTableIndex: helper, Type: 4}}}
+}
+
+// amd64TLSThunkCode returns the thunk and the offset of its helper call. An
+// indirect thunk calls through an 8-byte slot after its RET, which the loader
+// of a private DLL image fills: the image may be beyond a rel32 call's reach.
+func amd64TLSThunkCode(reg int, indirect bool) ([]byte, int) {
 	var code []byte
 	regs := []int{0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 	code = append(code, 0x9c) // PUSHFQ
@@ -93,7 +101,11 @@ func amd64TLSThunk(reg int, helper uint32) section {
 		code = append(code, 0xf3, 0x0f, 0x7f, byte(0x44|r<<3), 0x24, byte(32+16*r))
 	}
 	call := len(code)
-	code = append(code, 0xe8, 0, 0, 0, 0)
+	if indirect {
+		code = append(code, 0xff, 0x15, 0, 0, 0, 0) // CALL [RIP+slot]
+	} else {
+		code = append(code, 0xe8, 0, 0, 0, 0)
+	}
 	for i, r := range regs {
 		if r == reg {
 			code = append(code, 0x48, 0x89, 0x45, byte((len(regs)-1-i)*8))
@@ -111,10 +123,25 @@ func amd64TLSThunk(reg int, helper uint32) section {
 		code = append(code, 0x58+byte(r&7))
 	}
 	code = append(code, 0x9d, 0xc3)
-	return section{name: ".text", flags: pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ | 0x500000, size: uint32(len(code)), data: code, relocs: []pe.Reloc{{VirtualAddress: uint32(call + 1), SymbolTableIndex: helper, Type: 4}}}
+	if indirect {
+		for len(code)%8 != 0 {
+			code = append(code, 0xcc)
+		}
+		binary.LittleEndian.PutUint32(code[call+2:], uint32(len(code)-(call+6)))
+		code = append(code, make([]byte, 8)...)
+	}
+	return code, call
 }
 
 func arm64TLSThunk(reg int, helper, back uint32) section {
+	code, call, jump := arm64TLSThunkCode(reg, false)
+	return section{name: ".text", flags: pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ | 0x500000, size: uint32(len(code)), data: code, relocs: []pe.Reloc{{VirtualAddress: uint32(call), SymbolTableIndex: helper, Type: 3}, {VirtualAddress: uint32(jump), SymbolTableIndex: back, Type: 3}}}
+}
+
+// arm64TLSThunkCode returns the thunk, its helper call and its return branch.
+// An indirect thunk loads the helper from an 8-byte literal after the branch
+// into x16, which the thunk saves and restores with x0-x17.
+func arm64TLSThunkCode(reg int, indirect bool) ([]byte, int, int) {
 	var code []byte
 	emit := func(v uint32) { code = binary.LittleEndian.AppendUint32(code, v) }
 	emit(0xd10003ff | 544<<10) // SUB SP, SP, #544
@@ -135,7 +162,12 @@ func arm64TLSThunk(reg int, helper, back uint32) section {
 		emit(0xad0003e0 | uint32(10+i)<<15 | vectors[i+1]<<10 | vectors[i])
 	}
 	call := len(code)
-	emit(0x94000000)
+	if indirect {
+		emit(0x58000010) // LDR X16, slot
+		emit(0xd63f0200) // BLR X16
+	} else {
+		emit(0x94000000)
+	}
 	emit(0xf90003e0 | uint32(reg)<<10) // replace saved destination with helper result
 	for i := 0; i < len(vectors); i += 2 {
 		emit(0xad4003e0 | uint32(10+i)<<15 | vectors[i+1]<<10 | vectors[i])
@@ -149,5 +181,13 @@ func arm64TLSThunk(reg int, helper, back uint32) section {
 	emit(0x910003ff | 544<<10)
 	jump := len(code)
 	emit(0x14000000)
-	return section{name: ".text", flags: pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ | 0x500000, size: uint32(len(code)), data: code, relocs: []pe.Reloc{{VirtualAddress: uint32(call), SymbolTableIndex: helper, Type: 3}, {VirtualAddress: uint32(jump), SymbolTableIndex: back, Type: 3}}}
+	if indirect {
+		if len(code)%8 != 0 {
+			emit(0xd4200000) // BRK #0
+		}
+		literal := binary.LittleEndian.Uint32(code[call:]) | uint32((len(code)-call)/4)<<5
+		binary.LittleEndian.PutUint32(code[call:], literal)
+		code = append(code, make([]byte, 8)...)
+	}
+	return code, call, jump
 }

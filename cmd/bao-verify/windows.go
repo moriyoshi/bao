@@ -143,6 +143,7 @@ func (h *harness) windows() {
 	check(digest(archive) == archiveHash, "Windows inference modified original archive")
 	h.windowsRust(arch)
 	h.windowsLifecycle(arch)
+	h.windowsDLL(arch)
 	h.results["windows"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "archive_sha256": archiveHash, "bindings": "manifest and DWARF typed scalar ABI; runtime registration integers", "rust_target": rustTarget, "rust": "Cargo no_std staticlib, Win32 import and actual atomic RAII drop", "unwind": "typed C++ throw/catch/rethrow through RAII frames plus native lookup and negative controls"}
 	h.results["status"] = "CHECKED_WITH_LIMITATIONS"
 	fmt.Println("PASS: checked Windows CRT/TLS/exception/lifecycle profile; explicit shutdown and runtime DLL requirements retained")
