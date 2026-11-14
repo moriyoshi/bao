@@ -5211,3 +5211,16 @@ base symbol at offset 0) through the ordinary pipeline for both
 architectures. Whether macOS allows the `__TEXT` data pages to become writable
 is checked only by the macOS CI legs; hardened-runtime binaries are not
 checked.
+
+Follow-up (user request): `@rpath`, `@loader_path` and `@executable_path`
+dependencies. `dlopen` resolves them against its caller's image, which in a
+Go executable has no rpaths, so the loader expands them itself: the dylib's
+code is part of the executable, so `@executable_path` and `@loader_path` name
+the executable's directory (symlinks resolved), as dyld treats the main
+executable; `@rpath` tries the dylib's LC_RPATH entries in order, each
+expanded the same way, and a failed bind lists every path tried. The CI
+fixture links `libdep.dylib` (install name `@rpath/libdep.dylib`) with rpaths
+`@loader_path/missing` then `@executable_path`, and the consumer finds it next
+to itself. A new generated-package test (darwindylib) compiles the loader for
+darwin/arm64 at 40000 table entries; it caught a uintptr/int mismatch in the
+TLS template code that would have failed every dylib consumer's build.

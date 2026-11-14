@@ -1,7 +1,8 @@
 // Fixture for Bao's dylib input: an initializer, a static constructor,
 // thread_local with dynamic initialization and an address initializer across
 // threads, a C++ exception thrown and caught inside the dylib, imports from
-// libSystem and from libz (a separate library), and exported data.
+// libSystem, from libz (a separate library) and from libdep through @rpath,
+// and exported data.
 #include <pthread.h>
 #include <zlib.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@ static const char tls_text[] = "addr";
 static thread_local const char *tls_pointer = tls_text; // fixed-up TLS initializer
 
 extern "C" __attribute__((visibility("default"))) int dylib_value = 7;
+extern "C" int dylib_dep_value(void); // @rpath/libdep.dylib
 
 __attribute__((constructor)) static void attach() { attached++; }
 
@@ -62,5 +64,5 @@ extern "C" __attribute__((visibility("default"))) int dylib_state(void) { return
 extern "C" __attribute__((visibility("default"))) int dylib_format(char *out, int n) {
     std::string s = "v" + std::to_string(dylib_value);
     std::strncpy(out, s.c_str(), n);
-    return getpid() != 0 && zlibVersion()[0] != 0;
+    return getpid() != 0 && zlibVersion()[0] != 0 && dylib_dep_value() == 5;
 }

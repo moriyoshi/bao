@@ -868,6 +868,11 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   `LC_DYLD_INFO` rebase and bind opcodes; lazy binds are bound eagerly. Each
   bind resolves in the library its two-level namespace names, opened with
   `dlopen` by its install name. A missing weak import is null.
+- **Library paths:** the dylib's code is part of the executable, so
+  `@executable_path` and `@loader_path` both name the executable's directory,
+  as dyld treats the main executable. `@rpath` tries the dylib's `LC_RPATH`
+  entries in order, each expanded the same way. The libraries must exist there
+  at run time, for example shipped next to the executable.
 - **TLS:** thread-local variables use Bao's Darwin TLS runtime. The template is
   copied from the fixed-up image, so initializers may hold addresses, and each
   TLV descriptor's thunk is replaced.
@@ -885,8 +890,6 @@ Not supported:
 - arm64e dylibs, Objective-C and Swift images (their runtimes register images
   through dyld), and tagged or multi-start chained fixups.
 - Relocatable code combined with a dylib.
-- Dependencies named with `@rpath`, `@loader_path` or `@executable_path`, which
-  `dlopen` cannot resolve from the executable unless the paths happen to match.
 
 `dladdr` reports the executable for the dylib's code, `__mod_term_func` does not
 run, and weak definitions are not coalesced across images. Making the

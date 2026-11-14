@@ -52,6 +52,7 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 		libraries[path] = i
 	}
 	fmt.Fprintf(src, "\nvar dylibLibraries = [...]string{%s}\n", goList(paths, strconv.Quote))
+	fmt.Fprintf(src, "\nvar dylibRPaths = [...]string{%s}\n", goList(d.RPaths, strconv.Quote))
 	fmt.Fprintf(src, "\nvar dylibBinds = [...]struct{ slot uint64; name string; library int; addend int64; weak bool; self int64 }{%s}\n", goList(d.Binds, func(b translate.DylibBind) string {
 		self, library := int64(-1), -1
 		if b.Library != "" {
@@ -100,8 +101,12 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 	word := func(off uint64) *uint64 { return (*uint64)(unsafe.Pointer(&image[off])) }
 	for _, r := range dylibRebases { *word(r.slot) = uint64(base) + r.target }
 	handles := make([]uintptr, len(dylibLibraries))
-	for i, path := range dylibLibraries {
-		handles[i], _ = purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
+	candidates := make([][]string, len(dylibLibraries))
+	for i, name := range dylibLibraries {
+		candidates[i] = dylibSearchPaths(name)
+		for _, path := range candidates[i] {
+			if handles[i], err = purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL); err == nil { break }
+		}
 	}
 	for _, b := range dylibBinds {
 		var address uintptr
@@ -116,7 +121,7 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 		}
 		if address == 0 && !b.weak {
 			library := "any loaded image"
-			if b.library >= 0 { library = dylibLibraries[b.library] }
+			if b.library >= 0 { library = strings.Join(candidates[b.library], ", ") }
 			panic("bao: dylib import " + b.name + " is unavailable from " + library)
 		}
 		if address != 0 { address = uintptr(int64(address) + b.addend) }
@@ -127,13 +132,38 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 		if mprotect(base+uintptr(s.start), uintptr(s.end-s.start), s.prot) != 0 { panic("bao: dylib page protection failed") }
 	}
 	for _, f := range dylibFDEs { registerFrame(base + uintptr(f)) }
-	n := tlsEnd - tlsStart
+	n := uintptr(tlsEnd - tlsStart)
 	if n == 0 { n = 8 }
 	buffer := make([]byte, n+tlsAlign)
 	offset := (tlsAlign - uintptr(unsafe.Pointer(&buffer[0]))%%tlsAlign) %% tlsAlign
 	dylibTLSTemplate = buffer[offset : offset+n]
 	copy(dylibTLSTemplate, image[tlsStart:tlsData])
 	return uintptr(unsafe.Pointer(&dylibTLSTemplate[0])), n, tlsAlign
+}
+
+// dylibSearchPaths expands a dependency's install name as dyld would for an
+// image of this executable: @executable_path and @loader_path name the
+// executable's directory, and @rpath tries the dylib's LC_RPATH entries in
+// order, each expanded the same way. dlopen itself would resolve them against
+// its caller, which has no rpaths.
+func dylibSearchPaths(name string) []string {
+	dir := ""
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil { exe = real }
+		dir = filepath.Dir(exe)
+	}
+	expand := func(path string) string {
+		for _, prefix := range []string{"@executable_path", "@loader_path"} {
+			if rest, ok := strings.CutPrefix(path, prefix); ok { return dir + rest }
+		}
+		return path
+	}
+	if rest, ok := strings.CutPrefix(name, "@rpath"); ok {
+		var paths []string
+		for _, rpath := range dylibRPaths { paths = append(paths, expand(rpath)+rest) }
+		return paths
+	}
+	return []string{expand(name)}
 }
 
 // dylibInitialize runs the dylib's initializers in order.

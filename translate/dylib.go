@@ -22,9 +22,11 @@ import (
 
 // DylibImage describes a dylib loaded by the generated package.
 type DylibImage struct {
-	Arch          string
-	SHA256        string
-	InstallName   string
+	Arch        string
+	SHA256      string
+	InstallName string
+	// RPaths are the dylib\'s LC_RPATH entries, in order, for @rpath.
+	RPaths        []string
 	Size          uint64
 	Segments      []DylibSegment
 	Rebases       []DylibRebase
@@ -88,6 +90,7 @@ const (
 	lcReexportDylib      = 0x8000001f
 	lcLoadUpwardDylib    = 0x80000023
 	lcIDDylib            = 0xd
+	lcRPath              = 0x8000001c
 	sThreadLocalRegular  = 0x11
 	sThreadLocalZerofill = 0x12
 	sThreadLocalVars     = 0x13
@@ -175,6 +178,17 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 					name = name[:i]
 				}
 				libraries = append(libraries, string(name))
+			}
+		case lcRPath:
+			if len(raw) >= 12 {
+				off := binary.LittleEndian.Uint32(raw[8:])
+				if int(off) < len(raw) {
+					name := raw[off:]
+					if i := bytes.IndexByte(name, 0); i >= 0 {
+						name = name[:i]
+					}
+					d.RPaths = append(d.RPaths, string(name))
+				}
 			}
 		case lcDyldChainedFixups:
 			if chained, err = data(); err != nil {

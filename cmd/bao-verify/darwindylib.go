@@ -12,7 +12,10 @@ import (
 func (h *harness) darwinDylib(arch, sdk string) {
 	ldarch := map[string]string{"arm64": "arm64", "amd64": "x86_64"}[arch]
 	dylib := filepath.Join(h.dst, "fixture.dylib")
-	h.run("dylib-link.log", h.dst, nil, "xcrun", "clang++", "-dynamiclib", "-O2", "-std=c++17", "-arch", ldarch, "-lz", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib.cpp"))
+	// libdep is found through @rpath; the first rpath does not exist, and the
+	// second names the consumer's directory, where libdep sits.
+	h.run("dylib-dep-link.log", h.dst, nil, "xcrun", "clang", "-dynamiclib", "-O2", "-arch", ldarch, "-install_name", "@rpath/libdep.dylib", "-o", filepath.Join(h.dst, "libdep.dylib"), filepath.Join(h.root, "testdata/darwin_dylib_dep.c"))
+	h.run("dylib-link.log", h.dst, nil, "xcrun", "clang++", "-dynamiclib", "-O2", "-std=c++17", "-arch", ldarch, "-lz", "-L"+h.dst, "-ldep", "-Wl,-rpath,@loader_path/missing", "-Wl,-rpath,@executable_path", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib.cpp"))
 	app := filepath.Join(h.dst, "dylib")
 	require(os.Mkdir(app, 0o755))
 	h.run("dylib-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "dylib_threads", "-o", filepath.Join(app, "native"), dylib)
@@ -39,7 +42,7 @@ func (h *harness) darwinDylib(arch, sdk string) {
 		out, err := h.command("dylib-negative-"+kind+"-run.log", h.root, nil, negativeExe)
 		check(err != nil || !strings.Contains(string(out), "PASS:"), "Darwin dylib %s control did not fail: %s", kind, out)
 	}
-	h.results["darwin_dylib"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "initializer, static construction, thread_local across 8 threads, C++ throw/catch inside the dylib, libSystem and libz imports bound by library, an address-initialized thread_local, exported data; negative controls drop FDE registration and TLV descriptors"}
+	h.results["darwin_dylib"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "initializer, static construction, thread_local across 8 threads, C++ throw/catch inside the dylib, libSystem and libz imports bound by library, libdep through @rpath and @executable_path, an address-initialized thread_local, exported data; negative controls drop FDE registration and TLV descriptors"}
 }
 
 const darwinDylibConsumer = `package main
