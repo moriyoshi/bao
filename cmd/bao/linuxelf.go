@@ -25,6 +25,7 @@ func translateELF(args []string, stderr io.Writer) error {
 	fs.Var(&symbols, "symbol", "native external symbol, repeatable")
 	var systemLibraries symbolFlags
 	fs.Var(&systemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
+	maxTextAlignment := fs.Uint64("linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
@@ -43,7 +44,7 @@ func translateELF(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	p, err := linuxelf.TranslateWithOptions(input, *sysroot, symbols, linuxelf.Options{SystemLibraries: systemLibraries})
+	p, err := linuxelf.TranslateWithOptions(input, *sysroot, symbols, linuxelf.Options{SystemLibraries: systemLibraries, MaxTextAlignment: *maxTextAlignment})
 	if err != nil {
 		return err
 	}
@@ -75,6 +76,9 @@ func translateELF(args []string, stderr io.Writer) error {
 		}
 	}
 	complete = true
+	if len(p.CappedTextAlignments) != 0 {
+		fmt.Fprintf(stderr, "linked %d executable sections below their requested alignment; see linux_capped_text_alignments in bao-manifest.json\n", len(p.CappedTextAlignments))
+	}
 	fmt.Fprintf(stderr, "translated Linux %s ELF image: %d TLS descriptors, %d import bindings, %d initializer tables; verify target execution separately\n", p.Arch, p.TLSDescriptors, len(p.Imports), len(p.Constructors))
 	return nil
 }

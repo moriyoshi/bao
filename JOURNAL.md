@@ -4771,3 +4771,78 @@ merged without textual conflicts. On macOS Darwin arm64 with Go 1.27.3,
 `GOTOOLCHAIN=local GOCACHE=/Users/moriyoshi/Source/bao/.work/pr5-integration/gocache go test ./...`
 passed on the resolved working tree. This does not verify native Linux amd64
 execution or the pinned Go 1.26.11 toolchain.
+
+## 2026-11-14: Linux text alignment beyond 4 KiB corrupts Go interface dispatch
+
+Problem: the pythago session reported that a CGO_ENABLED=0 binary linking its
+Bao-generated linux/arm64 CPython package misdispatched interface method calls
+before any explicit native call. In its 25-line repro, `fs.ReadFile(fs.Sub(...))`
+crashed in `fmt.(*pp).printArg` with a garbage type word. In a larger program
+the call landed in `time.Duration.String`. It reproduced with packages from both
+main 6ba2de6 and the arm64-translator-gaps branch.
+
+Investigation (.work/statrepro, .work/textalign):
+- Bisecting the generated init(), returning before TLS configuration, fixups,
+  unwind registration or constructors still crashed. Native code was not
+  writing Go memory; the linked image itself was wrong.
+- The per-site `TypeAssert` records were intact in the file, and a hardware
+  watchpoint on `runtime.emptyTypeAssertCache` never fired.
+- `runtime.text` was 0x11000, but the ELF `.text` section and the first symbol
+  were at 0x14000. The first text section came from libffi's AArch64 `sysv.o`,
+  which is 16 KiB-aligned for `trampoline_code_table` (static trampolines).
+- In Go 1.26.11 `cmd/link/internal/ld/data.go`, `textaddress()` assigns
+  absolute text symbol addresses starting at `-T` (0x11000 on linux/arm64,
+  only 4 KiB-aligned) and sets `runtime.text` to that start. `address()` then
+  rounds the `.text` section's Vaddr up to the largest symbol alignment
+  (0x14000). `R_METHODOFF` and text `R_ADDROFF` are encoded relative to the
+  section Vaddr, but the runtime adds them to `runtime.text`. Every itab built
+  at run time therefore uses method pointers 0x3000 too low. Statically emitted
+  itabs use direct addresses, which is why most calls worked.
+- Minimal reproduction: a C function with `__attribute__((aligned(16384)))`
+  translated with `bao build -target linux/arm64 -sysroot /` and linked into the
+  same `fs.Sub`/`fs.ReadFile` program faulted. With `aligned(4096)` it printed
+  the file. Go assembly cannot request this much alignment, so only host
+  objects reach this path. It has not been reported upstream.
+
+Change: `linuxelf` rejects executable sections aligned beyond 4096 bytes on
+every Linux target (`MaxSafeTextAlignment`), with an error that names the
+section and the opt-in. `-linux-max-text-alignment 4096` (config
+`linux.max_text_alignment`) links them at 4096 bytes and records them in
+`linux_capped_text_alignments` in bao-manifest.json. It also prints a notice and
+reports `BAO-ELF-TEXT-ALIGNMENT-CAPPED` (WARN) in diagnostics, following the
+Windows `-windows-max-data-alignment` precedent. The safe limit assumes Go's
+default `-T`, which is 4 KiB-aligned on the Linux targets; a custom `-T` is
+outside the profile. Darwin's ELF-encoded path goes through the same Go linker
+code and was not changed or checked. Windows code is already limited to 16
+bytes.
+
+Verification. Host: Linux 7.0.0 aarch64, Ubuntu GCC 13.3.0, glibc 2.39. Go
+1.27.4 for Bao, Go 1.26.11 (GOTOOLCHAIN) for consumers. Everything ran natively.
+- `go test ./...` and `go vet ./...` passed. New tests cover the rejection, the
+  cap and its record, sections at or below 4096 and non-executable sections,
+  an unsupported cap value, and the config key.
+- Minimal repro: the default now fails translation with the explanatory error.
+  With the cap the manifest records `.text` 16384 -> 4096, `.text` and
+  `runtime.text` are both 0x11000, and the program prints the file.
+- pythago's package: rebuilt from the recorded inputs (all source and
+  `-link-archive` hashes matched bao-build.json) with this change applied onto
+  arm64-translator-gaps in a scratch worktree, plus the cap. The producer
+  reported 4 TLS descriptors, 551 imports and 2 initializer tables, and capped
+  one `.text` (ld -r merges libffi's 16 KiB section into it). The original
+  repro, with full native init, printed the file through `fs.Sub` on three
+  runs; it crashed with the previous package.
+- Not run: libffi closures (ctypes callbacks) under the cap. On this 4 KiB-page
+  host the trampoline table stays page-aligned in the file, but kernels with
+  16/64 KiB pages are unverified. The Linux cpp/cross suites, Bazel and
+  non-arm64 targets were also not run.
+
+Rebased onto main after PR #5 and PR #6 merged. `linuxelf/translate.go`,
+`linuxelf/translate_test.go` and this journal had additive conflicts; both
+sides were kept. On the linux/arm64 host, `go vet ./...` and `go test ./...`
+passed with Go 1.26.11 and Go 1.27.4. With a CLI built from the rebased tree
+(Go 1.26.11), the 16 KiB repro (.work/textalign/rebased) was rejected without
+the cap and, with `-linux-max-text-alignment 4096`, recorded the capped
+`.text` in bao-manifest.json and printed the file natively on three runs.
+The pythago session separately reported, on the same 4 KiB-page host and
+with this branch before the rebase, that ctypes `CFUNCTYPE` callbacks and libc
+`qsort` with a Python comparator work under the cap; that was not rerun here.
