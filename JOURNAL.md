@@ -5328,3 +5328,21 @@ control: without the registration only the dynamic cast failed
 (`[17 3 0 6 2 1 1]`), isolating the conformance registration. Scripts:
 .work/objc/swift-loop.sh. A CI leg with the same control is added to the
 Darwin suite; arm64 is checked only there.
+
+Follow-ups to the Objective-C entry:
+- Category properties (user request): instance properties go to the class and
+  class properties (present when the image info has
+  OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES, bit 6) to its metaclass, through
+  `class_replaceProperty`, with each attribute string split at commas into
+  one-letter names and values (type encodings contain no commas). Classes' own
+  properties were already realized by `objc_readClassPair`. On the Intel Mac
+  the extended fixture returned `[11 2 101 7 6 1 1 1 1]`, the last two being a
+  readonly category instance property (with its `R` attribute) and a category
+  class property found by `class_getProperty`; without the property step they
+  were `0 0` and the rest unchanged.
+- CI failure on b96b5a6 (darwin-arm64): a C/C++ dylib's package did not
+  compile (`use of untyped nil in variable declaration`): with no Objective-C
+  metadata the generator emitted `var dylibObjC = nil`. The generated-package
+  test only covered a plan with Objective-C sections; a darwindylibc variant
+  without Objective-C or Swift now compiles too, and it fails with the same
+  message when the fix is reverted.

@@ -106,7 +106,7 @@ func (h *harness) darwinDylibObjC(arch, sdk string) {
 	h.consumer("dylib-objc-negative-build.log", negative, h.goTool, "build", "-o", negativeExe, ".")
 	out, err = h.command("dylib-objc-negative-run.log", h.root, nil, negativeExe)
 	check(err != nil || !strings.Contains(string(out), "PASS:"), "Objective-C registration control did not fail: %s", out)
-	h.results["darwin_dylib_objc"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "class with protocol, +load in class and category, category methods, subclass via super, category on NSString, NSClassFromString, Foundation; negative control skips registration"}
+	h.results["darwin_dylib_objc"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "class with protocol, +load in class and category, category methods, subclass via super, category on NSString, NSClassFromString, Foundation, category instance and class properties; negative control skips registration"}
 }
 
 const darwinDylibObjCConsumer = `package main
@@ -121,11 +121,11 @@ import (
 )
 
 func main() {
-	var out [7]int32
+	var out [9]int32
 	purego.SyscallN(native.SymbolAddr0(), uintptr(unsafe.Pointer(&out[0])))
 	got := fmt.Sprint(out)
 	fmt.Println("objc:", got)
-	if got != "[11 2 101 7 6 1 1]" {
+	if got != "[11 2 101 7 6 1 1 1 1]" {
 		os.Exit(1)
 	}
 	fmt.Println("PASS: Objective-C dylib")
@@ -174,7 +174,7 @@ import (
 )
 
 func main() {
-	var out [7]int32
+	var out [9]int32
 	purego.SyscallN(native.SymbolAddr0(), uintptr(unsafe.Pointer(&out[0])))
 	got := fmt.Sprint(out)
 	fmt.Println("swift:", got)

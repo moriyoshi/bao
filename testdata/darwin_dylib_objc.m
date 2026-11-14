@@ -2,6 +2,7 @@
 // +load in a class and a category, a subclass calling super, a category on a
 // Foundation class, lookup by name and Foundation calls.
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 
 @protocol BaoGreeter
 - (int)greet;
@@ -27,6 +28,8 @@ static int loaded;
 @end
 
 @interface BaoCounter (Twice)
+@property(nonatomic, readonly) int doubled;
+@property(class, nonatomic, readonly) int instances;
 - (int)incrementTwice;
 @end
 
@@ -36,6 +39,8 @@ static int loaded;
     [self increment];
     return [self increment];
 }
+- (int)doubled { return self.count * 2; }
++ (int)instances { return 1; }
 @end
 
 @interface BaoChild : BaoCounter
@@ -54,7 +59,8 @@ static int loaded;
 @end
 
 // out: +load count, category method, subclass via super, protocol method,
-// category on NSString, lookup by name, Foundation formatting.
+// category on NSString, lookup by name, Foundation formatting, and the
+// category's instance and class properties as runtime metadata.
 __attribute__((visibility("default"))) void objc_check(int *out) {
     @autoreleasepool {
         BaoCounter *c = [BaoCounter shared];
@@ -65,5 +71,8 @@ __attribute__((visibility("default"))) void objc_check(int *out) {
         out[4] = [@"abc" baoLength];
         out[5] = NSClassFromString(@"BaoChild") == [BaoChild class];
         out[6] = [[NSString stringWithFormat:@"%d-%@", 42, @"x"] isEqualToString:@"42-x"];
+        objc_property_t doubled = class_getProperty([BaoCounter class], "doubled");
+        out[7] = doubled && strchr(property_getAttributes(doubled), 'R') != NULL;
+        out[8] = class_getProperty(object_getClass([BaoCounter class]), "instances") != NULL;
     }
 }

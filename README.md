@@ -889,8 +889,8 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   existing one of the same name), reads classes superclass-first with
   `objc_readClassPair`, attaches categories' methods and protocols
   (`class_replaceMethod`, `class_addProtocol`), and runs `+load` before the
-  initializers. Categories on other images' classes work. Category properties
-  and class properties are not attached.
+  initializers. Categories on other images' classes work, and their instance
+  and class properties are attached with `class_replaceProperty`.
 - **Swift:** the loader passes the image's protocol, conformance and type
   records (`__swift5_protos`, `__swift5_proto`, `__swift5_types`) to
   libswiftCore's `swift_registerProtocols`,

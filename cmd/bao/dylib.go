@@ -78,7 +78,7 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 	}
 	fmt.Fprintf(src, "\nvar dylibExportNames = [...]string{%s}\nvar dylibExportOffsets = [...]uint64{%s}\n", goList(names, strconv.Quote), goList(offsets, hex))
 	fmt.Fprintf(src, "\nconst dylibImageSize = %#x\n", d.Size)
-	objc := "nil"
+	objc := "(*dylibObjCSections)(nil)"
 	if o := d.ObjC; o != nil {
 		r := func(x translate.DylibRange) string { return fmt.Sprintf("dylibRange{%#x,%#x}", x.Start, x.End) }
 		objc = fmt.Sprintf("&dylibObjCSections{imageInfo: %#x, selRefs: %s, classes: %s, loadClasses: %s, categories: %s, loadCategories: %s, protocols: %s, protoRefs: %s}", o.ImageInfo, r(o.SelRefs), r(o.Classes), r(o.LoadClasses), r(o.Categories), r(o.LoadCats), r(o.Protocols), r(o.ProtoRefs))
@@ -232,6 +232,7 @@ var dylibObjCRuntime struct {
 	addProtocolToProtocol                                   func(uintptr, uintptr)
 	registerProtocol                                        func(uintptr)
 	replaceMethod                                           func(uintptr, uintptr, uintptr, uintptr) uintptr
+	replaceProperty                                         func(uintptr, uintptr, uintptr, uint32)
 	addProtocol                                             func(uintptr, uintptr) bool
 	getClass                                                func(uintptr) uintptr
 	msgSend                                                 func(uintptr, uintptr) uintptr
@@ -272,7 +273,7 @@ func dylibObjCRegister(base uintptr, s *dylibObjCSections) {
 	o := &dylibObjCRuntime
 	libobjc, err := purego.Dlopen("/usr/lib/libobjc.A.dylib", purego.RTLD_NOW|purego.RTLD_GLOBAL)
 	if err != nil { panic(err) }
-	for name, f := range map[string]any{"sel_registerName": &o.selRegisterName, "objc_readClassPair": &o.readClassPair, "objc_getProtocol": &o.getProtocol, "objc_allocateProtocol": &o.allocateProtocol, "protocol_addMethodDescription": &o.addMethodDescription, "protocol_addProtocol": &o.addProtocolToProtocol, "objc_registerProtocol": &o.registerProtocol, "class_replaceMethod": &o.replaceMethod, "class_addProtocol": &o.addProtocol, "object_getClass": &o.getClass, "objc_msgSend": &o.msgSend} {
+	for name, f := range map[string]any{"sel_registerName": &o.selRegisterName, "objc_readClassPair": &o.readClassPair, "objc_getProtocol": &o.getProtocol, "objc_allocateProtocol": &o.allocateProtocol, "protocol_addMethodDescription": &o.addMethodDescription, "protocol_addProtocol": &o.addProtocolToProtocol, "objc_registerProtocol": &o.registerProtocol, "class_replaceMethod": &o.replaceMethod, "class_replaceProperty": &o.replaceProperty, "class_addProtocol": &o.addProtocol, "object_getClass": &o.getClass, "objc_msgSend": &o.msgSend} {
 		purego.RegisterLibFunc(f, libobjc, name)
 	}
 	each := func(r dylibRange, f func(slot uintptr)) {
@@ -338,6 +339,33 @@ func dylibObjCRegister(base uintptr, s *dylibObjCSections) {
 		if imp := loads[cls]; imp != 0 { o.loads = append(o.loads, [2]uintptr{cls, imp}) }
 	}
 	each(s.classes, func(slot uintptr) { read(dylibWord(slot)) })
+	// Category properties: property_list_t entries are {name, attributes}. An
+	// attribute string such as T@"NSString",&,N,V_name is comma-separated
+	// one-letter names, each followed by its value; type encodings contain no
+	// commas. class_replaceProperty copies what it is given.
+	properties := func(cls, list uintptr) {
+		if list == 0 { return }
+		size, count := uintptr(dylibU32(list)&0xffff), uintptr(dylibU32(list+4))
+		for i := uintptr(0); i < count; i++ {
+			p := list + 8 + i*size
+			var keep [][]byte
+			var pairs []uintptr
+			for _, attr := range strings.Split(dylibString(dylibWord(p+8)), ",") {
+				if attr == "" { continue }
+				name, value := append([]byte(attr[:1]), 0), append([]byte(attr[1:]), 0)
+				keep = append(keep, name, value)
+				pairs = append(pairs, uintptr(unsafe.Pointer(&name[0])), uintptr(unsafe.Pointer(&value[0])))
+			}
+			var array uintptr
+			if len(pairs) != 0 { array = uintptr(unsafe.Pointer(&pairs[0])) }
+			o.replaceProperty(cls, dylibWord(p), array, uint32(len(pairs)/2))
+			runtime.KeepAlive(keep)
+			runtime.KeepAlive(pairs)
+		}
+	}
+	// Category class properties exist when the image info says so
+	// (OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES).
+	classProperties := s.imageInfo != 0 && dylibU32(base+uintptr(s.imageInfo)+4)&(1<<6) != 0
 	// Categories replace and add methods, as attached categories do.
 	isLoadCategory := map[uintptr]bool{}
 	each(s.loadCategories, func(slot uintptr) { isLoadCategory[dylibWord(slot)] = true })
@@ -351,6 +379,8 @@ func dylibObjCRegister(base uintptr, s *dylibObjCSections) {
 		if list := dylibWord(cat + 32); list != 0 {
 			for i := uintptr(0); i < dylibWord(list); i++ { o.addProtocol(cls, protocol(dylibWord(list+8+8*i))) }
 		}
+		properties(cls, dylibWord(cat+40))
+		if classProperties { properties(meta, dylibWord(cat+48)) }
 		if isLoadCategory[cat] {
 			if imp := loadIMP(dylibWord(cat + 24)); imp != 0 { o.loads = append(o.loads, [2]uintptr{cls, imp}) }
 		}

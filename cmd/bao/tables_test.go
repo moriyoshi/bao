@@ -136,6 +136,12 @@ func generatedPackages() []generatedPackage {
 	packages = append(packages, generatedPackage{"darwindylib", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
 		return darwinSource(syntheticDylibPlan(n), "darwindylib", []string{"answer"}, nil, true)
 	}})
+	// A C/C++ dylib has no Objective-C or Swift metadata.
+	packages = append(packages, generatedPackage{"darwindylibc", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
+		p := syntheticDylibPlan(n)
+		p.Dylib.ObjC, p.Dylib.Swift = nil, nil
+		return darwinSource(p, "darwindylibc", []string{"answer"}, nil, true)
+	}})
 	packages = append(packages, generatedPackage{"darwin", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
 		return darwinSource(syntheticDarwinPlan(n), "darwin", []string{"answer"}, nil, true)
 	}})
