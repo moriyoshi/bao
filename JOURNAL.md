@@ -5371,3 +5371,19 @@ arm64. The Swift leg failed only in its consumer: widening the Objective-C
 consumer to 9 slots had also widened the Swift one, so the expected 7 values
 did not match `[17 3 1 6 2 1 1 0 0]`. The first 7 values, all Swift checks of
 that commit, were correct on arm64.
+
+Dynamic replacements and accessible functions (user question): libswiftCore
+enables an image's `__swift5_replace` record (flags, scope count, relative
+pointers to scopes) by enabling each scope, the operation the exported
+`swift_enableDynamicReplacementScope` performs under the runtime's lock; the
+loader now does that. Opaque-result replacements (`__swift5_replac2`) go into
+a runtime-private table, and accessible functions (`__swift5_acfuncs`, only
+for distributed actors) are found by `swift_findAccessibleFunction` only in
+sections dyld registered; neither has an exported registration, so both stay
+rejected. Check on the Intel Mac: `BaoSwiftBase` gained `public dynamic func
+greeting()` (returns 1) and `callGreeting()`, which calls it from inside that
+framework; the fixture adds `@_dynamicReplacement(for: greeting())` returning
+42. The consumer read 42 through `callGreeting()`, so the replacement held
+process-wide; without enabling the scopes it read 1, the rest unchanged.
+Helper functions the Swift step uses are now emitted for every dylib, and a
+generated-package variant without Objective-C image info compiles.

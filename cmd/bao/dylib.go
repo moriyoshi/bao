@@ -78,6 +78,7 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 	}
 	fmt.Fprintf(src, "\nvar dylibExportNames = [...]string{%s}\nvar dylibExportOffsets = [...]uint64{%s}\n", goList(names, strconv.Quote), goList(offsets, hex))
 	fmt.Fprintf(src, "\nconst dylibImageSize = %#x\n", d.Size)
+	src.WriteString(dylibHelpersSource)
 	objc := "(*dylibObjCSections)(nil)"
 	if o := d.ObjC; o != nil {
 		r := func(x translate.DylibRange) string { return fmt.Sprintf("dylibRange{%#x,%#x}", x.Start, x.End) }
@@ -87,11 +88,11 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 		src.WriteString("\ntype dylibObjCSections struct{}\n\nfunc dylibObjCRegister(uintptr, *dylibObjCSections) {}\n\nfunc dylibObjCLoad(uintptr, *dylibObjCSections) {}\n")
 	}
 	fmt.Fprintf(src, "\nvar dylibObjC = %s\n", objc)
-	swift := "[...][2]dylibRange{}"
+	swift := "[...][2]dylibRange{{}, {}, {}, {}}"
 	if w := d.Swift; w != nil {
 		r := func(x translate.DylibRange) string { return fmt.Sprintf("{%#x,%#x}", x.Start, x.End) }
 		// protocols, conformances, type metadata (__swift5_types, __swift5_types2)
-		swift = fmt.Sprintf("[...][2]dylibRange{{%s, {}}, {%s, {}}, {%s, %s}}", r(w.Protocols), r(w.Conformances), r(w.Types), r(w.Types2))
+		swift = fmt.Sprintf("[...][2]dylibRange{{%s, {}}, {%s, {}}, {%s, %s}, {%s, {}}}", r(w.Protocols), r(w.Conformances), r(w.Types), r(w.Types2), r(w.Replacements))
 	}
 	if d.ObjC == nil {
 		src.WriteString("\ntype dylibRange struct{ start, end uint64 }\n")
@@ -239,14 +240,6 @@ var dylibObjCRuntime struct {
 	loads                                                   [][2]uintptr // receiver, IMP
 }
 
-func dylibWord(p uintptr) uintptr  { return *(*uintptr)(unsafe.Pointer(p)) }
-func dylibU32(p uintptr) uint32    { return *(*uint32)(unsafe.Pointer(p)) }
-func dylibI32(p uintptr) uintptr   { return uintptr(int64(*(*int32)(unsafe.Pointer(p)))) }
-func dylibString(p uintptr) string {
-	n := 0
-	for *(*byte)(unsafe.Pointer(p + uintptr(n))) != 0 { n++ }
-	return string(unsafe.Slice((*byte)(unsafe.Pointer(p)), n))
-}
 
 // dylibClassRO returns a class's class_ro_t; the data word's low bits are flags.
 func dylibClassRO(cls uintptr) uintptr { return dylibWord(cls+32) & 0x00007ffffffffff8 }
@@ -419,5 +412,30 @@ func dylibSwiftRegister(base uintptr) {
 			if r.end > r.start { register(base+uintptr(r.start), base+uintptr(r.end)) }
 		}
 	}
+	// Automatic dynamic replacements, as dyld's image callback enables them.
+	if r := dylibSwift[3][0]; r.end > r.start {
+		var enable func(uintptr)
+		purego.RegisterLibFunc(&enable, lib, "swift_enableDynamicReplacementScope")
+		for p := base + uintptr(r.start); p+8 <= base+uintptr(r.end); {
+			n := uintptr(dylibU32(p + 4))
+			for i := uintptr(0); i < n; i++ {
+				field := p + 8 + 4*i
+				enable(field + dylibI32(field))
+			}
+			p += 8 + 4*n
+		}
+	}
+}
+`
+
+// dylibHelpersSource reads the image's metadata in place.
+const dylibHelpersSource = `
+func dylibWord(p uintptr) uintptr { return *(*uintptr)(unsafe.Pointer(p)) }
+func dylibU32(p uintptr) uint32   { return *(*uint32)(unsafe.Pointer(p)) }
+func dylibI32(p uintptr) uintptr  { return uintptr(int64(*(*int32)(unsafe.Pointer(p)))) }
+func dylibString(p uintptr) string {
+	n := 0
+	for *(*byte)(unsafe.Pointer(p + uintptr(n))) != 0 { n++ }
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(p)), n))
 }
 `

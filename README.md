@@ -898,10 +898,14 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   after the Objective-C step (Swift classes are Objective-C classes there).
   Dynamic casts to protocols, generics, enums, errors, actors, NSObject
   subclasses with `@objc` members, and subclasses of classes from resilient
-  frameworks (Objective-C class stubs) work. Dynamic
-  replacements (`__swift5_replace`) and accessible functions
-  (`__swift5_acfuncs`) are rejected, and runtime lookups that scan every image's
-  reflection sections by name do not see this one.
+  frameworks (Objective-C class stubs) work. Automatic dynamic replacements
+  (`@_dynamicReplacement`, `__swift5_replace`) are enabled with
+  `swift_enableDynamicReplacementScope`, including replacements of functions in
+  other images. Replacements of functions with opaque result types
+  (`__swift5_replac2`) and distributed actors' accessible functions
+  (`__swift5_acfuncs`) are rejected: libswiftCore registers them only from
+  dyld's image callback. Runtime lookups that scan every image's reflection
+  sections by name do not see this one.
 - **Exports:** `SharedObjectExport(name)`, `SharedObjectExports()` and
   `-symbol` accessors return the image's addresses.
 

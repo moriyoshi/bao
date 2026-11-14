@@ -3,7 +3,8 @@
 // enum, collections, a thrown Swift error, a type name, an NSObject subclass
 // with @objc methods, a generic class, an actor, and a subclass of a class
 // from a resilient framework (JSONEncoder), and an NSObject subclass from a
-// resilient framework, which needs Objective-C class stubs.
+// resilient framework, which needs Objective-C class stubs, and a dynamic
+// replacement of a function in that framework.
 import BaoSwiftBase
 import Foundation
 
@@ -62,6 +63,9 @@ final class Derived: Base {
     override func value() -> Int { super.value() + 6 }
 }
 
+@_dynamicReplacement(for: greeting())
+func replacedGreeting() -> Int { 42 }
+
 func counted() -> Int {
     let done = DispatchSemaphore(value: 0)
     let result = UnsafeMutablePointer<Int>.allocate(capacity: 1)
@@ -81,7 +85,8 @@ func counted() -> Int {
 // type name length, dictionary count, caught error, enum description length,
 // an @objc method, the class found and answering through the Objective-C
 // runtime, a generic class, an actor, the JSONEncoder subclass's output, and
-// the stub-backed subclass's override plus 10 when found by name.
+// the stub-backed subclass's override plus 10 when found by name, and the
+// base framework's call to its dynamic function, which this dylib replaces.
 @_cdecl("swift_check")
 public func swiftCheck(_ out: UnsafeMutablePointer<Int32>) {
     let shapes: [Shape] = [Square(side: 3), Box(4)]
@@ -108,4 +113,5 @@ public func swiftCheck(_ out: UnsafeMutablePointer<Int32>) {
     // Looked up by name before any Swift use initializes its metadata.
     let named = NSClassFromString("BaoSwift.Derived") != nil
     out[12] = Int32(Derived().value()) + (named ? 10 : 0)
+    out[13] = Int32(callGreeting())
 }

@@ -132,7 +132,10 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 	}
 	for _, s := range f.Sections {
 		switch s.Name {
-		case "__swift5_replace", "__swift5_replac2", "__swift5_acfuncs":
+		case "__swift5_replac2", "__swift5_acfuncs":
+			// Opaque-result replacements and distributed-actor accessible
+			// functions are registered only from dyld's image callback;
+			// libswiftCore exports no entry point for them.
 			return nil, "", fmt.Errorf("Swift %s needs dyld image registration, which a dylib inside the executable lacks", s.Name)
 		}
 	}
@@ -361,7 +364,7 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 			d.EHFrame = DylibRange{off, off + s.Size}
 		case s.Seg == "__TEXT" && s.Name == "__unwind_info":
 			d.CompactUnwind = DylibRange{off, off + s.Size}
-		case s.Name == "__swift5_protos" || s.Name == "__swift5_proto" || s.Name == "__swift5_types" || s.Name == "__swift5_types2":
+		case s.Name == "__swift5_protos" || s.Name == "__swift5_proto" || s.Name == "__swift5_types" || s.Name == "__swift5_types2" || s.Name == "__swift5_replace":
 			if d.Swift == nil {
 				d.Swift = &DylibSwift{}
 			}
@@ -373,6 +376,8 @@ func parseDylib(input []byte, symbols []string) (*DylibImage, string, error) {
 				d.Swift.Conformances = r
 			case "__swift5_types":
 				d.Swift.Types = r
+			case "__swift5_replace":
+				d.Swift.Replacements = r
 			default:
 				d.Swift.Types2 = r
 			}
@@ -1064,4 +1069,8 @@ func (o *DylibObjC) section(name string, r DylibRange) error {
 // every image's reflection sections by name do not see this image.
 type DylibSwift struct {
 	Protocols, Conformances, Types, Types2 DylibRange
+	// Replacements holds automatic dynamic-replacement records:
+	// {flags, scope count, relative pointers to scopes}. Each scope is
+	// enabled with the exported swift_enableDynamicReplacementScope.
+	Replacements DylibRange
 }
