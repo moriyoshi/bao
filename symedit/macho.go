@@ -22,6 +22,9 @@ const (
 	lcLinkerHints = 0x2e
 	nlistSize     = 16
 	cpuARM64      = 0x0100000c
+	cpuARM        = 12
+	// N_ARM_THUMB_DEF marks a 32-bit ARM symbol that names Thumb code.
+	nArmThumbDef = 0x0008
 
 	nStab    = 0xe0
 	nPext    = 0x10
@@ -42,6 +45,10 @@ const (
 	indirectAbs    = 0x40000000
 	relocExtern    = 1 << 27
 	relocSymbolMax = 1 << 24
+	relocScattered = 1 << 31
+	// GENERIC_RELOC_PAIR and ARM_RELOC_PAIR hold the other half of a pair,
+	// not a section.
+	relocPair = 1
 	// ARM64_RELOC_ADDEND stores an addend where others store a section.
 	arm64RelocAddend = 10
 )
@@ -152,7 +159,51 @@ func (s machoSymbol) rebind(bind elf.SymBind) (byte, uint16) {
 	return typ, desc
 }
 
+// machoLayout locates the fields that differ between 64-bit and 32-bit
+// objects: the header size, the segment command and its section headers,
+// and nlist entries with 64- or 32-bit values.
+type machoLayout struct {
+	is32 bool
+	// header is the mach_header size, segment the segment command and
+	// segHeader its fixed part, section a section header and nlist a
+	// symbol table entry.
+	header, segment, segHeader, section, nlist int
+}
+
+var (
+	macho64 = machoLayout{header: machoHeader64, segment: lcSegment64, segHeader: 72, section: 80, nlist: nlistSize}
+	macho32 = machoLayout{is32: true, header: 28, segment: 0x1, segHeader: 56, section: 68, nlist: 12}
+)
+
+// nsectsAt is the offset of a segment command's section count.
+func (l machoLayout) nsectsAt() int { return l.segHeader - 8 }
+
+// sectionFields reads a section header: addr and size, then the offsets of
+// reloff, nreloc, flags, reserved1 and reserved2.
+func (l machoLayout) sectionFields(h []byte) (addr, size uint64, at int) {
+	if l.is32 {
+		return uint64(le.Uint32(h[32:])), uint64(le.Uint32(h[36:])), 48
+	}
+	return le.Uint64(h[32:]), le.Uint64(h[40:]), 56
+}
+
+func (l machoLayout) value(e []byte) uint64 {
+	if l.is32 {
+		return uint64(le.Uint32(e[8:]))
+	}
+	return le.Uint64(e[8:])
+}
+
+func (l machoLayout) putValue(e []byte, v uint64) {
+	if l.is32 {
+		le.PutUint32(e[8:], uint32(v))
+	} else {
+		le.PutUint64(e[8:], v)
+	}
+}
+
 type machoFile struct {
+	machoLayout
 	data     []byte
 	cputype  uint32
 	sections []machoSection
@@ -173,18 +224,22 @@ func isMachO(data []byte) bool {
 }
 
 func parseMachO(data []byte) (*machoFile, error) {
-	if len(data) < machoHeader64 || le.Uint32(data) != machoMagic64 {
-		return nil, errors.New("only 64-bit little-endian Mach-O objects are supported; split a universal file with lipo first")
+	layout := macho64
+	switch {
+	case len(data) >= 28 && le.Uint32(data) == 0xfeedface:
+		layout = macho32
+	case len(data) < machoHeader64 || le.Uint32(data) != machoMagic64:
+		return nil, errors.New("only little-endian Mach-O objects and universal files of them are supported")
 	}
 	if le.Uint32(data[12:]) != mhObject {
 		return nil, errors.New("not a Mach-O relocatable object")
 	}
 	ncmds, sizeofcmds := le.Uint32(data[16:]), le.Uint32(data[20:])
-	if uint64(sizeofcmds) > uint64(len(data)-machoHeader64) {
+	if uint64(sizeofcmds) > uint64(len(data)-layout.header) {
 		return nil, errors.New("Mach-O load commands are out of range")
 	}
-	f := &machoFile{data: data, cputype: le.Uint32(data[4:])}
-	off, end := machoHeader64, machoHeader64+int(sizeofcmds)
+	f := &machoFile{machoLayout: layout, data: data, cputype: le.Uint32(data[4:])}
+	off, end := layout.header, layout.header+int(sizeofcmds)
 	for i := uint32(0); i < ncmds; i++ {
 		if end-off < 8 {
 			return nil, errors.New("Mach-O load commands are out of range")
@@ -195,20 +250,21 @@ func parseMachO(data []byte) (*machoFile, error) {
 		}
 		c := data[off : off+size]
 		switch cmd {
-		case lcSegment64:
-			if size < 72 {
+		case uint32(layout.segment):
+			if size < layout.segHeader {
 				return nil, errors.New("short Mach-O segment command")
 			}
-			n := int(le.Uint32(c[64:]))
-			if n > (size-72)/80 {
+			n := int(le.Uint32(c[layout.nsectsAt():]))
+			if n > (size-layout.segHeader)/layout.section {
 				return nil, errors.New("Mach-O segment sections are out of range")
 			}
 			for j := 0; j < n; j++ {
-				h := c[72+80*j:]
+				h := c[layout.segHeader+layout.section*j:]
+				addr, sz, at := layout.sectionFields(h)
 				s := machoSection{
 					sectname: strings.TrimRight(string(h[:16]), "\x00"), segname: strings.TrimRight(string(h[16:32]), "\x00"),
-					addr: le.Uint64(h[32:]), size: le.Uint64(h[40:]), reloff: le.Uint32(h[56:]), nreloc: le.Uint32(h[60:]), flags: le.Uint32(h[64:]),
-					reserved1: le.Uint32(h[68:]), reserved2: le.Uint32(h[72:]), header: off + 72 + 80*j,
+					addr: addr, size: sz, reloff: le.Uint32(h[at:]), nreloc: le.Uint32(h[at+4:]), flags: le.Uint32(h[at+8:]),
+					reserved1: le.Uint32(h[at+12:]), reserved2: le.Uint32(h[at+16:]), header: off + layout.segHeader + layout.section*j,
 				}
 				if uint64(s.reloff)+8*uint64(s.nreloc) > uint64(len(data)) {
 					return nil, fmt.Errorf("Mach-O section %s,%s relocations are out of range", s.segname, s.sectname)
@@ -242,13 +298,13 @@ func parseMachO(data []byte) (*machoFile, error) {
 	}
 	symoff, nsyms := uint64(le.Uint32(data[f.symtab+8:])), uint64(le.Uint32(data[f.symtab+12:]))
 	stroff, strsize := uint64(le.Uint32(data[f.symtab+16:])), uint64(le.Uint32(data[f.symtab+20:]))
-	if symoff+nsyms*nlistSize > uint64(len(data)) || stroff+strsize > uint64(len(data)) {
+	if symoff+nsyms*uint64(layout.nlist) > uint64(len(data)) || stroff+strsize > uint64(len(data)) {
 		return nil, errors.New("Mach-O symbol table is out of range")
 	}
 	strtab := data[stroff : stroff+strsize]
 	f.symbols = make([]machoSymbol, nsyms)
 	for i := range f.symbols {
-		e := data[symoff+uint64(i)*nlistSize:]
+		e := data[symoff+uint64(i)*uint64(layout.nlist):]
 		strx := le.Uint32(e)
 		name := ""
 		if strx != 0 {
@@ -261,7 +317,7 @@ func parseMachO(data []byte) (*machoFile, error) {
 			}
 			name = string(strtab[strx : int(strx)+end])
 		}
-		f.symbols[i] = machoSymbol{name: name, typ: e[4], sect: e[5], desc: le.Uint16(e[6:]), value: le.Uint64(e[8:])}
+		f.symbols[i] = machoSymbol{name: name, typ: e[4], sect: e[5], desc: le.Uint16(e[6:]), value: layout.value(e)}
 	}
 	if f.dysymtab != 0 {
 		d := data[f.dysymtab:]
@@ -321,12 +377,32 @@ func (f *machoFile) relocations(out []byte, fn func(s machoSection, off int) err
 		}
 		for i := uint32(0); i < s.nreloc; i++ {
 			off := int(s.reloff) + 8*int(i)
-			// Scattered relocations exist only in 32-bit objects.
-			if le.Uint32(out[off:])&0x80000000 != 0 {
-				return errors.New("scattered Mach-O relocations are unsupported")
+			// Scattered relocations, in 32-bit objects, name an address
+			// rather than a symbol or section; see scattered.
+			if le.Uint32(out[off:])&relocScattered != 0 {
+				continue
 			}
 			if err := fn(s, off+4); err != nil {
 				return err
+			}
+		}
+	}
+	return nil
+}
+
+// scattered calls fn with the target address of each scattered relocation
+// in the sections that are kept.
+func (f *machoFile) scattered(fn func(s machoSection, addr uint64) error) error {
+	for k, s := range f.sections {
+		if f.ordinals != nil && f.ordinals[k+1] == 0 {
+			continue
+		}
+		for i := uint32(0); i < s.nreloc; i++ {
+			off := int(s.reloff) + 8*int(i)
+			if le.Uint32(f.data[off:])&relocScattered != 0 {
+				if err := fn(s, uint64(le.Uint32(f.data[off+4:]))); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -393,7 +469,7 @@ func (s machoSymbol) sectionOf() int {
 // sectionReference returns the input section ordinal that a non-extern
 // relocation word names, or 0 for an absolute one or an ARM64 addend.
 func (f *machoFile) sectionReference(word uint32) int {
-	if word&relocExtern != 0 || f.cputype == cpuARM64 && word>>28 == arm64RelocAddend {
+	if word&relocExtern != 0 || f.cputype == cpuARM64 && word>>28 == arm64RelocAddend || f.is32 && word>>28 == relocPair {
 		return 0
 	}
 	return int(word & (relocSymbolMax - 1))
@@ -529,6 +605,29 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
+	// A scattered relocation names an address. The linker finds the atom
+	// there by its symbol, which therefore stays, and it cannot point into
+	// a removed section.
+	targets := map[uint64]bool{}
+	err = f.scattered(func(s machoSection, addr uint64) error {
+		for k, t := range f.sections {
+			if f.removed(k+1) && addr >= t.addr && addr-t.addr < t.size {
+				return fmt.Errorf("cannot remove Mach-O section %s: a kept scattered relocation in %s refers to it", t.name(), s.name())
+			}
+		}
+		targets[addr] = true
+		return nil
+	})
+	if err != nil {
+		return objectResult{}, err
+	}
+	if len(targets) > 0 {
+		for i, sym := range f.symbols {
+			if sym.typ&nType == nSect && !sym.stab() && targets[sym.value] {
+				referenced[i] = true
+			}
+		}
+	}
 	indirect := f.indirect(out)
 	for i := 0; i+4 <= len(indirect); i += 4 {
 		if f.droppedIndirect != nil && f.droppedIndirect[i/4] {
@@ -567,7 +666,11 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 				return objectResult{}, fmt.Errorf("not stripping symbol %s because a relocation or indirect symbol names it, or it is marked no-dead-strip", name)
 			}
 			removed[i] = true
-		case e.StripUnneeded && !kept && !s.stab() && !s.common() && (local || s.undefined()):
+		// 32-bit code reaches local functions through section-relative
+		// relocations, which give only an address, and each defined symbol
+		// starts an atom; ld64 -r fails on an atom left without one. So
+		// -strip-unneeded keeps 32-bit section symbols.
+		case e.StripUnneeded && !kept && !s.stab() && !s.common() && (local || s.undefined()) && !(f.is32 && s.typ&nType == nSect):
 			removed[i] = true
 		}
 		if removed[i] {
@@ -634,6 +737,10 @@ func (f *machoFile) addSymbols(symbols *[]machoSymbol, adds []AddedSymbol) ([]st
 				return nil, fmt.Errorf("cannot add symbol %s at %s, whose section is removed", a.Name, a.Symbol)
 			}
 			s.typ, s.sect, s.value = t.typ&nType, t.sect, t.value+a.Value
+			// An alias of a Thumb function must be called in Thumb mode.
+			if f.cputype == cpuARM && a.Value == 0 {
+				s.desc |= t.desc & nArmThumbDef
+			}
 		}
 		if a.Section != "" {
 			k := 0
@@ -647,6 +754,9 @@ func (f *machoFile) addSymbols(symbols *[]machoSymbol, adds []AddedSymbol) ([]st
 				return nil, fmt.Errorf("cannot add symbol %s to missing Mach-O section %s; name it SEGMENT,SECTION", a.Name, a.Section)
 			}
 			s.typ, s.sect, s.value = nSect, byte(k), f.sections[k-1].addr+a.Value
+		}
+		if f.is32 && s.value > 0xffffffff {
+			return nil, fmt.Errorf("cannot add symbol %s: 32-bit Mach-O symbol values have 32 bits", a.Name)
 		}
 		switch a.Bind {
 		case elf.STB_WEAK:
@@ -793,7 +903,8 @@ func (f *machoFile) compactIndirect(out []byte) {
 	le.PutUint32(out[f.dysymtab+60:], uint32(kept))
 	for k, s := range f.sections {
 		if f.ordinals[k+1] != 0 && s.indirect() && int(s.reserved1) <= len(f.droppedIndirect) {
-			le.PutUint32(out[s.header+68:], s.reserved1-before[s.reserved1])
+			_, _, at := f.sectionFields(out[s.header:])
+			le.PutUint32(out[s.header+at+12:], s.reserved1-before[s.reserved1])
 		}
 	}
 }
@@ -804,29 +915,30 @@ func (f *machoFile) compactIndirect(out []byte) {
 // commands after a segment move up and the space they leave is zeroed.
 func (f *machoFile) compactSections(out []byte) {
 	ncmds, sizeofcmds := le.Uint32(out[16:]), int(le.Uint32(out[20:]))
-	cmds := out[machoHeader64 : machoHeader64+sizeofcmds]
+	cmds := out[f.header : f.header+sizeofcmds]
 	packed := make([]byte, 0, len(cmds))
 	ordinal := 0
 	for i, off := uint32(0), 0; i < ncmds; i++ {
 		c := cmds[off : off+int(le.Uint32(cmds[off+4:]))]
 		off += len(c)
-		if le.Uint32(c) != lcSegment64 {
+		if le.Uint32(c) != uint32(f.segment) {
 			packed = append(packed, c...)
 			continue
 		}
-		n := int(le.Uint32(c[64:]))
-		seg := append([]byte{}, c[:72]...)
+		hdr, size := f.segHeader, f.section
+		n := int(le.Uint32(c[f.nsectsAt():]))
+		seg := append([]byte{}, c[:hdr]...)
 		kept := 0
 		for j := 0; j < n; j++ {
 			ordinal++
 			if f.ordinals[ordinal] != 0 {
-				seg = append(seg, c[72+80*j:72+80*(j+1)]...)
+				seg = append(seg, c[hdr+size*j:hdr+size*(j+1)]...)
 				kept++
 			}
 		}
-		seg = append(seg, c[72+80*n:]...)
+		seg = append(seg, c[hdr+size*n:]...)
 		le.PutUint32(seg[4:], uint32(len(seg)))
-		le.PutUint32(seg[64:], uint32(kept))
+		le.PutUint32(seg[f.nsectsAt():], uint32(kept))
 		packed = append(packed, seg...)
 	}
 	copy(cmds, packed)
@@ -899,12 +1011,12 @@ func (f *machoFile) rewrite(out *[]byte, symbols []machoSymbol, removed []bool) 
 	oldOff, oldSize := le.Uint32((*out)[f.symtab+16:]), le.Uint32((*out)[f.symtab+20:])
 	strtab := bytes.Clone((*out)[oldOff : oldOff+oldSize])
 	offsets := map[string]uint32{}
-	table := make([]byte, 0, len(order)*nlistSize)
+	table := make([]byte, 0, len(order)*f.nlist)
 	for _, i := range order {
 		s := symbols[i]
-		entry := make([]byte, nlistSize)
+		entry := make([]byte, f.nlist)
 		if i < n {
-			copy(entry, f.data[le.Uint32(f.data[f.symtab+8:])+uint32(i)*nlistSize:])
+			copy(entry, f.data[le.Uint32(f.data[f.symtab+8:])+uint32(i)*uint32(f.nlist):])
 		}
 		if i >= n || s.name != f.symbols[i].name {
 			off, ok := offsets[s.name]
@@ -923,7 +1035,7 @@ func (f *machoFile) rewrite(out *[]byte, symbols []machoSymbol, removed []bool) 
 			entry[5] = byte(f.ordinals[k])
 		}
 		le.PutUint16(entry[6:], s.desc)
-		le.PutUint64(entry[8:], s.value)
+		f.putValue(entry, s.value)
 		table = append(table, entry...)
 	}
 	for len(strtab)%8 != 0 {

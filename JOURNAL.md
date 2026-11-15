@@ -6580,3 +6580,75 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
   - `main` refuses the object ("bigobj COFF objects are unsupported").
   - `bao build -target windows/amd64` of the object, or of a GNU ar archive
     of it, now gives the new errors.
+
+## 2026-11-15: Universal and 32-bit Mach-O in symbol edits
+
+Problem. symedit refused universal (fat) Mach-O files ("split a universal
+file with lipo first") and 32-bit Mach-O objects.
+
+Change.
+- `symedit/fat.go`:
+  - `Edit` and `Defined` accept FAT_MAGIC and FAT_MAGIC_64 files. Each slice,
+    an object or an archive, is edited as if it were alone.
+  - The result keeps the architectures, their order and their alignments,
+    with offsets recomputed.
+  - Java class files share FAT_MAGIC, so a file is taken as universal only
+    with 1 to 31 architectures. A slice past the end of the file and nested
+    universal files are refused.
+- `symedit/macho.go` gains a `machoLayout`, as COFF did for bigobj, covering
+  the 28-byte header, LC_SEGMENT with 68-byte sections, and 12-byte nlist
+  entries with 32-bit values.
+- 32-bit relocations:
+  - Scattered relocations name an address, not a symbol or section. Symbol
+    walks skip them.
+  - A defined symbol at a scattered target counts as referenced, and a
+    scattered target in a removed section is refused.
+  - Non-scattered PAIR relocations (type 1 on i386 and ARM) carry no section
+    ordinal and are not renumbered.
+- On 32-bit ARM, an `@SYMBOL:0` alias copies the target's N_ARM_THUMB_DEF.
+  Without it, ld64 warned "ARM function not 4-byte aligned" for the alias.
+- `-strip-unneeded` keeps 32-bit section symbols.
+  - 32-bit code reaches local functions through section-relative
+    relocations, which give only an address.
+  - Under MH_SUBSECTIONS_VIA_SYMBOLS each defined symbol starts an atom. When
+    keep-global plus strip-unneeded removed localized armv7 functions,
+    `ld -r -arch armv7` failed with "internal error: atom is missing a
+    symbolIndex(anon)".
+  - 64-bit code refers to local functions through extern relocations, which
+    bao already counts.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4; Mac: macOS 26.6.2 x86_64,
+Apple clang 17.0.0, ld-1230.1. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. `symedit/macho32_test.go`:
+  - converts the 64-bit fixtures to i386, and four edit kinds (wrap/rename,
+    bindings, section removal, added symbols) give the same symbols,
+    relocations, indirect tables and layout;
+  - checks a scattered relocation: its target refuses `-strip-symbol`, its
+    section cannot be removed, and strip-unneeded keeps 32-bit section
+    symbols;
+  - checks the ARM Thumb alias;
+  - checks universal files with FAT_MAGIC and FAT_MAGIC_64 holding an i386
+    object and an archive. Each slice equals editing it alone, at 4096-byte
+    alignment, and `Defined` unions the slices.
+  - The class-file and truncated-slice refusals are tested too.
+  - `TestMachORejects` now checks the reason for each refusal.
+- Universal, `.work/symfat/mac.sh` on the Mac (log `run1.log`):
+  - `lipo -create` x86_64+arm64 objects and archives, edited with
+    keep-global+strip-unneeded, `__DWARF` removal and an `@Py_Api` alias.
+  - Each slice is byte-identical to editing that architecture alone
+    (`lipo -thin` + `cmp`).
+  - The edited universal files linked for both architectures. x86_64 ran
+    natively and printed `3 9 5 5`; arm64 only linked.
+  - Control: a definition localized in the universal file no longer links.
+- 32-bit, `.work/sym32/r4`:
+  - clang 19.1.7 in bao-cpp-cross:20261108 built i386-apple-macos10.13 and
+    armv7-apple-ios9 objects. Their `__text` carries 2 and 4 scattered
+    relocations.
+  - `__DWARF,*` removal, `-only-section` and `-redefine-sym` match
+    llvm-objcopy (rust-objcopy, LLVM 22), with 8 ok.
+  - bao-only edits (wrap, keep-global, strip-unneeded, an `@` alias) ran, and
+    removing `__TEXT,__text` is refused.
+  - ld-1230.1 cannot link 32-bit executables. `ld -r -arch i386|armv7` read
+    every bao and llvm output without error after the two fixes above (log
+    `mac.log`), with only i386's deprecation warning.
+- `.work/symmacho/run.sh` was rerun on this code: 78 ok, 0 FAIL, as before.
