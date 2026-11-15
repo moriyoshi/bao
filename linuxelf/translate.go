@@ -92,10 +92,10 @@ type Plan struct {
 	CappedTextAlignments []CappedAlignment `json:"linux_capped_text_alignments,omitempty"`
 	// ImportsAboveVersionCap lists, as NAME@OLDEST, the imports with no version
 	// at or below their -linux-max-symbol-version cap; they stay unversioned.
-	ImportsAboveVersionCap []string `json:"linux_imports_above_version_cap,omitempty"`
-	SharedObject         *SharedObject     `json:"shared_object,omitempty"`
-	Artifacts            map[string]string `json:"artifact_sha256"`
-	Objects              [][]byte          `json:"-"`
+	ImportsAboveVersionCap []string          `json:"linux_imports_above_version_cap,omitempty"`
+	SharedObject           *SharedObject     `json:"shared_object,omitempty"`
+	Artifacts              map[string]string `json:"artifact_sha256"`
+	Objects                [][]byte          `json:"-"`
 }
 
 func (p *Plan) Runtime(name string) string { return p.Namespace + name }
@@ -333,6 +333,12 @@ type Options struct {
 	// relocatable input that may reference its exports. A shared object can
 	// also be the input itself.
 	SharedObject []byte
+	// SharedObjectWrap redirects the shared object's imports of each symbol
+	// to the relocatable input's __wrap_SYMBOL, as ld.lld --wrap does, so
+	// the input can interpose them. The input's own __real_SYMBOL, which
+	// the build's -wrap renames to SYMBOL, binds the system symbol with
+	// the version the shared object requires.
+	SharedObjectWrap []string
 	// MaxSymbolVersions caps the symbol version an import binds, one name
 	// per namespace, such as GLIBC_2.17: the glibc the inputs were built
 	// for. Without a cap an import binds its library's default version.
@@ -377,6 +383,9 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 		}
 		glue, err := parse(input)
 		if err != nil {
+			return nil, err
+		}
+		if err := so.wrapImports(opts.SharedObjectWrap, glue); err != nil {
 			return nil, err
 		}
 		// The shared object's sections come first, so its constructors run

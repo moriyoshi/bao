@@ -422,3 +422,58 @@ func TestPPC64DirectCallsIntoImageRejected(t *testing.T) {
 		t.Fatalf("direct call into the image accepted: %v", err)
 	}
 }
+
+// -wrap redirects the shared object's imports to the input's wrapper.
+func TestWrapSharedObjectImports(t *testing.T) {
+	imported := func(d *delinked) map[string]bool {
+		out := map[string]bool{}
+		for _, s := range d.m.symbols {
+			if s.sect == 0 && s.name != "" && elf.ST_BIND(s.info) != elf.STB_LOCAL {
+				out[s.name] = true
+			}
+		}
+		return out
+	}
+	d, err := delink(soFixture{}.build(), "t_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !imported(d)["puts"] {
+		t.Fatalf("fixture imports %v, not puts", imported(d))
+	}
+	glue := &image{sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 4, data: make([]byte, 4)}},
+		symbols: []symbol{{}, {name: "__wrap_puts", info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_FUNC), sect: 1, size: 4}}}
+	if err := d.wrapImports([]string{"puts", "not_imported"}, glue); err != nil {
+		t.Fatal(err)
+	}
+	if got := imported(d); got["puts"] || !got["__wrap_puts"] {
+		t.Fatalf("imports after -wrap: %v", got)
+	}
+	if err := d.m.merge(glue); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = delink(soFixture{}.build(), "t_")
+	empty := &image{sections: []section{{}}, symbols: []symbol{{}}}
+	if err := d.wrapImports([]string{"puts"}, empty); err == nil || !strings.Contains(err.Error(), "defines no __wrap_puts") {
+		t.Fatalf("missing wrapper: %v", err)
+	}
+	// An import of __wrap_puts the library already has binds to the same
+	// wrapper.
+	d, _ = delink(soFixture{}.build(), "t_")
+	d.m.symbols = append(d.m.symbols, symbol{name: "__wrap_puts", info: byte(elf.STB_GLOBAL) << 4})
+	if err := d.wrapImports([]string{"puts"}, glue); err != nil {
+		t.Fatal(err)
+	}
+	if got := imported(d); got["puts"] || !got["__wrap_puts"] {
+		t.Fatalf("imports after -wrap: %v", got)
+	}
+	// A library that defines its own __wrap_puts, weak or not, is refused
+	// rather than left to compete with the input's.
+	for _, bind := range []elf.SymBind{elf.STB_GLOBAL, elf.STB_WEAK} {
+		d, _ = delink(soFixture{}.build(), "t_")
+		d.m.symbols = append(d.m.symbols, symbol{name: "__wrap_puts", info: byte(bind)<<4 | byte(elf.STT_FUNC), sect: 1})
+		if err := d.wrapImports([]string{"puts"}, glue); err == nil || !strings.Contains(err.Error(), "the shared object itself defines __wrap_puts") {
+			t.Fatalf("library's own %v wrapper: %v", bind, err)
+		}
+	}
+}

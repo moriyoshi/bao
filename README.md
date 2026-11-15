@@ -1369,6 +1369,28 @@ bao build -target linux/arm64 -sysroot / -symbol glue_run \
   -linux-shared-object libpython3.13.so.1.0 -o ./py libglue.a
 ```
 
+`-wrap SYMBOL` applies to the library's imports too. The library's import of
+`SYMBOL` binds to the input's `__wrap_SYMBOL`, through its GOT and PLT slots.
+The input's `__real_SYMBOL` binds to the system symbol, with the version the
+library was linked against. A dynamic link cannot do this: whatever
+`--wrap` did, ld.so resolves the library's imports by name at run time. Bao
+can because it links the library's image into the package.
+
+- Only imports move. The library's calls to functions it defines itself do
+  not.
+- An import of `__wrap_SYMBOL` that the library already has binds to the same
+  wrapper.
+- Refused: a wrapped symbol that the library imports but the input does not
+  wrap, and a library that defines `__wrap_SYMBOL` itself.
+
+For example, glue that runs the library's threads on its own scheduler:
+
+```sh
+bao build -target linux/arm64 -sysroot / -symbol glue_run \
+  -wrap pthread_create -wrap pthread_join \
+  -linux-shared-object libpython3.13.so.1.0 -o ./py libglue.a
+```
+
 The library's code reaches its data through PC-relative instructions that no
 longer carry relocations, so Bao keeps its whole load image together as one
 4 KiB-aligned executable section in Go's text. Dynamic relocations become
