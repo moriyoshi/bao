@@ -31,6 +31,8 @@ func translateELF(args []string, stderr io.Writer) error {
 	var maxSymbolVersions symbolFlags
 	fs.Var(&maxSymbolVersions, "linux-max-symbol-version", "newest symbol version an import may bind in its namespace, such as GLIBC_2.17; repeatable")
 	sharedObject := fs.String("linux-shared-object", "", "linked PIC shared object to translate with the relocatable input, which may reference its exports")
+	var sharedObjectWrap symbolFlags
+	fs.Var(&sharedObjectWrap, "linux-shared-object-wrap", "redirect the shared object's imports of SYMBOL to the input's __wrap_SYMBOL, as ld.lld --wrap; repeatable")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
@@ -49,7 +51,7 @@ func translateELF(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	opts := linuxelf.Options{SystemLibraries: systemLibraries, MaxTextAlignment: *maxTextAlignment, MaxSymbolVersions: maxSymbolVersions}
+	opts := linuxelf.Options{SystemLibraries: systemLibraries, MaxTextAlignment: *maxTextAlignment, MaxSymbolVersions: maxSymbolVersions, SharedObjectWrap: sharedObjectWrap}
 	if *sharedObject != "" {
 		if opts.SharedObject, err = os.ReadFile(*sharedObject); err != nil {
 			return err

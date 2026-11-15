@@ -925,3 +925,34 @@ func sysrootLibrary(root, name string) string {
 	}
 	return ""
 }
+
+// wrapImports renames the shared object's imports of each wrapped symbol to
+// __wrap_SYMBOL, which the relocatable input must define, as ld.lld --wrap
+// redirects a shared object's references. Its GOT and PLT slots then bind
+// to the input's wrapper. The input's __real_SYMBOL, which the build's
+// -wrap renames to SYMBOL, imports the system symbol with the version this
+// shared object requires.
+func (d *delinked) wrapImports(names []string, input *image) error {
+	if len(names) == 0 {
+		return nil
+	}
+	defined := map[string]bool{}
+	for _, s := range input.symbols {
+		if s.sect != 0 && elf.ST_BIND(s.info) != elf.STB_LOCAL {
+			defined[s.name] = true
+		}
+	}
+	for _, name := range names {
+		for i := range d.m.symbols {
+			s := &d.m.symbols[i]
+			if s.sect != 0 || s.name != name || elf.ST_BIND(s.info) == elf.STB_LOCAL {
+				continue
+			}
+			if !defined["__wrap_"+name] {
+				return fmt.Errorf("-wrap %s: the shared object imports %s, but the input defines no __wrap_%s", name, name, name)
+			}
+			s.name = "__wrap_" + name
+		}
+	}
+	return nil
+}

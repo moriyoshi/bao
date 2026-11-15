@@ -35,13 +35,16 @@ type nativeFlags struct {
 	linuxMaxSymbolVersions            symbolFlags
 	linuxMaxTextAlignment             uint
 	linuxSharedObject                 string
-	config                            string
-	inlineBindings                    []byte
-	diagnostics                       diagnosticFlags
-	diagnosticCommand                 string
-	diagnosticSource                  string
-	windowsCXXRuntime                 string
-	windowsCRT                        string
+	// linuxSharedObjectWrap lists the -wrap symbols, which also apply to
+	// the shared object's imports.
+	linuxSharedObjectWrap []string
+	config                string
+	inlineBindings        []byte
+	diagnostics           diagnosticFlags
+	diagnosticCommand     string
+	diagnosticSource      string
+	windowsCXXRuntime     string
+	windowsCRT            string
 }
 
 func (o *nativeFlags) register(fs *flag.FlagSet) {
@@ -208,6 +211,9 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 		}
 		if o.linuxSharedObject != "" {
 			args = append(args, "-linux-shared-object", o.linuxSharedObject)
+			for _, name := range o.linuxSharedObjectWrap {
+				args = append(args, "-linux-shared-object-wrap", name)
+			}
 		}
 		return translateELF(append(args, "-sysroot", o.sysroot, input), stderr)
 	}
@@ -501,6 +507,7 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		}
 		sharedObject = &linkedInput{Path: o.linuxSharedObject, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}
 		o.linuxSharedObject = snapshot
+		o.linuxSharedObjectWrap = edits.wrap
 	}
 	if archive && !strings.HasPrefix(target.Name, "windows/") || len(linkArchives) > 0 {
 		fmt.Fprintf(stderr, "Combining archive for %s\n", target.Name)

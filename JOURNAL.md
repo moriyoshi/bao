@@ -6812,3 +6812,50 @@ removed, together with its Bazel data entry and the `ci/BUILD.bazel`
 export. `ci/docs-only.sh` is a short classifier that the workflow runs
 directly. The two previous entries describe that test and its macOS fixture
 fix; neither applies any more.
+
+## 2026-11-16: -wrap for a Linux shared object's imports
+
+Problem. pythago runs Python threads on goroutines. With LTO-lowered static
+archives it relinks with `ld.lld -r --wrap=pthread_create` (and join,
+detach, exit), and wants to move to PBS's `libpython3.X.so` via
+`-linux-shared-object`. That path binds the library's imports to the
+system libraries with `dlvsym`, and `-wrap` edited only the relocatable
+inputs, so nothing could interpose the library's own calls.
+
+Decision. Extend `-wrap` instead of adding a rebinding flag. ld.lld's
+`--wrap` also redirects a shared object's references, and pythago already
+relies on its semantics. The user chose this over a general
+`-linux-shared-object-bind SYM=GLUESYM`.
+
+Change.
+- `bao build` passes its `-wrap` names to `translate-elf` as
+  `-linux-shared-object-wrap` (in `linuxelf.Options.SharedObjectWrap`).
+- Before the delinked library merges with the input,
+  `delinked.wrapImports` renames each wrapped undefined import to
+  `__wrap_SYMBOL`.
+  - The library's relocation slots, its PLT and GOT, then bind to the input's
+    definition. No library code changes.
+  - The input's `__real_SYMBOL`, which symedit's wrap already renames to
+    `SYMBOL`, becomes the system import, with the version from the library's
+    verneed (versions are keyed by name).
+  - A wrapped import without a `__wrap_` definition in the input is an
+    error.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. `TestWrapSharedObjectImports`
+  checks the rename of the fixture's `puts` import, that a name the library
+  does not import is ignored, that the merge works, and the error without a
+  wrapper.
+- `.work/sowrap/run.sh` (log `run2.log`):
+  - A real shared library (`demo.c`) starts and joins a thread through its own
+    PLT imports. Glue (`glue.c`) wraps pthread_create and pthread_join,
+    counts the calls and forwards to `__real_`.
+  - Native linux/arm64 (gcc 13.3.0, host glibc 2.39): the consumer printed
+    `result: 42 wrapped calls: 2`.
+  - linux/amd64 (x86_64-linux-gnu-gcc 14.2.0, glibc 2.41 sysroot of
+    bao-cpp-cross:20261108) ran under emulated qemu-x86_64 and printed the
+    same.
+  - The real calls bind `pthread_create#GLIBC_2.34` and
+    `pthread_join#GLIBC_2.34`, the library's requirements.
+  - Controls: `main` builds with the same flags but prints `wrapped calls: 0`;
+    without `-wrap` the glue's `__real_` references do not resolve.
