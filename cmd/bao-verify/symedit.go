@@ -96,6 +96,7 @@ func (h *harness) darwinSectionEdits(dir, object, sdk string) {
 	lib := filepath.Join(dir, "libsection.a")
 	h.run("symedit-ar-libsection.a.log", dir, nil, "xcrun", "ar", "rcs", lib, object)
 	app := filepath.Join(h.dst, "symedit-section-app")
+	require(os.Mkdir(app, 0o755))
 	build := []string{h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "bao_symedit_section", "-symbol", "bao_symedit_alias", "-wildcard"}
 	h.run("symedit-section-producer.log", h.root, nil, append(build, "-remove-section", lib+"=__DWARF,*", "-add-symbol", lib+"="+add, "-o", filepath.Join(app, "native"), lib)...)
 	h.module(app, "bao-symedit-section-check", "")
