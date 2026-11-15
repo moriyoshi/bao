@@ -6740,3 +6740,51 @@ versions, commons and missing weak references.
 Change. The README's paragraph on the cap now explains the three cases: the
 runtime's 2.18 floor, weak imports, and symbols with no older export, where
 defining the wrappers in the inputs restores an older floor. No code changed.
+
+## 2026-11-15: Documentation-only pull requests skip the CI suites
+
+Problem. Every pull request ran all seven CI suites (unit, darwin-arm64,
+darwin-amd64, linux-arm64, linux-amd64, windows-amd64, windows-arm64), docs
+included. #28, which changes only README.md and JOURNAL.md, queued macOS and
+Windows runners for over an hour of checks. The result cache was no help,
+because it is never consulted for `pull_request` events.
+
+Decision.
+- The `main` ruleset requires all seven suite checks. A workflow-level
+  `paths-ignore` would therefore leave them missing and block docs pull
+  requests from merging.
+- A job-level `if` on the matrix job can report a check under the unexpanded
+  job name instead of the suite names.
+- So each suite still starts, but treats a documentation-only pull request
+  like an exact cache hit. Every expensive step already skips on a hit, and
+  the job passes in seconds.
+
+Change.
+- `ci/docs-only.sh` prints `docs_only=true` only for a `pull_request` event
+  whose merge commit (HEAD^2 exists) changes nothing but Markdown outside
+  `testdata` directories, comparing against its first parent, the base
+  branch.
+  - `bindings/testdata/README.md` is under a Bazel `glob(["testdata/**"])`,
+    so it still counts as an input.
+  - No Go code, Bazel rule or CI script reads the other Markdown files;
+    `cmd/bao` only names README.md in help text.
+- In `.github/workflows/ci.yml`:
+  - checkout fetches depth 2 for the merge commit's parents;
+  - a new step runs the script;
+  - the validation step sets `hit=true` when it prints true;
+  - the summary says the suite was skipped as documentation-only.
+- `cmd/bao-release` tests the script (`//ci:docs-only.sh` is now in its
+  data).
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `TestCIDocsOnlyPullRequests` builds real merge commits in which the base
+  has moved on after the branch.
+  - docs_only=true: README.md and JOURNAL.md edits, and a removed AGENTS.md.
+  - docs_only=false: source with docs, Markdown under testdata, a workflow
+    change, and a non-`pull_request` event.
+- actionlint 1.7.7 reports the same findings for the old and new workflow:
+  newer runner labels it does not know, and an SC2016 note on the existing
+  summary line. Nothing is new.
+- Not yet observed in Actions: this pull request changes the workflow, so
+  its own CI runs every suite. A later documentation-only pull request will
+  show the skip.

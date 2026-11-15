@@ -172,3 +172,73 @@ printf '%s\n' "$line"
 		})
 	}
 }
+
+// A pull request is checked out as a merge commit; only changes to Markdown
+// outside testdata make it documentation-only.
+func TestCIDocsOnlyPullRequests(t *testing.T) {
+	script, err := filepath.Abs("../../ci/docs-only.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid",
+		"GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid")
+	for name, c := range map[string]struct {
+		files map[string]string
+		event string
+		want  string
+	}{
+		"journal and README":       {map[string]string{"JOURNAL.md": "x", "examples/README.md": "x"}, "pull_request", "true"},
+		"source":                   {map[string]string{"README.md": "x", "main.go": "x"}, "pull_request", "false"},
+		"Markdown test data":       {map[string]string{"bindings/testdata/README.md": "x"}, "pull_request", "false"},
+		"workflow":                 {map[string]string{".github/workflows/ci.yml": "x"}, "pull_request", "false"},
+		"not a pull request":       {map[string]string{"README.md": "x"}, "workflow_dispatch", "false"},
+		"removed Markdown is docs": {map[string]string{"AGENTS.md": ""}, "pull_request", "true"},
+	} {
+		repo := t.TempDir()
+		git := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", append([]string{"-c", "commit.gpgsign=false"}, args...)...)
+			cmd.Dir, cmd.Env = repo, env
+			if b, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%s: git %v: %v: %s", name, args, err, b)
+			}
+		}
+		write := func(path, data string) {
+			t.Helper()
+			full := filepath.Join(repo, path)
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		git("init", "-q", "-b", "main")
+		for _, path := range []string{"README.md", "AGENTS.md", "main.go"} {
+			write(path, "base")
+		}
+		git("add", "-A")
+		git("commit", "-qm", "base")
+		git("switch", "-q", "-c", "head")
+		for path, data := range c.files {
+			if data == "" {
+				git("rm", "-q", path)
+				continue
+			}
+			write(path, data)
+		}
+		git("add", "-A")
+		git("commit", "-qm", "change")
+		git("switch", "-q", "main")
+		write("other", "advance the base")
+		git("add", "-A")
+		git("commit", "-qm", "base moves on")
+		git("merge", "-q", "--no-ff", "-m", "merge", "head")
+		cmd := exec.Command("bash", script)
+		cmd.Env = append(env, "BAO_CI_ROOT="+repo, "GITHUB_EVENT_NAME="+c.event)
+		b, err := cmd.CombinedOutput()
+		if err != nil || string(b) != "docs_only="+c.want+"\n" {
+			t.Errorf("%s: %q, %v; want docs_only=%s", name, b, err, c.want)
+		}
+	}
+}
