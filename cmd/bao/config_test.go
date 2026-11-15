@@ -32,6 +32,8 @@ func configFlags(t *testing.T, name, body string, args ...string) (*nativeFlags,
 		fs.Bool("locked", false, "")
 		fs.String("ld", "", "")
 		fs.String("min-os", "11.0", "")
+		var edits symbolEditFlags
+		edits.register(fs, "")
 	}
 	if err := fs.Parse(append([]string{"-config", path}, args...)); err != nil {
 		t.Fatal(err)

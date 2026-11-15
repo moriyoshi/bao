@@ -317,6 +317,8 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	fs.Var(&linkArchives, "link-archive", "additional static dependency archive; repeatable, searched for unresolved native references")
 	fs.Var(&linkNotices, "link-notice", "license/notice file for linked native dependencies; repeatable, retained in the generated package")
 	requireStaticRuntime := fs.Bool("require-static-runtime", false, "reject generated imports of standard shared C++/Rust/unwind runtimes; OS libraries remain permitted")
+	var edits symbolEditFlags
+	edits.register(fs, "PATH=PREFIX: prefix the symbols that the input or -link-archive at PATH defines, and references to them from inputs sharing PREFIX; other references keep their names; repeatable")
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
@@ -350,6 +352,9 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	target, archive, err := resolveTarget(o.target, input)
 	if err != nil {
 		return err
+	}
+	if edits.any() && !strings.HasPrefix(target.Name, "linux/") {
+		return usage("-wrap/-redefine-sym/-redefine-syms/-prefix-symbols support only Linux ELF inputs")
 	}
 	if strings.HasPrefix(target.Name, "windows/") && *linker != "" {
 		return usage("Windows COFF archive selection is built in; -ld is unsupported")
@@ -389,6 +394,9 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if sharedInput && len(linkArchives) > 0 {
 		return usage("-link-archive cannot extend a shared-object input; pass relocatable code as the input and the library with -linux-shared-object")
 	}
+	if sharedInput && edits.any() {
+		return usage("symbol edits apply to relocatable inputs, not a linked shared object")
+	}
 	type linkedInput struct {
 		Path     string `json:"path"`
 		SHA256   string `json:"sha256"`
@@ -397,26 +405,36 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	// Link immutable private copies, and record the bytes that those copies
 	// contain. Changes to caller-owned files during a producer invocation cannot
 	// change native inputs after their provenance digests have been recorded.
+	// Symbol edits apply to these copies; recorded digests stay those of the
+	// caller's files, and the edits themselves are recorded beside them.
 	nativeInput := filepath.Join(work, "primary.o")
 	if archive {
 		nativeInput = filepath.Join(work, "primary.a")
 	}
-	if err := writeNew(nativeInput, inputBytes); err != nil {
-		return err
-	}
+	components := []editComponent{{input, inputBytes}}
 	linked := []linkedInput{}
-	dependencies := []string{}
-	for i, path := range linkArchives {
+	for _, path := range linkArchives {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
+		components = append(components, editComponent{path, data})
+		linked = append(linked, linkedInput{Path: path, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))})
+	}
+	symbolEdits, err := edits.applyBuild(components, stderr)
+	if err != nil {
+		return err
+	}
+	if err := writeNew(nativeInput, components[0].data); err != nil {
+		return err
+	}
+	dependencies := []string{}
+	for i, c := range components[1:] {
 		snapshot := filepath.Join(work, fmt.Sprintf("dependency-%d.a", i))
-		if err := writeNew(snapshot, data); err != nil {
+		if err := writeNew(snapshot, c.data); err != nil {
 			return err
 		}
 		dependencies = append(dependencies, snapshot)
-		linked = append(linked, linkedInput{Path: path, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))})
 	}
 	notices := []linkedInput{}
 	noticeBytes := [][]byte{}
@@ -500,7 +518,8 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		SharedObject         *linkedInput        `json:"linux_shared_object,omitempty"`
 		LinkedNotices        []linkedInput       `json:"linked_notices,omitempty"`
 		RequireStaticRuntime bool                `json:"require_static_runtime,omitempty"`
-	}{1, version, target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, notices, *requireStaticRuntime}
+		SymbolEdits          *symbolEditRecord   `json:"symbol_edits,omitempty"`
+	}{1, version, target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, notices, *requireStaticRuntime, symbolEdits}
 	b, err := json.MarshalIndent(provenance, "", "  ")
 	if err != nil {
 		return err

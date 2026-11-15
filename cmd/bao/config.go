@@ -20,17 +20,21 @@ import (
 // buildConfig is the -config file. Every field mirrors a command-line flag.
 // Paths are relative to the file and may use ${VAR}; an unset variable fails.
 type buildConfig struct {
-	Schema               int             `json:"schema"`
-	Target               string          `json:"target"`
-	Package              string          `json:"package"`
-	Input                string          `json:"input"`
-	Symbols              []string        `json:"symbols"`
-	Bindings             json.RawMessage `json:"bindings"`
-	StripDebug           *bool           `json:"strip_debug"`
-	StripBitcode         *bool           `json:"strip_bitcode"`
-	LinkArchives         []string        `json:"link_archives"`
-	LinkNotices          []string        `json:"link_notices"`
-	RequireStaticRuntime *bool           `json:"require_static_runtime"`
+	Schema               int               `json:"schema"`
+	Target               string            `json:"target"`
+	Package              string            `json:"package"`
+	Input                string            `json:"input"`
+	Symbols              []string          `json:"symbols"`
+	Bindings             json.RawMessage   `json:"bindings"`
+	StripDebug           *bool             `json:"strip_debug"`
+	StripBitcode         *bool             `json:"strip_bitcode"`
+	LinkArchives         []string          `json:"link_archives"`
+	LinkNotices          []string          `json:"link_notices"`
+	RequireStaticRuntime *bool             `json:"require_static_runtime"`
+	Wrap                 []string          `json:"wrap"`
+	RedefineSymbols      []string          `json:"redefine_symbols"`
+	RedefineSymbolFiles  []string          `json:"redefine_symbol_files"`
+	PrefixSymbols        map[string]string `json:"prefix_symbols"`
 	Cargo                *struct {
 		ManifestPath string `json:"manifest_path"`
 		Package      string `json:"package"`
@@ -205,6 +209,26 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 		func() error { return setPaths("link-archive", s.LinkArchives...) },
 		func() error { return setPaths("link-notice", s.LinkNotices...) },
 		func() error { return setBool("require-static-runtime", s.RequireStaticRuntime) },
+		func() error { return set("wrap", s.Wrap...) },
+		func() error { return set("redefine-sym", s.RedefineSymbols...) },
+		func() error { return setPaths("redefine-syms", s.RedefineSymbolFiles...) },
+		func() error {
+			// Each key is an input or link archive path; sort for a stable order.
+			paths := make([]string, 0, len(s.PrefixSymbols))
+			for p := range s.PrefixSymbols {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+			specs := make([]string, 0, len(paths))
+			for _, p := range paths {
+				resolved, err := path(p)
+				if err != nil {
+					return err
+				}
+				specs = append(specs, resolved+"="+s.PrefixSymbols[p])
+			}
+			return set("prefix-symbols", specs...)
+		},
 	}
 	// An explicit input means this run is not building the configured crate.
 	if s.Cargo != nil && len(fs.Args()) == 0 && input == "" {

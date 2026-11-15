@@ -625,6 +625,7 @@ bao help build
 | `translate` | Translate an already-combined object; auto-detect Darwin/ELF input |
 | `inspect` | Report Darwin raw-input compatibility or Linux ELF/Windows COFF structure |
 | `bindings` | Infer selected C ABI function types from full native DWARF |
+| `objcopy` | Rename, wrap or prefix symbols in an ELF object or archive; see [symbol edits](#symbol-edits) |
 | `doctor` | Check the full producer toolchain; installs nothing |
 | `targets` | List target names and Rust triples |
 | `sign`, `keygen` | Produce Ed25519 release envelopes and local signing keys |
@@ -683,6 +684,67 @@ Windows COFF member selection happens inside Bao; see the
 `-sysroot`. `-ld` selects a compatible cross linker. Combining Darwin archives
 on another host requires a compatible Apple partial linker; precombined-object
 translation itself needs no native compiler/linker.
+
+### Symbol edits
+
+`bao build` can rename symbols in its Linux ELF inputs before they are
+combined, so a producer needs neither `objcopy` nor a second relinking step.
+The same edits are available on single files as `bao objcopy`. Only
+little-endian ELF64 relocatable objects and archives of them are supported;
+Darwin and Windows targets reject these flags.
+
+| Flag | Effect |
+| --- | --- |
+| `-wrap SYM` | References to `SYM` go to `__wrap_SYM`, and undefined `__real_SYM` becomes `SYM`, with `ld.lld --wrap` semantics |
+| `-redefine-sym OLD=NEW` | Rename every `OLD` symbol, defined or undefined, as `llvm-objcopy --redefine-sym` |
+| `-redefine-syms FILE` | Rename from `OLD NEW` lines; `#` starts a comment, as `llvm-objcopy --redefine-syms` |
+| `-prefix-symbols PATH=PREFIX` | Prefix the symbols that the input or `-link-archive` at `PATH` defines (build only) |
+
+All flags are repeatable. `-wrap` and `-redefine-sym(s)` apply to the input and
+every `-link-archive`, so wrapper glue can live in any of them. Each edit applies
+to input names; a renamed symbol is not edited again.
+
+`-wrap` follows lld rather than GNU ld: when an object both defines and calls
+`SYM`, that call also goes to `__wrap_SYM`. Bao adds an undefined `__wrap_SYM`
+to that object and redirects its runtime relocations. Relocations in debug
+sections keep describing the definition. Redirecting relocations stored in
+LLVM's CREL format is rejected.
+
+`-prefix-symbols` makes a component's definitions private. Only symbols
+defined in that component, and that component's references to them, gain the
+prefix. Other undefined references, such as `malloc` or a `Py*` function from
+another input, keep their names. Inputs that share a prefix form one component,
+so a vendored library and the extension that calls it can share one prefix. A
+wrapped or explicitly renamed symbol is not prefixed. An identity rename such as
+`-redefine-sym PyInit_mod=PyInit_mod` keeps an entry point's name.
+`PATH` must name the same file as the input or a `-link-archive`.
+
+```sh
+# libext1.a calls its vendored libssl.a. Both share one prefix, and the
+# identity rename keeps the entry point that libapp.a calls.
+bao build -target linux/arm64 -symbol app_main \
+  -wrap pthread_create -wrap recv \
+  -link-archive ext1/libext1.a -link-archive ext1/libssl.a \
+  -prefix-symbols ext1/libext1.a=ext1_ -prefix-symbols ext1/libssl.a=ext1_ \
+  -redefine-sym PyInit_ext1=PyInit_ext1 \
+  -o ./native libapp.a
+```
+
+Edits apply to Bao's private copies of the inputs. Symbol and section bytes
+other than the edited names, symbols and relocations are preserved. An edited
+archive is rewritten in GNU format with a new symbol index, because a searched
+archive's index must name the renamed definitions. `bao-build.json` records the
+edits under `symbol_edits`. Its source and link-archive digests stay those of
+the unedited files. `-bindings dwarf` reads the unedited input, so name renamed
+exports with a signature manifest instead.
+
+```sh
+bao objcopy -wrap pthread_create -redefine-syms renames.txt libpython.o libpython-edited.o
+bao objcopy -prefix-symbols ext1_ libvendor.a libvendor-private.a
+```
+
+`bao objcopy` takes one input and a new output, which must not exist.
+`-prefix-symbols PREFIX` there prefixes the input's own definitions.
 
 ### Function bindings and native debug stripping
 
@@ -1494,7 +1556,9 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 
 `bindings` is an inline manifest, a manifest path, or `dwarf`. Other top-level
 keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
-`require_static_runtime` and `cargo` (`manifest_path`, `package`, `offline`,
+`require_static_runtime`, the [symbol edits](#symbol-edits) `wrap`,
+`redefine_symbols` (`OLD=NEW` strings), `redefine_symbol_files` and
+`prefix_symbols` (an object from path to prefix), and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
 `sysroot`, `ld`, `system_libraries`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform

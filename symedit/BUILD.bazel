@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "symedit",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    importpath = "github.com/moriyoshi/bao/symedit",
+    visibility = ["//visibility:public"],
+    deps = ["//ar"],
+)
+
+go_test(
+    name = "symedit_test",
+    srcs = glob(["*_test.go"]),
+    embed = [":symedit"],
+    deps = ["//ar"],
+)
