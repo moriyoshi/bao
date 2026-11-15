@@ -1266,8 +1266,23 @@ per namespace such as `GLIBCXX_3.4.19`, or `"max_symbol_versions"` in the
 `linux` config section). Imports then bind the newest version at or below the
 cap. An import with no such version stays unversioned and is printed, and
 `linux_imports_above_version_cap` in bao-manifest.json lists it. The result
-loads on an older glibc, but fails if that import is bound there. bao's own
-TLS runtime needs `__cxa_thread_atexit_impl`, from glibc 2.18.
+loads on an older glibc, but fails if that import is bound there. Read that
+list before relying on the cap:
+
+- bao's own TLS runtime calls `__cxa_thread_atexit_impl`, from glibc 2.18,
+  the first time a thread uses native TLS, and aborts if it fails. An image
+  that uses native TLS therefore needs glibc 2.18 whatever the cap.
+- An import the inputs declare weak, such as an optional `getentropy` or
+  `sem_clockwait`, is listed too. It is optional only if the code checks it
+  before calling it.
+- Some symbols have no older version because they were never exported
+  before. For example, `stat64`, `fstat64` and `lstat64` became libc exports
+  in glibc 2.33. Before that they were static wrappers in
+  `libc_nonshared.a` around `__xstat64`, `__fxstat64` and `__lxstat64`. An
+  input built against glibc 2.33 or later imports `@GLIBC_2.33`, and no cap
+  can move it older. To keep an older floor, define the wrappers yourself in
+  the inputs, calling the `__*xstat64` functions with the version argument
+  that glibc's pre-2.33 headers define as `_STAT_VER` for the target.
 
 On every Linux target, an executable section aligned beyond 4096 bytes fails
 translation by default. Stock Go's linker starts `runtime.text` at its 4 KiB
