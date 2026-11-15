@@ -22,6 +22,7 @@ type symbolEditFlags struct {
 	globalize, weaken, strip                symbolFlags
 	localizeHidden, stripUnneeded           symbolFlags // build: component paths
 	localizeHiddenAll, stripUnneededAll     bool        // objcopy
+	removeSection, onlySection, addSymbol   symbolFlags
 	wildcard                                bool
 }
 
@@ -42,6 +43,13 @@ func (f *symbolEditFlags) register(fs *flag.FlagSet, scoped bool, prefixUsage st
 	fs.Var(&f.globalize, "globalize-symbol", symbol+": make that definition"+where+" global; repeatable")
 	fs.Var(&f.weaken, "weaken-symbol", symbol+": make that global symbol"+where+" weak; repeatable")
 	fs.Var(&f.strip, "strip-symbol", symbol+": remove that symbol"+where+"; a symbol a relocation names is an error; repeatable")
+	section, add := "SECTION", "NAME=[SECTION:]VALUE[,FLAGS]"
+	if scoped {
+		section, add = "PATH=SECTION", "PATH="+add
+	}
+	fs.Var(&f.removeSection, "remove-section", section+": remove that ELF section"+where+", its relocations and its symbols; repeatable")
+	fs.Var(&f.onlySection, "only-section", section+": keep only the matching ELF sections"+where+" and the symbol and string tables; repeatable")
+	fs.Var(&f.addSymbol, "add-symbol", add+": add an ELF symbol"+where+", as llvm-objcopy --add-symbol; FLAGS are global, local, weak, default, hidden, protected, object, function or notype; repeatable")
 	if scoped {
 		fs.Var(&f.localizeHidden, "localize-hidden", "PATH: make the hidden and internal definitions in the input or -link-archive at PATH local; repeatable")
 		fs.Var(&f.stripUnneeded, "strip-unneeded", "PATH: remove the local and undefined symbols in the input or -link-archive at PATH that no relocation needs; repeatable")
@@ -49,7 +57,7 @@ func (f *symbolEditFlags) register(fs *flag.FlagSet, scoped bool, prefixUsage st
 		fs.BoolVar(&f.localizeHiddenAll, "localize-hidden", false, "make hidden and internal definitions local")
 		fs.BoolVar(&f.stripUnneededAll, "strip-unneeded", false, "remove local and undefined symbols that no relocation needs")
 	}
-	fs.BoolVar(&f.wildcard, "wildcard", false, "treat the names given to the localize, keep-global, globalize, weaken and strip flags as shell patterns; a pattern starting with ! excludes names")
+	fs.BoolVar(&f.wildcard, "wildcard", false, "treat the names given to the localize, keep-global, globalize, weaken, strip and section flags as shell patterns; a pattern starting with ! excludes names")
 }
 
 func (f *symbolEditFlags) any() bool {
@@ -57,7 +65,7 @@ func (f *symbolEditFlags) any() bool {
 }
 
 func (f *symbolEditFlags) visibility() bool {
-	return len(f.localize)+len(f.localizeFiles)+len(f.keepGlobal)+len(f.keepGlobalFiles)+len(f.globalize)+len(f.weaken)+len(f.strip)+len(f.localizeHidden)+len(f.stripUnneeded) > 0 || f.localizeHiddenAll || f.stripUnneededAll
+	return len(f.localize)+len(f.localizeFiles)+len(f.keepGlobal)+len(f.keepGlobalFiles)+len(f.globalize)+len(f.weaken)+len(f.strip)+len(f.localizeHidden)+len(f.stripUnneeded)+len(f.removeSection)+len(f.onlySection)+len(f.addSymbol) > 0 || f.localizeHiddenAll || f.stripUnneededAll
 }
 
 // edits returns the -wrap and -redefine-sym(s) edits, which apply to every input.
@@ -100,8 +108,8 @@ func (f *symbolEditFlags) edits() (symedit.Edits, error) {
 	return e, nil
 }
 
-// visibilitySpec is the binding and strip edits of one component, also its
-// build provenance.
+// visibilitySpec is the binding, strip and section edits of one component,
+// also its build provenance.
 type visibilitySpec struct {
 	Path           string   `json:"path,omitempty"`
 	Localize       []string `json:"localize,omitempty"`
@@ -111,20 +119,31 @@ type visibilitySpec struct {
 	Weaken         []string `json:"weaken,omitempty"`
 	Strip          []string `json:"strip,omitempty"`
 	StripUnneeded  bool     `json:"strip_unneeded,omitempty"`
+	RemoveSection  []string `json:"remove_section,omitempty"`
+	OnlySection    []string `json:"only_section,omitempty"`
+	AddSymbol      []string `json:"add_symbol,omitempty"`
 }
 
-func (s *visibilitySpec) compile(wildcard bool) (symedit.Visibility, error) {
-	v := symedit.Visibility{LocalizeHidden: s.LocalizeHidden, StripUnneeded: s.StripUnneeded}
+// compile returns the component's edits, without the renames and wraps.
+func (s *visibilitySpec) compile(wildcard bool) (symedit.Edits, error) {
+	e := symedit.Edits{Visibility: symedit.Visibility{LocalizeHidden: s.LocalizeHidden, StripUnneeded: s.StripUnneeded}}
 	var err error
 	for _, m := range []struct {
 		into  *symedit.Matcher
 		names []string
-	}{{&v.Localize, s.Localize}, {&v.KeepGlobal, s.KeepGlobal}, {&v.Globalize, s.Globalize}, {&v.Weaken, s.Weaken}, {&v.Strip, s.Strip}} {
+	}{{&e.Localize, s.Localize}, {&e.KeepGlobal, s.KeepGlobal}, {&e.Globalize, s.Globalize}, {&e.Weaken, s.Weaken}, {&e.Strip, s.Strip}, {&e.RemoveSection, s.RemoveSection}, {&e.OnlySection, s.OnlySection}} {
 		if *m.into, err = symedit.NewMatcher(m.names, wildcard); err != nil {
-			return v, usage("%v", err)
+			return e, usage("%v", err)
 		}
 	}
-	return v, nil
+	for _, spec := range s.AddSymbol {
+		a, err := symedit.ParseAddSymbol(spec)
+		if err != nil {
+			return e, usage("%v", err)
+		}
+		e.AddSymbols = append(e.AddSymbols, a)
+	}
+	return e, nil
 }
 
 // visibilitySpecs groups the binding and strip flags by component path; the
@@ -146,6 +165,10 @@ func (f *symbolEditFlags) visibilitySpecs() ([]*visibilitySpec, error) {
 			return "", value, nil
 		}
 		i := strings.LastIndexByte(value, '=')
+		// An added symbol's own NAME=VALUE has one more =.
+		if name == "add-symbol" && i > 0 {
+			i = strings.LastIndexByte(value[:i], '=')
+		}
 		if i <= 0 || i == len(value)-1 {
 			return "", "", usage("-%s %q: expected PATH=VALUE", name, value)
 		}
@@ -164,6 +187,9 @@ func (f *symbolEditFlags) visibilitySpecs() ([]*visibilitySpec, error) {
 		{"globalize-symbol", f.globalize, false, func(s *visibilitySpec) *[]string { return &s.Globalize }},
 		{"weaken-symbol", f.weaken, false, func(s *visibilitySpec) *[]string { return &s.Weaken }},
 		{"strip-symbol", f.strip, false, func(s *visibilitySpec) *[]string { return &s.Strip }},
+		{"remove-section", f.removeSection, false, func(s *visibilitySpec) *[]string { return &s.RemoveSection }},
+		{"only-section", f.onlySection, false, func(s *visibilitySpec) *[]string { return &s.OnlySection }},
+		{"add-symbol", f.addSymbol, false, func(s *visibilitySpec) *[]string { return &s.AddSymbol }},
 	} {
 		for _, value := range flag.values {
 			path, arg, err := split(flag.name, value)
@@ -233,7 +259,7 @@ type prefixRecord struct {
 type buildEdits struct {
 	base       symedit.Edits
 	prefixOf   []string
-	visibility []symedit.Visibility
+	visibility []symedit.Edits
 	rebinds    []bool
 	record     *symbolEditRecord
 }
@@ -249,7 +275,7 @@ func (f *symbolEditFlags) resolveBuild(components []editComponent) (*buildEdits,
 	if err != nil {
 		return nil, err
 	}
-	b := &buildEdits{base: base, prefixOf: make([]string, len(components)), visibility: make([]symedit.Visibility, len(components)), rebinds: make([]bool, len(components))}
+	b := &buildEdits{base: base, prefixOf: make([]string, len(components)), visibility: make([]symedit.Edits, len(components)), rebinds: make([]bool, len(components))}
 	b.record = &symbolEditRecord{Wrap: base.Wrap, Rename: base.Rename, Wildcard: f.wildcard}
 	stats := make([]os.FileInfo, len(components))
 	for i, c := range components {
@@ -299,7 +325,7 @@ func (f *symbolEditFlags) resolveBuild(components []editComponent) (*buildEdits,
 	}
 	owner := make([]string, len(components))
 	for _, s := range specs {
-		matched, err := match("localize/keep-global/globalize/weaken/strip", s.Path)
+		matched, err := match("localize/keep-global/globalize/weaken/strip/section", s.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -316,7 +342,8 @@ func (f *symbolEditFlags) resolveBuild(components []editComponent) (*buildEdits,
 	return b, nil
 }
 
-// changesBindings reports whether component i has binding or strip edits.
+// changesBindings reports whether component i has binding, strip or section
+// edits.
 func (b *buildEdits) changesBindings(i int) bool {
 	return b != nil && b.rebinds[i]
 }
@@ -360,7 +387,8 @@ func (b *buildEdits) apply(components []editComponent, stderr io.Writer) (*symbo
 				e.Rename[from] = to
 			}
 		}
-		e.Visibility = b.visibility[i]
+		c := b.visibility[i]
+		e.Visibility, e.RemoveSection, e.OnlySection, e.AddSymbols = c.Visibility, c.RemoveSection, c.OnlySection, c.AddSymbols
 		edited, n, err := symedit.Edit(components[i].data, e)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", components[i].path, err)
@@ -394,7 +422,8 @@ func objcopy(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if len(specs) == 1 {
-		e.Visibility, _ = specs[0].compile(f.wildcard)
+		c, _ := specs[0].compile(f.wildcard)
+		e.Visibility, e.RemoveSection, e.OnlySection, e.AddSymbols = c.Visibility, c.RemoveSection, c.OnlySection, c.AddSymbols
 	}
 	data, err := os.ReadFile(fs.Arg(0))
 	if err != nil {

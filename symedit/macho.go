@@ -289,6 +289,9 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
+	if e.editsSections() {
+		return objectResult{}, errors.New("section edits and added symbols are supported only for ELF, not Mach-O")
+	}
 	if e.empty() || f.symtab == 0 {
 		return objectResult{data: data}, nil
 	}

@@ -25,9 +25,21 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
-	if e.empty() || f.symtab == 0 {
+	if e.empty() {
 		return objectResult{data: data}, nil
 	}
+	if f.symtab == 0 {
+		if e.editsSections() {
+			return objectResult{}, errors.New("section edits need an ELF symbol table")
+		}
+		return objectResult{data: data}, nil
+	}
+	sectionIndex, err := f.droppedSections(e)
+	if err != nil {
+		return objectResult{}, err
+	}
+	dropped := func(i int) bool { return sectionIndex != nil && i >= 0 && i < len(sectionIndex) && sectionIndex[i] < 0 }
+	xindex := f.xindex()
 	n := len(f.symbols)
 	wrapped := map[string]bool{}
 	for _, name := range e.Wrap {
@@ -82,17 +94,42 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 		}
 		infos[i] = elf.ST_INFO(e.binding(s), elf.ST_TYPE(s.info))
 	}
-	var crel bool
-	for _, s := range f.sections {
-		crel = crel || s.typ == shtCREL && int(s.link) == f.symtab
+	// Symbols that -add-symbol adds follow those a wrap adds.
+	var userAdded []elfSymbol
+	for _, a := range e.AddSymbols {
+		if at, ok := existing[a.Name]; ok && f.symbols[at].defined() {
+			return objectResult{}, fmt.Errorf("cannot add symbol %s, which is already defined", a.Name)
+		}
+		shndx := uint16(elf.SHN_ABS)
+		if a.Section != "" {
+			found := -1
+			for i, s := range f.sections {
+				if i > 0 && s.name == a.Section {
+					found = i
+					break
+				}
+			}
+			if found < 0 || dropped(found) {
+				return objectResult{}, fmt.Errorf("cannot add symbol %s to missing ELF section %s", a.Name, a.Section)
+			}
+			if found >= int(elf.SHN_LORESERVE) {
+				return objectResult{}, fmt.Errorf("cannot add symbol %s to ELF section %d, which needs an extended index", a.Name, found)
+			}
+			shndx = uint16(found)
+		}
+		userAdded = append(userAdded, elfSymbol{name: a.Name, info: elf.ST_INFO(a.Bind, a.Type), other: byte(a.Visibility), shndx: shndx, value: a.Value})
 	}
-	if crel && (len(retarget) > 0 || !e.Visibility.empty()) {
+	var crel bool
+	for i, s := range f.sections {
+		crel = crel || s.typ == shtCREL && int(s.link) == f.symtab && !dropped(i)
+	}
+	if crel && (len(retarget) > 0 || !e.Visibility.empty() || sectionIndex != nil || len(userAdded) > 0) {
 		return objectResult{}, errors.New("CREL relocations are unsupported when redirecting references or changing symbol bindings; build without -Wa,--crel")
 	}
 	out := bytes.Clone(data)
 	relocs := func(fn func(s elfSection, entry []byte) error) error {
 		for i, s := range f.sections {
-			if s.typ != elf.SHT_RELA && s.typ != elf.SHT_REL || int(s.link) != f.symtab {
+			if s.typ != elf.SHT_RELA && s.typ != elf.SHT_REL || int(s.link) != f.symtab || dropped(i) {
 				continue
 			}
 			size := uint64(16)
@@ -131,6 +168,7 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 	if retargeted == 0 {
 		added = nil
 	}
+	added = append(added, userAdded...)
 	// Relocations and group signatures need their symbols.
 	referenced := make([]bool, n+len(added))
 	err = relocs(func(_ elfSection, entry []byte) error {
@@ -144,8 +182,8 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
-	for _, s := range f.sections {
-		if s.typ == elf.SHT_GROUP && int(s.link) == f.symtab && int(s.info) < n {
+	for i, s := range f.sections {
+		if s.typ == elf.SHT_GROUP && int(s.link) == f.symtab && int(s.info) < n && !dropped(i) {
 			referenced[s.info] = true
 		}
 	}
@@ -158,6 +196,15 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 		}
 		local := elf.ST_BIND(infos[i]) == elf.STB_LOCAL
 		switch {
+		case dropped(f.symbolSection(i, xindex)):
+			if referenced[i] {
+				name := s.name
+				if name == "" {
+					name = "the section symbol"
+				}
+				return objectResult{}, fmt.Errorf("cannot remove ELF section %s: a kept relocation or section group names %s, defined in it", f.sections[f.symbolSection(i, xindex)].name, name)
+			}
+			removed[i] = true
 		case s.named() && e.Strip.Match(s.name):
 			if referenced[i] {
 				return objectResult{}, fmt.Errorf("not stripping symbol %s because a relocation or section group names it", s.name)
@@ -176,7 +223,17 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 			hidden = append(hidden, names[i])
 		}
 	}
-	edited := renamed + retargeted + rebound + removedCount
+	droppedCount := 0
+	for i := range f.sections {
+		if dropped(i) {
+			droppedCount++
+		}
+	}
+	for _, a := range userAdded {
+		reorder = reorder || elf.ST_BIND(a.info) == elf.STB_LOCAL
+	}
+	reorder = reorder || droppedCount > 0
+	edited := renamed + retargeted + rebound + removedCount + droppedCount + len(userAdded)
 	if edited == 0 {
 		return objectResult{data: data}, nil
 	}
@@ -216,7 +273,14 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 				return objectResult{}, err
 			}
 			le.PutUint32(entry, off)
-			entry[4] = added[i-n].info
+			a := added[i-n]
+			entry[4], entry[5] = a.info, a.other
+			le.PutUint16(entry[6:], a.shndx)
+			le.PutUint64(entry[8:], a.value)
+		}
+		// Section indices are renumbered when sections go.
+		if shndx := le.Uint16(entry[6:]); sectionIndex != nil && shndx != 0 && shndx < uint16(elf.SHN_LORESERVE) {
+			le.PutUint16(entry[6:], uint16(sectionIndex[shndx]))
 		}
 		entries[i] = entry
 	}
@@ -242,11 +306,16 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 				}
 			}
 		}
-	} else if err := f.reorder(&out, entries, infos, removed, place, header); err != nil {
+	} else if err := f.reorder(&out, entries, removed, sectionIndex, place, header); err != nil {
 		return objectResult{}, err
 	}
 	if len(offsets) > 0 {
 		place(int(symtab.link), strtab, 1)
+	}
+	if sectionIndex != nil {
+		if err := f.compactSections(&out, sectionIndex, place, header); err != nil {
+			return objectResult{}, err
+		}
 	}
 	return objectResult{data: out, edited: edited, hidden: hidden}, nil
 }
@@ -254,7 +323,7 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 // reorder writes a symbol table whose local symbols precede the others, as
 // ELF requires, without the removed ones, and renumbers every reference to a
 // symbol index. entries beyond the input's symbols are added globals.
-func (f *elfFile) reorder(out *[]byte, entries [][]byte, infos []byte, removed []bool, place func(int, []byte, int), header func(int) []byte) error {
+func (f *elfFile) reorder(out *[]byte, entries [][]byte, removed []bool, sectionIndex []int, place func(int, []byte, int), header func(int) []byte) error {
 	n := len(f.symbols)
 	order := []int{0}
 	for pass := 0; pass < 2; pass++ {
@@ -262,7 +331,7 @@ func (f *elfFile) reorder(out *[]byte, entries [][]byte, infos []byte, removed [
 			if i < n && removed[i] {
 				continue
 			}
-			local := i < n && elf.ST_BIND(infos[i]) == elf.STB_LOCAL
+			local := elf.ST_BIND(entries[i][4]) == elf.STB_LOCAL
 			if local == (pass == 0) {
 				order = append(order, i)
 			}
@@ -285,7 +354,7 @@ func (f *elfFile) reorder(out *[]byte, entries [][]byte, infos []byte, removed [
 		return index[old], nil
 	}
 	for i, s := range f.sections {
-		if i == 0 || int(s.link) != f.symtab {
+		if i == 0 || int(s.link) != f.symtab || sectionIndex != nil && sectionIndex[i] < 0 {
 			continue
 		}
 		switch s.typ {
@@ -319,7 +388,11 @@ func (f *elfFile) reorder(out *[]byte, entries [][]byte, infos []byte, removed [
 			table := make([]byte, 4*len(order))
 			for j, k := range order {
 				if k < n {
-					copy(table[4*j:], old[4*k:4*k+4])
+					v := le.Uint32(old[4*k:])
+					if sectionIndex != nil && v != 0 {
+						v = uint32(sectionIndex[v])
+					}
+					le.PutUint32(table[4*j:], v)
 				}
 			}
 			place(i, table, 4)
@@ -407,4 +480,70 @@ func (e Edits) wrapLinked(name string) bool {
 		}
 	}
 	return false
+}
+
+// compactSections rewrites the members of kept section groups and writes a
+// section header table without the removed sections, renumbering links,
+// relocation targets, the section count and the section name table index.
+func (f *elfFile) compactSections(out *[]byte, index []int, place func(int, []byte, int), header func(int) []byte) error {
+	for i, s := range f.sections {
+		if s.typ != elf.SHT_GROUP || index[i] < 0 {
+			continue
+		}
+		h := header(i)
+		off, size := le.Uint64(h[24:]), le.Uint64(h[32:])
+		old := (*out)[off : off+size]
+		members := append([]byte{}, old[:4]...)
+		for o := 4; o+4 <= len(old); o += 4 {
+			if m := int(le.Uint32(old[o:])); m < len(index) && index[m] >= 0 {
+				members = le.AppendUint32(members, uint32(index[m]))
+			}
+		}
+		if len(members) != len(old) {
+			place(i, members, 4)
+		}
+	}
+	var table []byte
+	kept := 0
+	for i, s := range f.sections {
+		if index[i] < 0 {
+			continue
+		}
+		h := bytes.Clone(header(i)[:sectionHeaderSize])
+		if i > 0 && s.link != 0 {
+			if int(s.link) >= len(index) || index[s.link] < 0 {
+				return fmt.Errorf("ELF section %s links to a removed section", s.name)
+			}
+			le.PutUint32(h[40:], uint32(index[s.link]))
+		}
+		if i > 0 && (s.typ == elf.SHT_REL || s.typ == elf.SHT_RELA || s.typ == shtCREL || s.flags&elf.SHF_INFO_LINK != 0) && s.info != 0 {
+			if int(s.info) >= len(index) || index[s.info] < 0 {
+				return fmt.Errorf("ELF section %s applies to a removed section", s.name)
+			}
+			le.PutUint32(h[44:], uint32(index[s.info]))
+		}
+		table = append(table, h...)
+		kept++
+	}
+	// Counts and the name table index past the reserved range live in the
+	// null section header.
+	le.PutUint64(table[32:], 0)
+	le.PutUint32(table[40:], 0)
+	shnum, shstrndx := kept, index[f.shstrndx]
+	if kept >= int(elf.SHN_LORESERVE) {
+		le.PutUint64(table[32:], uint64(kept))
+		shnum = 0
+	}
+	if shstrndx >= int(elf.SHN_LORESERVE) {
+		le.PutUint32(table[40:], uint32(shstrndx))
+		shstrndx = int(elf.SHN_XINDEX)
+	}
+	for len(*out)%8 != 0 {
+		*out = append(*out, 0)
+	}
+	le.PutUint64((*out)[0x28:], uint64(len(*out)))
+	le.PutUint16((*out)[0x3c:], uint16(shnum))
+	le.PutUint16((*out)[0x3e:], uint16(shstrndx))
+	*out = append(*out, table...)
+	return nil
 }
