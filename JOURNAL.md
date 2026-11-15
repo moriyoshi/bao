@@ -6709,3 +6709,34 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
   `.comment` removal, `-redefine-sym`, localize with strip-unneeded and
   `-add-symbol`. Sections, symbols and relocations matched as read by GNU
   readelf 2.42: 24 of 24 (`.work/symwide/parity.log`).
+
+## 2026-11-15: Notes on imports above the Linux version cap
+
+Finding. pythago moved to main with `-linux-max-symbol-version GLIBC_2.17`
+(their report). CPython 3.13 and 3.14t passed natively on linux/arm64 and
+under emulated qemu on linux/amd64, without their earlier workarounds for
+versions, commons and missing weak references.
+`linux_imports_above_version_cap` listed three kinds of import:
+- `__cxa_thread_atexit_impl@GLIBC_2.18`, from bao's own TLS runtime.
+  `linuxelf/native/tls.c` declares it strong and calls it when a thread
+  first uses native TLS, and aborts if the call fails. So 2.18 is the floor
+  for any image that uses native TLS.
+  - The capped consumers inspected for the versioned-import entry
+    (`.work/symver/out`) bind it through a lazy JUMP_SLOT with no BIND_NOW.
+    So such a binary should load on glibc 2.17 and fail at the first native
+    TLS access. That is inferred from the dynamic section; nothing ran on
+    glibc 2.17.
+  - A fallback that relies only on the pthread key destructor when the
+    symbol is absent was discussed but not implemented. Native TLS
+    destructors would then lose their place before other pthread keys'
+    destructors.
+- Weak imports in the inputs: `getentropy@GLIBC_2.25` and
+  `sem_clockwait@GLIBC_2.30`.
+- pythago also reported `stat64`, `fstat64` and `lstat64@GLIBC_2.33` from
+  PBS's sqlite. Before glibc 2.33 these were static wrappers in
+  `libc_nonshared.a` around `__xstat64` and its siblings, so no older
+  version exists to bind. pythago defines the wrappers in its glue.
+
+Change. The README's paragraph on the cap now explains the three cases: the
+runtime's 2.18 floor, weak imports, and symbols with no older export, where
+defining the wrappers in the inputs restores an older floor. No code changed.
