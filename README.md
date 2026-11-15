@@ -714,8 +714,9 @@ to input names; a renamed symbol is not edited again.
 `-wrap` follows lld rather than GNU ld: when an object both defines and calls
 `SYM`, that call also goes to `__wrap_SYM`. Bao adds an undefined `__wrap_SYM`
 to that object and redirects its runtime relocations. Relocations in debug
-sections keep describing the definition. Redirecting relocations stored in
-LLVM's CREL format is rejected.
+sections keep describing the definition. Relocations in LLVM's CREL format
+(`-Wa,--crel`) are decoded, edited like RELA ones, and encoded again as LLVM
+encodes them when they change.
 
 `-prefix-symbols` makes a component's definitions private. Only symbols
 defined in that component, and that component's references to them, gain the
@@ -783,8 +784,8 @@ such as `$x`. Unlike llvm-objcopy, it does not remove debug sections;
 `-strip-debug` does that after binding inference.
 Local symbols must precede the others in ELF. Bao therefore rewrites the symbol
 table and renumbers every relocation, section group, extended section index
-and LLVM address-significance entry. It rejects any other section that refers
-to symbol indices, and CREL relocations.
+and LLVM address-significance entry, in REL, RELA and CREL relocation
+sections. It rejects any other section that refers to symbol indices.
 
 `-wrap` applies to every input of the link. `-keep-global-symbol` and
 `-localize-hidden` therefore leave a wrapped symbol's definition and its

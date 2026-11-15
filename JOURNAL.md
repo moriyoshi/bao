@@ -6472,3 +6472,54 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
     valid, because no kept section covers the dropped entries.
 - The practical use is 32-bit Mach-O (a later item), where such sections are
   normal.
+
+## 2026-11-15: ELF CREL relocations in symbol edits
+
+Problem. ELF objects with CREL relocation sections (SHT_CREL 0x40000014,
+clang `-Wa,--crel,--allow-experimental-crel`) were refused for any edit that
+redirects references, changes bindings, removes sections or adds symbols.
+Such edits renumber or retarget relocation symbol indices, and CREL stores
+them delta-encoded. CREL relocations also did not count as references for
+`-strip-unneeded` and `-strip-symbol`.
+
+Change (`symedit/crel.go`, `symedit/edit.go`).
+- `decodeCREL` follows LLVM's decoder (`llvm/lib/Object/ELF.cpp`) and turns
+  a section into RELA entries. The ULEB128 header holds count*8, 4 for
+  addends, and the shift; each entry has a flags byte with offset bits, then
+  SLEB128 deltas.
+- `encodeCREL` follows `encodeCrel` in `llvm/include/llvm/MC/MCELFExtras.h`:
+  the shift comes from the trailing zeros of 8|offsets, and an offset delta
+  is continued in ULEB128 past the first byte.
+  - Go's `binary.Varint` is zigzag, not SLEB128, so the codec has its own
+    SLEB128 helpers.
+  - A first encoder tested `b&4` for the addend flag. Without addends that
+    bit belongs to the offset, which the round-trip test caught.
+- `editELF` decodes every CREL section linked to the symbol table. Its
+  relocation walks (retargeting, referenced symbols) and `reorder`'s
+  renumbering go through the decoded entries.
+- A section is encoded again and placed at the end of the file only if its
+  entries changed.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestCRELRoundTrip` encodes and decodes 200 random entries with and
+    without addends, and refuses four malformed inputs.
+  - `TestCRELEditsMatchRELA` converts two fixtures' RELA sections to CREL and
+    checks wrap, localize with strip-unneeded, section removal and an added
+    symbol. Decoded relocations and symbols must equal the RELA results.
+- `.work/symcrel/run.sh` (log `run3.log`) ran natively on linux/arm64 in
+  bao-cpp-cross:20261108. clang 19.1.7 built
+  `-Wa,--crel,--allow-experimental-crel` objects, which ld.lld (rust-lld,
+  LLD 22.1.8) linked.
+  - A copy of crel.go (`parity`) re-encoded all 64 relocations of clang's 8
+    CREL sections in vis.o, and the glue's 2, byte for byte. Every
+    bao-edited output passes the same check.
+  - Each edited object linked and ran:
+    - a wrap of strlen printed `3 9 1005 5`;
+    - keep-global with strip-unneeded, `.debug*` removal, and an added symbol
+      printed the unedited `3 9 5 5`.
+  - Each output's decoded relocations (target, offset, type, symbol name,
+    addend) equal those of the same edit on a RELA build of the same source.
+  - `main` refuses `-strip-unneeded` on the CREL object.
+  - `ld.lld -r` preserves CREL, so GNU readelf 2.42 could not be the
+    comparison reader; the parity tool's dump mode was.
