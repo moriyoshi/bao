@@ -6652,3 +6652,60 @@ Apple clang 17.0.0, ld-1230.1. Bazel was not run.
     every bao and llvm output without error after the two fixes above (log
     `mac.log`), with only i386's deprecation warning.
 - `.work/symmacho/run.sh` was rerun on this code: 78 ok, 0 FAIL, as before.
+
+## 2026-11-15: ELF32 and big-endian ELF in symbol edits
+
+Problem. The ELF editor accepted only little-endian ELF64 ("only
+little-endian ELF64 objects are supported"). That excluded i386, armv7,
+powerpc, mips, s390x and aarch64_be objects for `bao objcopy`. No `bao build`
+target uses them.
+
+Decision and change (`symedit/elfwide.go`). The editor reads about fifty
+little-endian ELF64 fields. Instead of threading a byte order and class
+through all of them, a 32-bit or big-endian object is edited through a shadow.
+- The shadow is a little-endian ELF64 file: a 64-byte header, then the whole
+  input, so input offsets map by a constant.
+- Converted copies of the sections the editor reads are appended: the
+  symbol table, REL and RELA (32-bit `r_info` is sym<<8|type), groups,
+  extended section indices and the section header table.
+- After editing, the result keeps the input's header size, and the input's
+  bytes from there on keep their offsets. Sections that the editor rewrote,
+  or that are structural, are appended in the input's form, followed by a new
+  section header table.
+- An unchanged edit returns the input as it is.
+- Refused: MIPS64, whose `r_info` packs three types and a special symbol; CREL
+  in ELF32, which decodes with 32-bit arithmetic; and values that do not fit
+  ELF32 on the way back.
+- The `layout` test helper now reads group words in the file's byte order.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `symedit/elfwide_test.go` converts the ELF64 fixtures to ELF32 LE,
+    ELF32 BE and ELF64 BE. Relocation types keep their low byte for ELF32.
+  - Five edit kinds on two fixtures give the same sections, relocation
+    links, groups, symbols and decoded relocations in each form, and keep the
+    form: wrap/rename, localize with strip-unneeded, keep-global, section
+    removal, and added symbols including `@SYMBOL`.
+  - PROGBITS contents keep their offsets, an unchanged edit returns the input
+    byte for byte, and MIPS64 is refused.
+- `.work/symwide/run.sh` (log `run2.log`) ran in bao-cpp-cross:20261108.
+  - Setup:
+    - clang 19.1.7 built freestanding objects for i686-linux-gnu (ELF32 LE),
+      armv7-linux-gnueabihf `-marm` (ELF32 LE, REL), powerpc-linux-gnu and
+      mips-linux-gnu `-mno-abicalls -G0` (ELF32 BE), and s390x-linux-gnu and
+      aarch64_be-linux-gnu (ELF64 BE), all `-ffunction-sections`.
+    - On lib.o: `-wrap target` (also called inside the object),
+      `-add-symbol api_alias=@api:0,function`, keep-global, strip-unneeded and
+      `.comment` removal. glue.o got `-wrap target`.
+    - ld.lld (rust-lld, LLD 22.1.8) linked each static program, and the
+      matching qemu-user ran it, so execution was emulated.
+  - All six exited 0: the wrapped call gave 1020, and api and its alias 5.
+  - Controls: the unwrapped glue does not link, and `main` refuses every
+    object.
+  - Fixture note: MIPS first segfaulted, and an `ld.lld --wrap` build of the
+    unedited objects segfaulted the same way. That was small-data `$gp`
+    access with no C runtime to set `$gp`; `-G0` fixed both.
+- Against llvm-objcopy (rust-objcopy, LLVM 22) on each target's lib.o:
+  `.comment` removal, `-redefine-sym`, localize with strip-unneeded and
+  `-add-symbol`. Sections, symbols and relocations matched as read by GNU
+  readelf 2.42: 24 of 24 (`.work/symwide/parity.log`).

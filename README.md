@@ -690,13 +690,19 @@ translation itself needs no native compiler/linker.
 `bao build` can rename symbols in its Linux ELF, macOS Mach-O and Windows COFF
 inputs before they are combined, so a producer needs neither `objcopy` nor a
 second relinking step. The same edits are available on single files as
-`bao objcopy`. Supported inputs are little-endian ELF64 relocatable objects,
+`bao objcopy`. Supported inputs are ELF relocatable objects of either class
+and byte order,
 64- and 32-bit little-endian Mach-O objects and universal (fat) files of them,
 amd64/arm64 COFF relocatable objects (regular or bigobj), and archives of all
 of these. Import library members pass through unchanged (see the COFF notes).
 
 `bao objcopy` also handles formats that `bao build` does not translate:
 
+- ELF32 and big-endian ELF objects, such as i386, armv7, powerpc, mips,
+  s390x and aarch64_be. They are edited through an equivalent little-endian
+  ELF64 copy, and every byte the edit does not change keeps its offset.
+  MIPS64, whose relocations pack several types into `r_info`, and CREL
+  relocations in ELF32 objects are refused.
 - COFF bigobj, which `cl /bigobj` and `-Wa,-mbig-obj` write, and which LLVM
   writes for more than 65279 sections. `bao build` says so when given one.
 - Universal Mach-O files, objects or archives. Each slice is edited as if it

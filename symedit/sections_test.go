@@ -3,7 +3,6 @@ package symedit
 import (
 	"bytes"
 	"debug/elf"
-	"encoding/binary"
 	"reflect"
 	"strings"
 	"testing"
@@ -37,7 +36,7 @@ func layout(t *testing.T, data []byte) (sections []string, rela map[string]strin
 		case elf.SHT_GROUP:
 			b, _ := s.Data()
 			for off := 4; off < len(b); off += 4 {
-				group = append(group, f.Sections[binary.LittleEndian.Uint32(b[off:])].Name)
+				group = append(group, f.Sections[f.ByteOrder.Uint32(b[off:])].Name)
 			}
 		}
 	}
