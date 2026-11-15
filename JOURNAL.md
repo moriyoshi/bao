@@ -6064,3 +6064,68 @@ linux-arm64, darwin-amd64, darwin-arm64, windows-amd64 and windows-arm64.
 - The Windows section edit step ran natively and passed in both runs, for
   msvc, clang-cl, clang and mingw on windows-amd64 and for msvc, clang-cl
   and clang on windows-arm64.
+
+## 2026-11-15: COFF import library members in symbol edits
+
+Problem. `symedit` refused any archive with a short import member ("COFF
+short import members are not edited"). That made every symbol edit fail on a
+MinGW or CRT library that mixes static code with DLL imports, including
+`-wrap`, `-prefix-symbols` and binding flags on a `-link-archive`. Bao's
+Windows member selection (`internal/ar`) already treats such members as
+import declarations.
+
+Decision and change (`symedit/coffimport.go`, `symedit/coff.go`):
+- Short import members (IMPORT_OBJECT_HEADER, version 0 or 1) pass through
+  byte-identical.
+  - Their symbols are `__imp_NAME`, plus `NAME` for code and const imports,
+    as llvm-lib indexes them. They stay in the rebuilt archive index.
+- Import descriptor and thunk objects, which have `.idata` sections (the
+  check `internal/ar` uses), also pass through.
+  - Short imports refer to `__IMPORT_DESCRIPTOR_<dll>` implicitly, and
+    link.exe finds it under that name. A first version prefixed these
+    objects' names. lld-link still linked the result, because it builds
+    import tables itself.
+- Imports are not definitions for `Defined()`. `-prefix-symbols` therefore
+  never renames a DLL import, and references to one keep their names.
+- `-keep-global-symbol`, `-localize-hidden`, `-strip-unneeded`, section edits
+  and `-add-symbol` leave import members alone.
+- A wrap applies to the references in other members.
+- A flag that names an import's symbol is an error, since the name is also
+  the export it binds to: `-redefine-sym`, `-localize-symbol`,
+  `-globalize-symbol`, `-weaken-symbol` and `-strip-symbol`.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. clang 19.1.7 in
+bao-cpp-cross:20261108. Import libraries came from llvm-lib (`rust-lld
+-flavor link /lib /def:`) and links used lld-link (rust-lld, LLD 22.1.8). These
+were link-only checks: there is no Windows host, and the CI fixtures have no
+import library.
+- `go vet ./...` and `go test ./...` passed. `TestCOFFImportMembers` covers:
+  - code and data imports in an archive edited with a wrap, a prefix and
+    keep-global, with the import bytes unchanged;
+  - the index entries `malloc` and `__imp_malloc` (and only `__imp__environ`
+    for the data import);
+  - `internal/ar` member selection on the result;
+  - refusals for each naming flag;
+  - a descriptor object left unchanged and excluded from `Defined`;
+  - a lone import member.
+- `.work/symimp/run.sh` (log `run4.log`):
+  - The archive held a clang object importing `malloc` and the data
+    `_environ`, plus llvm-lib's import library for ucrtbase.dll.
+  - `main` refuses `-wrap malloc -prefix-symbols p_` on it, and this branch
+    edits it.
+  - Only the static object changed. The two short imports and the three
+    descriptor objects are byte-identical.
+  - The edited archive linked with lld-link together with the wrapped glue.
+  - Controls: the unedited archive leaves `p_vendored_alloc` unresolved,
+    omitting the glue leaves `__wrap_malloc` unresolved, and
+    `-redefine-sym malloc=my_malloc` is refused.
+- `.work/symimp/build.sh` (log `build2.log`):
+  - `bao build -target windows/amd64` took a function-only mixed archive as a
+    `-link-archive` with `-prefix-symbols ...=p_ -wrap malloc` and
+    `-windows-import-library f.lib`.
+  - The build bound malloc to ucrtbase.dll, and a consumer was cross-built.
+    It was not run.
+  - The same build with `main` fails in symedit, as does the build without
+    the prefix (`p_vendored_alloc` unresolved).
+  - Bao binds DLL functions only, so the data-import archive is not used
+    here.

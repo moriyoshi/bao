@@ -545,3 +545,97 @@ func TestCOFFAddSymbol(t *testing.T) {
 		}
 	}
 }
+
+// testCOFFImport builds a short import member declaring NAME from DLL, as
+// code or data, imported by name.
+func testCOFFImport(name, dll string, data bool) []byte {
+	le := binary.LittleEndian
+	out := make([]byte, 20)
+	le.PutUint16(out[2:], 0xffff)
+	le.PutUint16(out[6:], coffMachineAMD64)
+	le.PutUint32(out[12:], uint32(len(name)+len(dll)+2))
+	typ := uint16(1) << 2 // IMPORT_OBJECT_NAME
+	if data {
+		typ |= 1
+	}
+	le.PutUint16(out[18:], typ)
+	return append(append(append(append(out, name...), 0), dll...), 0)
+}
+
+func TestCOFFImportMembers(t *testing.T) {
+	imp := testCOFFImport("malloc", "ucrtbase.dll", false)
+	dataImp := testCOFFImport("_environ", "ucrtbase.dll", true)
+	in := testArchive(ar.Member{Name: "one.obj", Data: coffFixture("")}, ar.Member{Name: "malloc.obj", Data: imp}, ar.Member{Name: "environ.obj", Data: dataImp})
+	// Imports are not definitions that a prefix may rename.
+	defined, err := Defined(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"PyList_New", "XML_Parse", "after_weak", "comdat_key", "tentative"}; !reflect.DeepEqual(defined, want) {
+		t.Fatalf("Defined = %q, want %q", defined, want)
+	}
+	out, n, err := Edit(in, Edits{Wrap: []string{"malloc"}, Rename: Prefix(defined, "p_"), Visibility: Visibility{KeepGlobal: matcher(t, true, "p_*", "Py*")}})
+	if err != nil || n == 0 {
+		t.Fatalf("Edit = %d, %v", n, err)
+	}
+	members, err := ar.Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 5 || !bytes.Equal(members[3].Data, imp) || !bytes.Equal(members[4].Data, dataImp) {
+		t.Fatalf("members = %+v", members)
+	}
+	second := members[1].Data
+	ns := int(binary.LittleEndian.Uint32(second[4+4*int(binary.LittleEndian.Uint32(second)):]))
+	start := 4 + 4*int(binary.LittleEndian.Uint32(second)) + 4
+	strs := strings.Split(strings.TrimRight(string(second[start+2*ns:]), "\x00"), "\x00")
+	got := map[string]uint16{}
+	for i, s := range strs {
+		got[s] = binary.LittleEndian.Uint16(second[start+2*i:])
+	}
+	// Code imports index the thunk and the slot; data imports the slot.
+	for name, member := range map[string]uint16{"malloc": 2, "__imp_malloc": 2, "__imp__environ": 3, "p_PyList_New": 1} {
+		if got[name] != member {
+			t.Errorf("index %s = %d, want %d (%v)", name, got[name], member, got)
+		}
+	}
+	if _, ok := got["_environ"]; ok {
+		t.Errorf("data import indexed its name: %v", got)
+	}
+	// Bao's COFF member selection still sees the object and the imports.
+	if objects, err := internalar.ParseCOFFForMachine(out, coffMachineAMD64); err != nil || len(objects) != 1 {
+		t.Fatalf("ParseCOFF = %d, %v", len(objects), err)
+	}
+	for name, e := range map[string]Edits{
+		"-redefine-sym":     {Rename: map[string]string{"malloc": "my_malloc"}},
+		"-localize-symbol":  {Visibility: Visibility{Localize: matcher(t, false, "__imp_malloc")}},
+		"-strip-symbol":     {Visibility: Visibility{Strip: matcher(t, false, "__imp__environ")}},
+		"-globalize-symbol": {Visibility: Visibility{Globalize: matcher(t, false, "malloc")}},
+	} {
+		if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), name+" names") || !strings.Contains(err.Error(), "ucrtbase.dll") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// The import library's descriptor and thunk objects, which have .idata
+	// sections, are left alone too: the linker finds them by these names.
+	descriptor := testCOFF([]testCOFFSymbol{{name: "__IMPORT_DESCRIPTOR_ucrtbase", section: coffText, class: ext}}, "")
+	copy(descriptor[coffFileHeader:], ".idata$2")
+	lib := testArchive(ar.Member{Name: "one.obj", Data: coffFixture("")}, ar.Member{Name: "ucrtbase.dll", Data: descriptor})
+	if defined, err := Defined(lib); err != nil || len(defined) != 5 {
+		t.Fatalf("Defined = %q, %v", defined, err)
+	}
+	out, _, err = Edit(lib, Edits{Rename: Prefix([]string{"PyList_New"}, "p_"), Visibility: Visibility{KeepGlobal: matcher(t, false, "p_PyList_New")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if members, err := ar.Parse(out); err != nil || !bytes.Equal(members[len(members)-1].Data, descriptor) {
+		t.Fatalf("descriptor was edited: %v", err)
+	}
+	if _, _, err := Edit(descriptor, Edits{Visibility: Visibility{Localize: matcher(t, false, "__IMPORT_DESCRIPTOR_ucrtbase")}}); err == nil || !strings.Contains(err.Error(), "-localize-symbol names __IMPORT_DESCRIPTOR_ucrtbase, which an import library descriptor defines") {
+		t.Errorf("descriptor localize: %v", err)
+	}
+	// A lone import member has nothing to edit.
+	if out, n, err := Edit(imp, Edits{Wrap: []string{"malloc"}, RemoveSection: matcher(t, false, ".text")}); err != nil || n != 0 || !bytes.Equal(out, imp) {
+		t.Fatalf("lone import: %d, %v", n, err)
+	}
+}

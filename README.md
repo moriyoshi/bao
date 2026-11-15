@@ -692,8 +692,8 @@ inputs before they are combined, so a producer needs neither `objcopy` nor a
 second relinking step. The same edits are available on single files as
 `bao objcopy`. Supported inputs are little-endian ELF64, 64-bit Mach-O, and
 amd64/arm64 COFF relocatable objects, and archives of them. Split a universal
-Mach-O file with `lipo` first. COFF bigobj files and import libraries are not
-edited.
+Mach-O file with `lipo` first. COFF bigobj files are not edited. Import library
+members pass through unchanged (see the COFF notes).
 
 Names are C names on both formats, as for `-symbol`. On Mach-O, Bao matches and
 writes them with the leading underscore that C symbols carry, so
@@ -829,6 +829,14 @@ Removing symbols renumbers relocations, weak-external tags and
 - Bao selects Windows archive members itself, without a partial linker. A
   Windows primary archive's binding edits are therefore applied member by
   member, like a `-link-archive`.
+- Import library members, both short import declarations and the descriptor
+  and thunk objects with `.idata` sections, pass through unchanged and stay in
+  the archive index. A DLL import's name is also the export it binds to, so
+  `-prefix-symbols` leaves imports alone; references to them keep their names.
+  A wrap applies to the references in other members, and `-keep-global-symbol`
+  and the other flags that act on every definition skip imports. A flag that
+  names an import, such as `-redefine-sym malloc=my_malloc` or
+  `-localize-symbol __imp_malloc`, is an error.
 - Edited COFF archives use the Microsoft library format: two linker members
   and NUL-terminated long names.
 

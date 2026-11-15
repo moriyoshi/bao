@@ -91,6 +91,10 @@ type coffFile struct {
 	records  int // symbol table records, including auxiliary ones
 	symoff   uint32
 	strtab   []byte // including its 4-byte size
+	// imports marks the import descriptor and thunk objects of an import
+	// library, which have .idata sections. Like short import members they
+	// are left alone, and their names are the ones the linker looks up.
+	imports bool
 	// numbers maps a section's input number to its output one, or to 0 for
 	// a removed section. It is nil when no section is removed.
 	numbers []int
@@ -175,6 +179,7 @@ func parseCOFF(data []byte) (*coffFile, error) {
 			return nil, fmt.Errorf("COFF section %s is out of range", name)
 		}
 		f.sections = append(f.sections, s)
+		f.imports = f.imports || name == ".idata" || strings.HasPrefix(name, ".idata$")
 	}
 	for i := 0; i < f.records; {
 		e := data[int(f.symoff)+i*coffSymbolSize:]
@@ -199,6 +204,9 @@ func parseCOFF(data []byte) (*coffFile, error) {
 }
 
 func (f *coffFile) defined() []string {
+	if f.imports {
+		return nil
+	}
 	var out []string
 	for _, s := range f.symbols {
 		if name := s.cname(); name != "" && s.external() && (s.section != 0 || s.common()) {
@@ -209,6 +217,9 @@ func (f *coffFile) defined() []string {
 }
 
 func (f *coffFile) undefined() []string {
+	if f.imports {
+		return nil
+	}
 	var out []string
 	for _, s := range f.symbols {
 		if name := s.cname(); name != "" && s.undefined() {
@@ -455,6 +466,18 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 		return objectResult{}, err
 	}
 	if e.empty() {
+		return objectResult{data: data}, nil
+	}
+	if f.imports {
+		var names []string
+		for _, s := range f.symbols {
+			if s.external() && s.section != 0 {
+				names = append(names, s.name)
+			}
+		}
+		if err := refuseImportEdits(names, "an import library descriptor defines", e); err != nil {
+			return objectResult{}, err
+		}
 		return objectResult{data: data}, nil
 	}
 	if f.records == 0 {
