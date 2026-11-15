@@ -384,12 +384,24 @@ func TestMachOPrefixAndArchive(t *testing.T) {
 func TestMachORejects(t *testing.T) {
 	exec := machoFixture()
 	binary.LittleEndian.PutUint32(exec[12:], 2) // MH_EXECUTE
+	// A universal header whose architecture table is missing, a 64-bit
+	// body behind the 32-bit magic, and a big-endian object.
 	fat := []byte{0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2}
 	thin32 := machoFixture()
 	binary.LittleEndian.PutUint32(thin32, 0xfeedface)
-	for name, in := range map[string][]byte{"executable": exec, "universal": fat, "32-bit": thin32} {
-		if _, _, err := Edit(in, Edits{Wrap: []string{"malloc"}}); err == nil {
-			t.Errorf("%s accepted", name)
+	bigEndian := machoFixture()
+	binary.BigEndian.PutUint32(bigEndian, machoMagic64)
+	for name, c := range map[string]struct {
+		in   []byte
+		want string
+	}{
+		"executable":            {exec, "not a Mach-O relocatable object"},
+		"truncated universal":   {fat, "architecture table is out of range"},
+		"64-bit body, 32 magic": {thin32, "out of range"},
+		"big-endian":            {bigEndian, "only little-endian Mach-O"},
+	} {
+		if _, _, err := Edit(c.in, Edits{Wrap: []string{"malloc"}}); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want %q", name, err, c.want)
 		}
 	}
 	if _, _, err := Edit(testArchive(ar.Member{Name: "a.o", Data: machoFixture()}, ar.Member{Name: "b.o", Data: fixture()}), Edits{Wrap: []string{"malloc"}}); err == nil || !strings.Contains(err.Error(), "mixes") {
@@ -412,21 +424,21 @@ func machoSectionFixture() []byte {
 	}, machoExtra{local: [3][]uint32{{machoUnwind}, nil, {machoText}}, hints: []uint64{0x10, 0x50, 0x90}})
 }
 
-type machoLayout struct {
+type machoSectionView struct {
 	sections []string
 	symbols  []string // NAME:SECTION:VALUE, with ABS and UNDEF for others
 	local    map[string][]uint32
 	hints    []uint64
 }
 
-func readMachOLayout(t *testing.T, data []byte) machoLayout {
+func readMachOLayout(t *testing.T, data []byte) machoSectionView {
 	t.Helper()
 	readMachO(t, data)
 	f, err := macho.NewFile(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := machoLayout{local: map[string][]uint32{}}
+	l := machoSectionView{local: map[string][]uint32{}}
 	for _, s := range f.Sections {
 		l.sections = append(l.sections, s.Seg+","+s.Name)
 		for _, r := range s.Relocs {

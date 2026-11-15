@@ -304,7 +304,21 @@ func Defined(data []byte) ([]string, error) {
 		}
 		return nil
 	}
-	if isArchive(data) {
+	if isFat(data) {
+		parts, slices, _, err := fatSlices(data)
+		if err != nil {
+			return nil, err
+		}
+		for i, part := range parts {
+			names, err := Defined(part)
+			if err != nil {
+				return nil, fmt.Errorf("universal Mach-O slice %s: %w", slices[i].arch(), err)
+			}
+			for _, name := range names {
+				seen[name] = true
+			}
+		}
+	} else if isArchive(data) {
 		members, err := regularMembers(data)
 		if err != nil {
 			return nil, err
@@ -346,6 +360,9 @@ func Prefix(defined []string, prefix string) map[string]string {
 func Edit(data []byte, e Edits) ([]byte, int, error) {
 	if err := e.Validate(); err != nil {
 		return nil, 0, err
+	}
+	if isFat(data) {
+		return editFat(data, e)
 	}
 	if !isArchive(data) {
 		r, err := editObject(data, e)
