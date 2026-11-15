@@ -557,3 +557,29 @@ func TestMachOAddSymbol(t *testing.T) {
 		t.Errorf("archive: %v", err)
 	}
 }
+
+func TestMachOAddSymbolAtSymbol(t *testing.T) {
+	in := machoSectionFixture()
+	withLocal := buildMachO([]testNlist{{name: "_u", typ: local, sect: machoUnwind, value: 128 + 16}, {name: "_f", typ: global, text: true}}, machoExtra{})
+	out, _, err := Edit(withLocal, Edits{AddSymbols: addSymbols(t, "f_alias=@f:4,function", "unwind_alias=@u:8")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mach-O values are addresses: the local _u is at 144, 16 bytes into
+	// __compact_unwind, so its alias is at 152.
+	l := readMachOLayout(t, out)
+	have := map[string]bool{}
+	for _, s := range l.symbols {
+		have[s] = true
+	}
+	if !have["_f_alias:__text:4"] || !have["_unwind_alias:__compact_unwind:152"] {
+		t.Fatalf("symbols = %q", l.symbols)
+	}
+	e := Edits{AddSymbols: addSymbols(t, "x=@u:0"), RemoveSection: matcher(t, false, "__LD,__compact_unwind")}
+	if _, _, err := Edit(withLocal, e); err == nil || !strings.Contains(err.Error(), "whose section is removed") {
+		t.Errorf("removed target: %v", err)
+	}
+	if _, _, err := Edit(in, Edits{AddSymbols: addSymbols(t, "x=@ext:0")}); err == nil || !strings.Contains(err.Error(), "does not define") {
+		t.Errorf("undefined target: %v", err)
+	}
+}

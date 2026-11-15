@@ -190,3 +190,59 @@ func TestParseAddSymbol(t *testing.T) {
 		}
 	}
 }
+
+func addSymbols(t *testing.T, specs ...string) []AddedSymbol {
+	t.Helper()
+	var out []AddedSymbol
+	for _, spec := range specs {
+		a, err := ParseAddSymbol(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func TestAddSymbolAtSymbol(t *testing.T) {
+	if a, err := ParseAddSymbol("alias=@foo:8,function"); err != nil || a.Symbol != "foo" || a.Section != "" || a.Value != 8 || a.Type != elf.STT_FUNC {
+		t.Fatalf("%+v %v", a, err)
+	}
+	if _, err := ParseAddSymbol("alias=@:8"); err == nil {
+		t.Fatal("empty target accepted")
+	}
+	out, _, err := Edit(sectionFixture(), Edits{AddSymbols: addSymbols(t, "foo_alias=@foo:8,function", "helper_alias=@helper:4,local")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := elf.NewFile(bytes.NewReader(out))
+	syms, _ := f.Symbols()
+	got := map[string]elf.Symbol{}
+	for _, s := range syms {
+		got[s.Name] = s
+	}
+	if s := got["foo_alias"]; s.Section != got["foo"].Section || s.Value != 8 || elf.ST_TYPE(s.Info) != elf.STT_FUNC || elf.ST_BIND(s.Info) != elf.STB_GLOBAL {
+		t.Fatalf("foo_alias = %+v", s)
+	}
+	// A local target is found when no global has the name.
+	if s := got["helper_alias"]; s.Section != got["helper"].Section || s.Value != 4 || elf.ST_BIND(s.Info) != elf.STB_LOCAL {
+		t.Fatalf("helper_alias = %+v", s)
+	}
+	dup := testObject([]testSymbol{
+		{".text", elf.STB_LOCAL, elf.STT_SECTION, textSection, 0, false, false},
+		{"dup", elf.STB_LOCAL, elf.STT_FUNC, textSection, 0, false, false},
+		{"dup", elf.STB_LOCAL, elf.STT_FUNC, textSection, 0, false, false},
+	}, "")
+	for spec, want := range map[string]string{
+		"x=@bar:0":    "which the object does not define",
+		"x=@shared:0": "which the object does not define",
+		"x=@nosuch:0": "which the object does not define",
+	} {
+		if _, _, err := Edit(sectionFixture(), Edits{AddSymbols: addSymbols(t, spec)}); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", spec, err)
+		}
+	}
+	if _, _, err := Edit(dup, Edits{AddSymbols: addSymbols(t, "x=@dup:0")}); err == nil || !strings.Contains(err.Error(), "names 2 definitions") {
+		t.Errorf("ambiguous target: %v", err)
+	}
+}

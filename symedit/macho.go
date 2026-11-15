@@ -573,6 +573,27 @@ func (f *machoFile) addSymbols(symbols *[]machoSymbol, adds []AddedSymbol) ([]st
 	var added []string
 	for _, a := range adds {
 		s := machoSymbol{name: "_" + a.Name, typ: nAbs, value: a.Value}
+		if a.Symbol != "" {
+			var globals, locals []int
+			for i, t := range f.symbols {
+				if kind := t.typ & nType; t.cname() == a.Symbol && (kind == nSect || kind == nAbs) {
+					if t.external() {
+						globals = append(globals, i)
+					} else {
+						locals = append(locals, i)
+					}
+				}
+			}
+			at, err := pickTarget(a.Name, a.Symbol, globals, locals)
+			if err != nil {
+				return nil, err
+			}
+			t := f.symbols[at]
+			if t.typ&nType == nSect && f.removed(int(t.sect)) {
+				return nil, fmt.Errorf("cannot add symbol %s at %s, whose section is removed", a.Name, a.Symbol)
+			}
+			s.typ, s.sect, s.value = t.typ&nType, t.sect, t.value+a.Value
+		}
 		if a.Section != "" {
 			k := 0
 			for j, sec := range f.sections {

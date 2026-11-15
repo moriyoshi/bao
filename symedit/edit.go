@@ -103,7 +103,31 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 		if at, ok := existing[a.Name]; ok && f.symbols[at].defined() {
 			return objectResult{}, fmt.Errorf("cannot add symbol %s, which is already defined", a.Name)
 		}
-		shndx := uint16(elf.SHN_ABS)
+		shndx, value := uint16(elf.SHN_ABS), a.Value
+		if a.Symbol != "" {
+			var globals, locals []int
+			for i, s := range f.symbols {
+				if i > 0 && s.named() && s.name == a.Symbol && s.defined() && !s.common() {
+					if s.global() {
+						globals = append(globals, i)
+					} else {
+						locals = append(locals, i)
+					}
+				}
+			}
+			at, err := pickTarget(a.Name, a.Symbol, globals, locals)
+			if err != nil {
+				return objectResult{}, err
+			}
+			t := f.symbols[at]
+			if t.shndx == uint16(elf.SHN_XINDEX) {
+				return objectResult{}, fmt.Errorf("cannot add symbol %s at %s, whose section needs an extended index", a.Name, a.Symbol)
+			}
+			if dropped(int(t.shndx)) {
+				return objectResult{}, fmt.Errorf("cannot add symbol %s at %s, whose section is removed", a.Name, a.Symbol)
+			}
+			shndx, value = t.shndx, t.value+a.Value
+		}
 		if a.Section != "" {
 			found := -1
 			for i, s := range f.sections {
@@ -120,7 +144,7 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 			}
 			shndx = uint16(found)
 		}
-		userAdded = append(userAdded, elfSymbol{name: a.Name, info: elf.ST_INFO(a.Bind, a.Type), other: byte(a.Visibility), shndx: shndx, value: a.Value})
+		userAdded = append(userAdded, elfSymbol{name: a.Name, info: elf.ST_INFO(a.Bind, a.Type), other: byte(a.Visibility), shndx: shndx, value: value})
 		if a.Bind != elf.STB_LOCAL {
 			addedNames = append(addedNames, a.Name)
 		}

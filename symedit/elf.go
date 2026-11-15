@@ -152,7 +152,7 @@ func parseELF(data []byte) (*elfFile, error) {
 		if end < 0 {
 			return nil, fmt.Errorf("ELF symbol %d name is unterminated", i)
 		}
-		f.symbols[i] = elfSymbol{name: string(strtab[name : int(name)+end]), info: e[4], other: e[5], shndx: le.Uint16(e[6:])}
+		f.symbols[i] = elfSymbol{name: string(strtab[name : int(name)+end]), info: e[4], other: e[5], shndx: le.Uint16(e[6:]), value: le.Uint64(e[8:])}
 	}
 	return f, nil
 }

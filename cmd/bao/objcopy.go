@@ -49,7 +49,7 @@ func (f *symbolEditFlags) register(fs *flag.FlagSet, scoped bool, prefixUsage st
 	}
 	fs.Var(&f.removeSection, "remove-section", section+": remove that section"+where+", its relocations and its symbols; Mach-O sections are SEGMENT,SECTION; repeatable")
 	fs.Var(&f.onlySection, "only-section", section+": keep only the matching sections"+where+", with their relocations; repeatable")
-	fs.Var(&f.addSymbol, "add-symbol", add+": add a symbol"+where+" at an offset in SECTION, or an absolute one, as llvm-objcopy --add-symbol; FLAGS are global, local, weak, default, hidden, protected, object, function or notype; repeatable")
+	fs.Var(&f.addSymbol, "add-symbol", add+": add a symbol"+where+" at an offset in SECTION, or an absolute one, as llvm-objcopy --add-symbol; @SYMBOL in place of SECTION places it VALUE bytes past that definition; FLAGS are global, local, weak, default, hidden, protected, object, function or notype; repeatable")
 	if scoped {
 		fs.Var(&f.localizeHidden, "localize-hidden", "PATH: make the hidden and internal definitions in the input or -link-archive at PATH local; repeatable")
 		fs.Var(&f.stripUnneeded, "strip-unneeded", "PATH: remove the local and undefined symbols in the input or -link-archive at PATH that no relocation needs; repeatable")
