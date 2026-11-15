@@ -12,8 +12,8 @@ def release_binaries():
             goarch = goarch,
             pure = "on",
             x_defs = {
-                "github.com/moriyoshi/bao/cmd/bao.version": "{STABLE_BAO_VERSION}",
-                "github.com/moriyoshi/bao/cmd/bao.commit": "{STABLE_BAO_COMMIT}",
+                "github.com/moriyoshi/bao/internal/cli.version": "{STABLE_BAO_VERSION}",
+                "github.com/moriyoshi/bao/internal/cli.commit": "{STABLE_BAO_COMMIT}",
             },
             visibility = ["//visibility:public"],
         )

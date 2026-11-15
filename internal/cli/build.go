@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -560,7 +560,7 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		LinkedNotices        []linkedInput       `json:"linked_notices,omitempty"`
 		RequireStaticRuntime bool                `json:"require_static_runtime,omitempty"`
 		SymbolEdits          *symbolEditRecord   `json:"symbol_edits,omitempty"`
-	}{1, version, target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, notices, *requireStaticRuntime, symbolEdits}
+	}{1, baoVersion(), target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, notices, *requireStaticRuntime, symbolEdits}
 	b, err := json.MarshalIndent(provenance, "", "  ")
 	if err != nil {
 		return err

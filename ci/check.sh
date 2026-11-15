@@ -19,7 +19,7 @@ case "$suite" in
     rustup toolchain install 1.99.1 --profile minimal --target "$rust_target"
     export RUSTUP_TOOLCHAIN=1.99.1 CGO_ENABLED=0 GOENV=off GOTOOLCHAIN=local GOWORK=off
     [[ $(go version) == *'go1.26.11 '* ]]
-    go test -count=1 ./pecoff ./bindings ./toolchain ./cmd/bao
+    go test -count=1 ./pecoff ./bindings ./toolchain ./internal/cli ./build
     go test -count=1 ./cmd/bao-verify
     mkdir -p ".work/ci-evidence/$suite"
     go build -o .work/bao-windows.exe ./cmd/bao

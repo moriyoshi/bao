@@ -6883,3 +6883,52 @@ Review question: what if `__wrap_SYMBOL` already exists?
 Verification. `go vet ./linuxelf` and `go test ./linuxelf` passed with the
 extended `TestWrapSharedObjectImports`. The end-to-end run is unaffected,
 since its library defines no wrapper.
+
+## 2026-11-16: Importable build API
+
+Problem. pythago wants its consumers' `go generate` step to need only Go.
+bao's CLI lived in `cmd/bao`, package main, so it could only be run as a
+separately installed binary. A go.mod `tool` directive does not reach a
+dependent module's consumers.
+
+Decision. The user chose a typed API for `bao build` over exporting the CLI
+dispatcher. To keep one code path, `build.Run` produces the same arguments
+the command parses, rather than reimplementing the build.
+
+Change.
+- The command's implementation moved from `cmd/bao` to `internal/cli`
+  (`git mv`, package `cli`). It exports `Run(ctx, args, stdout, stderr)` and
+  `ExitCode(err)`, and `cmd/bao/main.go` is now a thin main around them.
+- New package `build`:
+  - `Options` has typed fields for the common `bao build` flags, including
+    everything pythago uses (target, sysroot, package, symbols, wrap, link
+    archives, output, and the Linux shared object, version cap and text
+    alignment), plus Windows and Darwin options.
+  - `Args` passes any other flag, and `CommandLine()` returns the argument
+    list. The input follows `--`.
+  - `Run(ctx, opts)` calls `cli.Run`. Output writers default to discard.
+- Version: when the build is not stamped, `baoVersion()` reports the
+  `github.com/moriyoshi/bao` module version (or its replacement) from build
+  info. `bao version` and `bao-build.json` use it.
+- Release `x_defs` now stamp `github.com/moriyoshi/bao/internal/cli.version`
+  and `.commit`.
+- Bazel: `//internal/cli:cli`, `//internal/cli:cli_test`, `//build:build`
+  and `//build:build_test`; `//cmd/bao:bao` embeds only main.go. The root
+  test suite and `ci/check.sh`'s Windows `go test` list follow.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel is not installed
+here, so the Bazel changes are checked only by CI.
+- `go vet ./...` and `go test ./...` passed. internal/cli carries the moved
+  tests unchanged except for the package name.
+- `TestCommandLine` checks the full argument mapping.
+- `TestRunTwice` runs two windows/amd64 builds of a synthetic COFF object in
+  one process, and `TestRunErrors` checks a missing input, an unknown flag
+  and cancellation.
+- `.work/importable`:
+  - A separate module that requires bao through a `replace` and calls
+    `build.Run` built linux/arm64 twice in one process from a gcc 13.3.0
+    archive.
+  - `bao-build.json` recorded `"bao_version": "v0.0.0 => ../../.."`.
+  - A CGO_ENABLED=0 consumer of that package ran natively and printed
+    `answer: 42`.
+  - `go run ./cmd/bao version -json` still reports `devel`.
