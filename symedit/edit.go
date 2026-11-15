@@ -9,8 +9,8 @@ import (
 	"strings"
 )
 
-// elfResult is one edited object.
-type elfResult struct {
+// objectResult is one edited object.
+type objectResult struct {
 	data   []byte
 	edited int
 	// hidden lists the global definitions, by output name, that the edit made
@@ -20,13 +20,13 @@ type elfResult struct {
 
 const removedIndex = ^uint32(0)
 
-func editELF(data []byte, e Edits) (elfResult, error) {
+func editELF(data []byte, e Edits) (objectResult, error) {
 	f, err := parseELF(data)
 	if err != nil {
-		return elfResult{}, err
+		return objectResult{}, err
 	}
 	if e.empty() || f.symtab == 0 {
-		return elfResult{data: data}, nil
+		return objectResult{data: data}, nil
 	}
 	n := len(f.symbols)
 	wrapped := map[string]bool{}
@@ -87,7 +87,7 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 		crel = crel || s.typ == shtCREL && int(s.link) == f.symtab
 	}
 	if crel && (len(retarget) > 0 || !e.Visibility.empty()) {
-		return elfResult{}, errors.New("CREL relocations are unsupported when redirecting references or changing symbol bindings; build without -Wa,--crel")
+		return objectResult{}, errors.New("CREL relocations are unsupported when redirecting references or changing symbol bindings; build without -Wa,--crel")
 	}
 	out := bytes.Clone(data)
 	relocs := func(fn func(s elfSection, entry []byte) error) error {
@@ -125,7 +125,7 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 			return nil
 		})
 		if err != nil {
-			return elfResult{}, err
+			return objectResult{}, err
 		}
 	}
 	if retargeted == 0 {
@@ -142,7 +142,7 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 		return nil
 	})
 	if err != nil {
-		return elfResult{}, err
+		return objectResult{}, err
 	}
 	for _, s := range f.sections {
 		if s.typ == elf.SHT_GROUP && int(s.link) == f.symtab && int(s.info) < n {
@@ -160,7 +160,7 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 		switch {
 		case s.named() && e.Strip.Match(s.name):
 			if referenced[i] {
-				return elfResult{}, fmt.Errorf("not stripping symbol %s because a relocation or section group names it", s.name)
+				return objectResult{}, fmt.Errorf("not stripping symbol %s because a relocation or section group names it", s.name)
 			}
 			removed[i] = true
 		case e.StripUnneeded && !referenced[i] && elf.ST_TYPE(s.info) != elf.STT_SECTION && !s.mapping() && (local || !s.defined()):
@@ -178,7 +178,7 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 	}
 	edited := renamed + retargeted + rebound + removedCount
 	if edited == 0 {
-		return elfResult{data: data}, nil
+		return objectResult{data: data}, nil
 	}
 	// Append new names to a copy of the string table so that existing offsets,
 	// including shared suffixes and section names, keep their meaning.
@@ -206,14 +206,14 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 			if names[i] != f.symbols[i].name {
 				off, err := intern(names[i])
 				if err != nil {
-					return elfResult{}, err
+					return objectResult{}, err
 				}
 				le.PutUint32(entry, off)
 			}
 		} else {
 			off, err := intern(added[i-n].name)
 			if err != nil {
-				return elfResult{}, err
+				return objectResult{}, err
 			}
 			le.PutUint32(entry, off)
 			entry[4] = added[i-n].info
@@ -243,12 +243,12 @@ func editELF(data []byte, e Edits) (elfResult, error) {
 			}
 		}
 	} else if err := f.reorder(&out, entries, infos, removed, place, header); err != nil {
-		return elfResult{}, err
+		return objectResult{}, err
 	}
 	if len(offsets) > 0 {
 		place(int(symtab.link), strtab, 1)
 	}
-	return elfResult{data: out, edited: edited, hidden: hidden}, nil
+	return objectResult{data: out, edited: edited, hidden: hidden}, nil
 }
 
 // reorder writes a symbol table whose local symbols precede the others, as
@@ -370,18 +370,23 @@ func renumberAddrsig(data []byte, renumber func(uint64) (uint32, error), removed
 }
 
 // binding applies llvm-objcopy's order: localize, keep-global, globalize,
-// then weaken. Undefined and common symbols are never made local.
-func (v Visibility) binding(s elfSymbol) elf.SymBind {
+// then weaken. Undefined and common symbols are never made local. A wrap
+// applies to every input of the link, so -keep-global-symbol and
+// -localize-hidden leave a wrapped symbol's definition and its __wrap_
+// wrapper global; only naming one with -localize-symbol hides it.
+func (e Edits) binding(s elfSymbol) elf.SymBind {
+	v := e.Visibility
 	b := elf.ST_BIND(s.info)
 	if !s.named() {
 		return b
 	}
 	if s.defined() && !s.common() {
+		linked := e.wrapLinked(s.name)
 		vis := elf.SymVis(s.other & 3)
-		if v.LocalizeHidden && (vis == elf.STV_HIDDEN || vis == elf.STV_INTERNAL) || v.Localize.Match(s.name) {
+		if v.LocalizeHidden && !linked && (vis == elf.STV_HIDDEN || vis == elf.STV_INTERNAL) || v.Localize.Match(s.name) {
 			b = elf.STB_LOCAL
 		}
-		if !v.KeepGlobal.empty() && !v.KeepGlobal.Match(s.name) {
+		if !v.KeepGlobal.empty() && !linked && !v.KeepGlobal.Match(s.name) {
 			b = elf.STB_LOCAL
 		}
 	}
@@ -392,4 +397,14 @@ func (v Visibility) binding(s elfSymbol) elf.SymBind {
 		b = elf.STB_WEAK
 	}
 	return b
+}
+
+// wrapLinked reports a wrapped symbol or its wrapper.
+func (e Edits) wrapLinked(name string) bool {
+	for _, w := range e.Wrap {
+		if name == w || name == "__wrap_"+w {
+			return true
+		}
+	}
+	return false
 }

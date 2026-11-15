@@ -5567,3 +5567,112 @@ was not run.
 
 Remaining: Mach-O and COFF (phase 3) and section edits. `-strip-unneeded`
 keeps debug sections (see above).
+
+## 2026-11-15: Mach-O symbol edits (phase 3, Mach-O first)
+
+Problem: phase 3 of pythago's request extends the symbol edits to Mach-O and
+COFF for its darwin and windows targets. The user chose Mach-O first.
+
+Decisions:
+- Edits take C names on both formats, as `-symbol` does. On Mach-O, Bao
+  adds and strips the leading underscore, so one flag list serves Linux and
+  macOS. Mach-O symbols without that underscore (assembler labels, stabs,
+  N_INDR) are never edited.
+- Binding mapping:
+  - N_EXT is global.
+  - N_PEXT (private extern, from hidden visibility) is hidden.
+  - N_WEAK_DEF / N_WEAK_REF are weak.
+  - An undefined N_EXT symbol with a value is common.
+  The ELF binding rules run on that view, and the result is mapped back.
+  Localizing clears N_EXT, N_PEXT and the weak bits.
+- Every Mach-O edit rebuilds the symbol table. LC_DYSYMTAB requires locals,
+  external definitions and undefined symbols as contiguous groups, and LLVM
+  and ld64 write the two external groups sorted by name. Locals keep input
+  order, because stab sequences depend on it. The rebuild renumbers extern
+  relocations (24-bit symbol fields) and the indirect symbol table, except
+  INDIRECT_SYMBOL_LOCAL/ABS entries. The new tables go at the end of the
+  file and LC_SYMTAB is repointed. Linked-image tables (TOC, modules,
+  external/local relocations) and scattered relocations are rejected.
+- Wrap:
+  - Redirection skips debug sections (S_ATTR_DEBUG), `__LD,__compact_unwind`
+    and `__eh_frame`, so unwind data keeps describing the definition.
+  - An undefined `__real_SYM` in an object that defines `SYM` is bound
+    directly to the definition and removed. One object should not both
+    define and import a name.
+- ld64 keeps atoms by symbol, so N_NO_DEAD_STRIP (`__attribute__((used))`)
+  and REFERENCED_DYNAMICALLY symbols count as referenced. `-strip-unneeded`
+  keeps them, and `-strip-symbol` refuses them. Removing one would let ld64
+  dead strip its atom.
+- Edited Mach-O archives are written in the BSD format of Apple's ar:
+  - `#1/N` names padded so each object's data is 8-byte aligned;
+  - a `__.SYMDEF` index (or `__.SYMDEF_64` past 4 GiB) of external
+    definitions, without commons, as ranlib does by default;
+  - mixed ELF/Mach-O archives are rejected.
+- Correction to the phase 2 entry (applies to ELF too). In a combined
+  primary, `-keep-global-symbol` localized the glue's `__wrap_strlen`. The
+  link archives' wrapped `strlen` calls then failed to resolve: bao reported
+  "system SDK does not export ___wrap_strlen", found while replaying the new
+  CI step on the Intel Mac. A wrap applies to the whole link, so
+  keep-global and localize-hidden now leave a wrapped symbol's definition
+  and its `__wrap_` wrapper global. An explicit `-localize-symbol` still
+  hides them.
+
+Reference tool: llvm-objcopy (rust-objcopy, LLVM 22, run on the Linux host).
+For Mach-O it rejects `--strip-unneeded` and `--prefix-symbols`. It accepts
+`--localize-hidden` but leaves private externs global, and it accepts
+`--strip-symbol` but removed none of three symbols. Those operations were
+checked against expected tables instead.
+
+Verification. Linux host: Linux 7.0.0 aarch64, Go 1.27.4. Mac:
+macbook-pro-2.local, macOS 26.6.2 on x86_64, Apple clang 17.0.0, ld-1230.1.
+Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. New symedit tests use
+  hand-built arm64 MH_OBJECTs read back with debug/macho. They cover:
+  - wrap and rename, with the `__real_` binding, debug and unwind
+    relocations left alone, the indirect table renumbered, sorted groups and
+    LC_DYSYMTAB counts;
+  - keep-global wildcards, localize-hidden, weaken and strip-unneeded, with
+    stabs, commons and a no-dead-strip local kept;
+  - strip refusals;
+  - C-name prefixes, the BSD archive index offsets and alignment, and the
+    archive cross-member error;
+  - rejected MH_EXECUTE, 32-bit, universal and mixed archives;
+  - the wrap exemption on both formats.
+  The bao-verify harness gained a `darwin_symbol_edits` step for CI.
+- Mac end to end, driver `.work/symmacho/run.sh` (fixtures in
+  `.work/symmacho/src`; Mac script `mac.sh`). Fixtures were compiled for
+  x86_64 and arm64. Executables ran natively for x86_64; arm64 ones were
+  only linked, since the host is Intel. Results:
+  - Wrapped objects printed `102 1020 1003`, as on Linux. An `ld -r`
+    combined object holding both the definition and `__real_target` printed
+    the same, with no `__real_target` left in nm.
+  - A BSD archive prefixed by `bao objcopy` linked through `-lp`.
+  - Seven binding/strip variants linked and printed `3 9 5 5`.
+  - Symbol tables matched llvm-objcopy on both architectures for keep-global
+    wildcards, weaken plus globalize, localize-symbol and redefine-sym.
+  - `bao build` for darwin/amd64 and darwin/arm64 produced the phase 1 and
+    phase 2 packages, combining the primary first for keep-global.
+  - CGO_ENABLED=0 darwin/amd64 consumers ran on the Mac and read
+    103021003/11012, 2020003/12, 120/34 and 120/34. The darwin/arm64
+    consumers were built but not run.
+  - A replay of the CI step (`.work/symmacho/ci/mac-ci.sh`) combines wrap,
+    prefixes and keep-global on one primary. It printed `PASS: symbol
+    edits` on darwin/amd64 after the wrap exemption fix, and failed as
+    described above before it.
+- Negative controls (Mac, both architectures):
+  - unedited glue fails to link;
+  - an unprefixed archive leaves references unresolved;
+  - localized and stripped definitions no longer link;
+  - stripping a no-dead-strip symbol is refused;
+  - per-member localize-hidden of a sharing archive is refused;
+  - builds without prefixes fail with duplicate symbol `_counter` and
+    `_vendored_fn`.
+
+- Final reruns on this commit's code, after the wrap exemption and
+  no-dead-strip changes:
+  - `.work/symedit/e2e.sh` (Linux phase 1): 26 ok, 0 FAIL;
+  - `.work/symvis/e2e.sh` (Linux phase 2): 50 ok, 0 FAIL;
+  - `.work/symmacho/run.sh` (Mac): 78 ok, 0 FAIL.
+
+Remaining: COFF. Native darwin/arm64 execution is left to CI's
+`darwin_symbol_edits` step.

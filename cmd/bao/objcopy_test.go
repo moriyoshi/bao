@@ -146,7 +146,7 @@ func TestSymbolEditUsage(t *testing.T) {
 	}
 	var stdout, stderr strings.Builder
 	err := run([]string{"build", "-target", "windows/amd64", "-wrap", "answer", "-o", filepath.Join(dir, "out"), input}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "only Linux ELF") || exitCode(err) != 2 {
+	if err == nil || !strings.Contains(err.Error(), "not Windows COFF") || exitCode(err) != 2 {
 		t.Fatalf("build: %v", err)
 	}
 	if err := run([]string{"objcopy", "-wrap", "answer", input}, &stdout, &stderr); err == nil || exitCode(err) != 2 {

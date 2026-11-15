@@ -5,7 +5,8 @@
 // Every other byte of an object is preserved and an edited archive gets a new
 // symbol index, so the results remain ordinary inputs to a native linker.
 //
-// Only little-endian ELF64 relocatable objects are supported.
+// Little-endian ELF64 and 64-bit Mach-O relocatable objects are supported.
+// Names are C names: on Mach-O, edits add and match the leading underscore.
 package symedit
 
 import (
@@ -190,7 +191,7 @@ func ParseRenames(r io.Reader) (map[string]string, error) {
 func Defined(data []byte) ([]string, error) {
 	seen := map[string]bool{}
 	add := func(object []byte) error {
-		f, err := parseELF(object)
+		f, err := parseObject(object)
 		if err != nil {
 			return err
 		}
@@ -243,7 +244,7 @@ func Edit(data []byte, e Edits) ([]byte, int, error) {
 		return nil, 0, err
 	}
 	if !isArchive(data) {
-		r, err := editELF(data, e)
+		r, err := editObject(data, e)
 		return r.data, r.edited, err
 	}
 	return editArchive(data, e)
