@@ -586,6 +586,33 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 	return p, nil
 }
 
+// allocateCommons defines each common symbol, such as OpenSSL's hidden
+// `.comm OPENSSL_ia32cap_P,40,16` that a partial link leaves common, in one
+// zero-filled section, aligned as its value requests, as a final link
+// allocates commons in .bss. Binding and visibility are kept.
+func allocateCommons(m *image) error {
+	var bss uint16
+	for i := 1; i < len(m.symbols); i++ {
+		s := &m.symbols[i]
+		if s.sect != uint16(elf.SHN_COMMON) {
+			continue
+		}
+		align := max(s.value, 1)
+		if align&(align-1) != 0 || align > MaxSafeTextAlignment {
+			return fmt.Errorf("unsupported alignment %d of common symbol %s", s.value, s.name)
+		}
+		if bss == 0 {
+			bss = m.addSection(section{name: ".bss.bao.common", typ: elf.SHT_NOBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 1})
+		}
+		sec := &m.sections[bss]
+		offset := (sec.size + align - 1) &^ (align - 1)
+		sec.size, sec.align = offset+s.size, max(sec.align, align)
+		s.sect, s.value = bss, offset
+		s.info = s.info&0xf0 | byte(elf.STT_OBJECT)
+	}
+	return nil
+}
+
 // Retire symbols that cannot or need not reach Go's linker, and reject the
 // rest of the forms outside the supported profile.
 func normalizeSymbols(m *image) error {
@@ -596,6 +623,9 @@ func normalizeSymbols(m *image) error {
 				referenced[r.sym] = true
 			}
 		}
+	}
+	if err := allocateCommons(m); err != nil {
+		return err
 	}
 	for i := 1; i < len(m.symbols); i++ {
 		s := &m.symbols[i]
@@ -614,7 +644,7 @@ func normalizeSymbols(m *image) error {
 			if s.sect == uint16(elf.SHN_ABS) && referenced[uint32(i)] {
 				return fmt.Errorf("unsupported relocation against absolute symbol %s", s.name)
 			}
-			return fmt.Errorf("unsupported absolute/common/extended symbol %s", s.name)
+			return fmt.Errorf("unsupported absolute or extended-index symbol %s", s.name)
 		}
 		if int(s.sect) >= len(m.sections) {
 			return fmt.Errorf("invalid native symbol section")

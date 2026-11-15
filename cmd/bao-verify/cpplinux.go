@@ -148,6 +148,7 @@ func (h *harness) cppLinux() {
 	h.results["cpp_runtime_libraries"] = string(h.run("cpp-linux-runtime-libraries.log", h.root, nil, container(true, "set -eu\n"+diagnostic)...))
 	h.cppLinuxScalars(arch, compiler, compilerFlags, archiveTool, container)
 	h.cppLinuxSymbolVersions(arch, compiler, compilerFlags, archiveTool, container)
+	h.cppLinuxCommons(arch, compiler, compilerFlags, archiveTool, container)
 }
 
 // cppLinuxSymbolVersions checks that imports bind versioned glibc symbols:
@@ -198,6 +199,25 @@ func (h *harness) cppLinuxSymbolVersions(arch, compiler, compilerFlags, archiveT
 		check(strings.HasPrefix(unversioned, "fails"), "unversioned imports unexpectedly passed on amd64: %s", negOut)
 	}
 	h.results["symbol_versions"] = map[string]any{"status": "PASS", "pthread_cond_init": directives["pthread_cond_init"], "memcpy": directives["memcpy"], "imports": len(directives), "unversioned_control": unversioned}
+}
+
+// cppLinuxCommons checks that common symbols, which the partial link leaves
+// unallocated, are defined zero-filled and aligned: testdata/linux_common.c
+// has a hidden assembler .comm and a -fcommon tentative definition.
+func (h *harness) cppLinuxCommons(arch, compiler, compilerFlags, archiveTool string, container func(bool, ...string) []string) {
+	flags := strings.Replace(compilerFlags, "-std=c++20", "-std=gnu11 -fcommon -x c", 1)
+	h.run("common-compile.log", h.root, nil, container(false, "set -eu\n"+compiler+" "+flags+" -c /testdata/linux_common.c -o /work/common.o\n"+archiveTool+" rcs /work/common.a /work/common.o")...)
+	app := filepath.Join(h.dst, "common")
+	require(os.Mkdir(app, 0755))
+	h.run("common-producer.log", h.root, nil, container(false, "/work/bao-linux build -target "+h.target+" -sysroot "+cppLinuxSysroot(arch)+" -bindings dwarf -symbol bao_common -o /work/common/native /work/common.a")...)
+	require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-common\ngo 1.26.0\n"), 0644))
+	main := "package main\n\nimport (\n\t\"fmt\"\n\n\t\"bao-common/native\"\n)\n\nfunc main() {\n\ta, b := native.BaoCommon(), native.BaoCommon()\n\tfmt.Println(\"common:\", a, b)\n}\n"
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(main), 0644))
+	cross := h.consumerEnv(map[string]string{"GOOS": "linux", "GOARCH": arch})
+	h.run("common-build.log", app, cross, h.goTool, "build", "-o", filepath.Join(h.dst, "common-executable"), ".")
+	out := string(h.run("common-run.log", h.root, nil, h.cppLinuxExec(arch, "common-executable", "1", nil)...))
+	check(strings.Contains(out, "common: 173 246\n"), "common symbols failed: %s", out)
+	h.results["common_symbols"] = map[string]any{"status": "PASS", "checks": "hidden assembler .comm with 16-byte alignment and a -fcommon tentative definition: zero-initialized, aligned, persistent"}
 }
 
 func (h *harness) cppLinuxExec(arch, executable, procs string, extra map[string]string, args ...string) []string {
