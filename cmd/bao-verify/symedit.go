@@ -235,7 +235,9 @@ func (h *harness) windowsSymbolEdits(arch string) {
 // windowsWeaken weakens testdata/symedit_weak.c's value definition and its
 // hook reference with -weaken-symbol. With libstrong.a's value linked, the
 // consumer gets 20: the strong definition wins, for the weakened object's
-// own call too. Without it, the weak default gives 10. The hook stays NULL.
+// own call too. The archive is searched only for unresolved names, which the
+// weak default no longer leaves, so that build also exports
+// bao_symedit_strong to pull the member in. Without it, the weak default gives 10. The hook stays NULL.
 // GNU as for PE calls a function in the same object through its section, so
 // with MinGW GCC that call keeps the default and both builds give 10.
 func (h *harness) windowsWeaken(dir, weak, strong, arch string) {
@@ -245,14 +247,16 @@ func (h *harness) windowsWeaken(dir, weak, strong, arch string) {
 	}
 	signatures := filepath.Join(dir, "weak-signatures.json")
 	require(os.WriteFile(signatures, []byte(`{"schema":1,"abi":"c","functions":[{"name":"Weak","symbol":"bao_symedit_weak","params":[],"result":"int64"}]}`), 0o644))
+	strongSignatures := filepath.Join(dir, "strong-signatures.json")
+	require(os.WriteFile(strongSignatures, []byte(`{"schema":1,"abi":"c","functions":[{"name":"Weak","symbol":"bao_symedit_weak","params":[],"result":"int64"},{"name":"Strong","symbol":"bao_symedit_strong","params":[],"result":"int64"}]}`), 0o644))
 	results := map[string]string{}
 	for _, c := range []struct {
-		name, want string
-		extra      []string
-	}{{"strong", strongWant, []string{"-link-archive", strong}}, {"alone", "weak: 10\n", nil}} {
+		name, want, signatures string
+		extra                  []string
+	}{{"strong", strongWant, strongSignatures, []string{"-link-archive", strong}}, {"alone", "weak: 10\n", signatures, nil}} {
 		app := filepath.Join(h.dst, "symedit-weak-"+c.name)
 		require(os.Mkdir(app, 0o755))
-		build := append([]string{h.bao, "build", "-target", h.target, "-bindings", signatures, "-weaken-symbol", weak + "=value", "-weaken-symbol", weak + "=hook"}, c.extra...)
+		build := append([]string{h.bao, "build", "-target", h.target, "-bindings", c.signatures, "-weaken-symbol", weak + "=value", "-weaken-symbol", weak + "=hook"}, c.extra...)
 		h.run("symedit-weak-"+c.name+"-producer.log", h.root, nil, append(build, "-o", filepath.Join(app, "native"), weak)...)
 		require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-windows-weak\ngo 1.26.0\n"), 0o644))
 		require(os.WriteFile(filepath.Join(app, "main.go"), []byte("package main\n\nimport (\n\t\"fmt\"\n\t\"runtime\"\n\n\tnative \"bao-windows-weak/native\"\n)\n\nfunc main() {\n\truntime.LockOSThread()\n\tv := native.Weak()\n\tnative.Shutdown()\n\tfmt.Println(\"weak:\", v)\n}\n"), 0o644))
@@ -263,9 +267,9 @@ func (h *harness) windowsWeaken(dir, weak, strong, arch string) {
 		results[c.name] = strings.TrimSpace(string(out))
 	}
 	// Without weakening, the two definitions collide.
-	out, err := h.command("symedit-weak-negative-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-bindings", signatures, "-weaken-symbol", weak+"=hook", "-link-archive", strong, "-o", filepath.Join(h.dst, "symedit-weak-negative"), weak)
+	out, err := h.command("symedit-weak-negative-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-bindings", strongSignatures, "-weaken-symbol", weak+"=hook", "-link-archive", strong, "-o", filepath.Join(h.dst, "symedit-weak-negative"), weak)
 	check(err != nil && strings.Contains(string(out), "duplicate"), "unweakened definitions did not collide: %v\n%s", err, out)
-	h.results["windows_weaken"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "results": results, "checks": "-weaken-symbol on a definition and a reference: a strong -link-archive definition wins, the weak default serves alone, the weak reference is NULL; negative control without weakening collides"}
+	h.results["windows_weaken"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "results": results, "checks": "-weaken-symbol on a definition and a reference: a strong definition from a -link-archive member that an export pulls in wins, the weak default serves alone, the weak reference is NULL; negative control without weakening collides"}
 }
 
 // windowsSectionEdits is darwinSectionEdits for COFF: CodeView or DWARF

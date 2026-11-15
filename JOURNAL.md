@@ -6384,3 +6384,27 @@ link-only checks: there is no Windows host. Bazel was not run.
   msvc-mode objects was not done: a safety check refused the command because
   of docker's `--rm` flag. Native results for all four drivers come from the
   new CI step.
+
+## 2026-11-15: COFF weakening CI fixture pulls the strong member
+
+Problem. In Actions run 43705103085, `windowsWeaken` failed on windows-amd64
+and windows-arm64. The build with the strong `-link-archive` printed
+`weak: 10`, not the expected 20.
+- An archive is searched only for unresolved names. Once weakened, the weak
+  default resolves `value`, so bao's COFF member selection never pulled
+  libstrong.a's member.
+- The same holds for archives on ELF.
+- The earlier lld-link check in `.work/symweaken` passed b.obj as an object,
+  which is always linked, so it did not show this.
+- The negative control had the same gap: without the member nothing could
+  collide.
+
+Change. `testdata/symedit_strong.c` also defines `bao_symedit_strong`. The
+strong build and the negative control export it, which pulls the member in.
+
+Verification. `bao build -target windows/amd64` was run locally on clang
+19.1.7 gnu- and msvc-mode objects (`.work/symweaken/pull`).
+- The strong build translated both objects ("2 Windows amd64 COFF objects").
+- Without `-weaken-symbol value`, the control fails with "duplicate
+  NODUPLICATES COMDAT external:value".
+- Nothing ran here. Native results come from CI.
