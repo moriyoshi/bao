@@ -5889,3 +5889,156 @@ llvm-objcopy (rust-objcopy, LLVM 22). Bazel was not run.
   0 FAIL, and `.work/symvis/e2e.sh` 50 ok, 0 FAIL.
 
 Remaining: section edits for Mach-O and COFF.
+
+## 2026-11-15: Mach-O and COFF section edits
+
+Problem. `-remove-section`, `-only-section` and `-add-symbol` were ELF only.
+Mach-O and COFF inputs were refused with "supported only for ELF".
+
+Decision and change (`symedit/macho.go`, `symedit/coff.go`):
+- Mach-O sections are matched as `SEGMENT,SECTION`, as llvm-objcopy names
+  them.
+  - `ParseAddSymbol` now splits off the section at the last colon before it
+    splits flags at commas, so `y=__DATA,__data:8,weak` parses.
+  - A removed section's header leaves its segment command. Later load
+    commands move up, and the freed bytes are zeroed. Segment extents and
+    every file offset stay as they were, and the removed contents stay in
+    the file unreferenced.
+  - Symbol `n_sect` values are renumbered, stabs included. So are the
+    section ordinals of section-relative relocations, except
+    ARM64_RELOC_ADDEND, which holds an addend there.
+  - Symbols defined in a removed section go. A kept extern relocation or
+    indirect entry naming one is an error, as is a kept section-relative
+    relocation naming a removed section.
+  - llvm-objcopy accepts that last case: it drops the relocations, leaving
+    `__compact_unwind` and DWARF entries unrelocated (see verification).
+  - Removing a pointer or stub section is refused while the object has
+    indirect symbol entries.
+  - LC_DATA_IN_CODE entries and LC_LINKER_OPTIMIZATION_HINT hints with an
+    address in a removed section are dropped. The rewritten blob goes at the
+    end of the file.
+- COFF:
+  - The section header table is compacted in place and NumberOfSections
+    updated. Symbol section numbers and the associative COMDAT target in
+    section-definition aux records are renumbered.
+  - As in llvm-objcopy, a section associated with a removed one goes too,
+    repeated until nothing changes.
+  - Symbols in removed sections go. A kept relocation, COMDAT key or weak
+    external tag naming one is an error.
+  - Removed sections' `.drectve` and `.llvm_addrsig` are skipped, and kept
+    `.llvm_addrsig` entries for removed symbols are dropped.
+- `-add-symbol` on Mach-O and COFF:
+  - There is no llvm-objcopy reference for either format; llvm-objcopy
+    rejects `--add-symbol` for both.
+  - Values are section offsets, as in ELF objects. Mach-O adds the section
+    address to get `n_value`.
+  - Mach-O: `hidden` makes a private extern, `weak` sets N_WEAK_DEF,
+    `protected` is refused, and type flags are ignored.
+  - COFF: values are 32-bit and `function` sets type 0x20. `weak`, `hidden`
+    and `protected` are refused. The section name must be unique.
+  - Names are looked up by output name. An existing undefined external of
+    that name is turned into the definition in place, so the object's
+    references bind to it, and the binding and strip passes skip it. ELF
+    still appends a separate symbol, matching llvm-objcopy.
+- Archives: each edited object reports the global names it added. Two
+  members adding the same one is an error, since an added symbol goes into
+  every member that has its section. This applies to ELF too.
+- `bao-verify` gains `darwinSectionEdits` and `windowsSectionEdits`, run
+  after the symbol edit step. They use `testdata/symedit_section.c`, one
+  function compiled with debug data (`-g`, or `/Z7` for msvc and clang-cl,
+  which also get `/Gy-`). Each step:
+  - finds the function's section;
+  - checks with debug/macho or debug/pe that bao objcopy removed the debug
+    sections and placed the alias with the function;
+  - builds a package that adds `bao_symedit_alias` at offset 0 of that
+    section and removes the debug sections;
+  - runs a consumer that wants 7 from both names (darwin also compares the
+    addresses);
+  - checks that removing the code section is refused.
+
+Findings:
+- On Darwin `ld -r` drops `__DWARF` sections. On the Mac, `ld -r -arch x86_64`
+  of the `-g` fixture went from 8 `__DWARF` sections to 0. So a combined-first
+  primary archive has no debug sections left to remove, and the darwin build
+  reported "Edited 1 symbols", the alias only.
+- clang-cl puts each function in a COMDAT `.text` beside an empty default
+  `.text` even without `/Gy`, so `-add-symbol` naming `.text` is ambiguous
+  there. `/Gy-` leaves one `.text`.
+- Clang's MinGW function sections keep their unwind data in COMDAT sections
+  of their own, `.xdata$f` and `.pdata$f`, with selection ANY rather than
+  associative. Removing `.text$f` alone is therefore refused, by llvm-objcopy
+  too, and `-wildcard -remove-section '*$f'` removes all three.
+  MSVC-environment function sections use associative `.pdata`/`.xdata`.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Reference: llvm-objcopy
+(rust-objcopy, LLVM 22). Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. New symedit tests cover:
+  - Mach-O removal and `-only-section` (identical output): symbol and
+    section-relative relocation renumbering, dropped hints, and refusals for
+    section-relative references, a referenced definition and an indirect
+    stub section;
+  - Mach-O added symbols (section offset plus address, private extern, weak,
+    absolute local, an undefined symbol turned into the definition) and
+    their refusals;
+  - COFF removal with associative renumbering, removal of a COMDAT section
+    with its associative one, `-only-section`, and the `.text` refusal;
+  - COFF added symbols and their refusals;
+  - the archive duplicate check and the `SEGMENT,SECTION` parse.
+- Mach-O, driver `.work/symsect2/run-mac.sh` (log `run-mac1.log`):
+  - Host: macOS 26.6.2 x86_64, Apple clang 17.0.0, ld-1230.1. x86_64
+    programs ran natively, while arm64 ones were only linked.
+  - Objects removing `__DWARF,*`, keeping only `__TEXT,*`, `__DATA,*` and
+    `__LD,*`, or adding three symbols each linked. On x86_64 they printed
+    the unedited `3 9 5 5`.
+  - A call through `vis_alias=__TEXT,__text:0,function` reached
+    hidden_helper on x86_64.
+  - arm64 linker optimization hints were kept, 8 bytes.
+  - `bao build` for darwin/amd64 and darwin/arm64 built packages for the CI
+    fixture. CGO_ENABLED=0 consumers were cross-built on Linux. The
+    darwin/amd64 one ran on the Mac and printed `direct: 7 alias: 7`, with
+    equal addresses.
+  - Refused: removing `__TEXT,__text` or `__DATA,__data` (DWARF has
+    section-relative relocations to both), adding a defined name, and the
+    build control that removes the fixture's `__TEXT,__text`.
+  - Section lists and symbol tables matched llvm-objcopy for the removal and
+    `-only-section` cases on both architectures.
+  - The run reported 30 ok and 2 FAIL. Both FAIL lines are the "remove the
+    code" parity case, where Bao refuses and llvm-objcopy accepts. Inspecting
+    llvm-objcopy's arm64 output shows it dropped the 8 `__compact_unwind` and
+    12 DWARF relocations into the removed `__text`. Bao's refusal is
+    intended.
+- COFF, driver `.work/symsect2/run-coff.sh` (log `run-coff3.log`):
+  - Toolchain: clang 19.1.7 in bao-cpp-cross:20261108, linking with
+    lld-link (rust-lld, LLD 22.1.8). Targets were x86_64/aarch64
+    windows-msvc and x86_64 windows-gnu. These were link-only checks, since
+    there is no Windows host or emulator here.
+  - Objects removing `.debug*`, the two `-only-section` forms (an explicit
+    list, and `*` with `!.debug*`) and three added symbols each linked with
+    lld-link, as did a program calling the alias.
+  - MinGW `-wildcard -remove-section '*$Py_Internal_thing'` removed exactly
+    the three sections. The rest linked, and a program calling the removed
+    function no longer linked.
+  - Removing every msvc-environment `.text` COMDAT also removed their
+    associative `.pdata`/`.xdata`.
+  - Refused: `.text`, `.text$Py_Internal_thing` alone, and adding a defined,
+    weak or hidden symbol.
+  - Matching llvm-objcopy for sections and symbols: the removal and
+    `-only-section` cases on all three targets, and the MinGW function
+    removal. Both tools refused the three refusal cases.
+  - The run reported 51 ok and 2 FAIL. Both FAIL lines are the msvc
+    "remove every COMDAT code section" case, and they differ only in
+    `.llvm_addrsig`. Bao's is empty. llvm-objcopy's keeps the entries 33 and
+    38, which named the removed `static_used` and `unused_static` and are
+    now past the end of the symbol table.
+- Windows CI step by hand, `.work/symsect2/run-coff-ci.sh` (log
+  `run-coff-ci2.log`): clang-19 in gnu and cl modes for windows/amd64 and
+  windows/arm64. Each passed the objcopy inspection, the bao build and the
+  refusal control, and had its consumer cross-built. Nothing ran; 12 ok,
+  0 FAIL.
+- Earlier drivers were rerun on this code, since the Mach-O and COFF rewrite
+  paths changed:
+  - `.work/symmacho/run.sh` gave 78 ok, 0 FAIL;
+  - `.work/symcoff/run.sh` gave 69 ok, 0 FAIL;
+  - `.work/symsect/run.sh` gave 34 ok, 0 FAIL.
+- The new CI steps have not run yet. Native execution on Windows and on
+  darwin/arm64 is left to them.

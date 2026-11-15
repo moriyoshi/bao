@@ -3,6 +3,7 @@ package symedit
 import (
 	"bytes"
 	"debug/elf"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,7 +18,10 @@ const (
 	lcSegment64   = 0x19
 	lcSymtab      = 0x2
 	lcDysymtab    = 0xb
+	lcDataInCode  = 0x29
+	lcLinkerHints = 0x2e
 	nlistSize     = 16
+	cpuARM64      = 0x0100000c
 
 	nStab    = 0xe0
 	nPext    = 0x10
@@ -38,17 +42,33 @@ const (
 	indirectAbs    = 0x40000000
 	relocExtern    = 1 << 27
 	relocSymbolMax = 1 << 24
+	// ARM64_RELOC_ADDEND stores an addend where others store a section.
+	arm64RelocAddend = 10
 )
 
 type machoSection struct {
 	segname, sectname string
+	addr, size        uint64
 	flags             uint32
 	reloff, nreloc    uint32
+}
+
+func (s machoSection) name() string { return s.segname + "," + s.sectname }
+
+// indirect reports a section type whose entries the indirect symbol table
+// lists: symbol pointers and stubs.
+func (s machoSection) indirect() bool {
+	switch s.flags & 0xff {
+	case 0x6, 0x7, 0x8, 0x10, 0x14:
+		return true
+	}
+	return false
 }
 
 type machoSymbol struct {
 	name  string
 	typ   byte
+	sect  byte
 	desc  uint16
 	value uint64
 }
@@ -114,10 +134,14 @@ func (s machoSymbol) rebind(bind elf.SymBind) (byte, uint16) {
 
 type machoFile struct {
 	data     []byte
+	cputype  uint32
 	sections []machoSection
-	// Load command offsets; dysymtab is 0 when the object has none.
-	symtab, dysymtab int
-	symbols          []machoSymbol
+	// Load command offsets; each is 0 when the object has none.
+	symtab, dysymtab, dataInCode, hints int
+	symbols                             []machoSymbol
+	// ordinals maps a section's input ordinal to its output one, or to 0
+	// for a removed section. It is nil when no section is removed.
+	ordinals []int
 }
 
 func isMachO(data []byte) bool {
@@ -136,7 +160,7 @@ func parseMachO(data []byte) (*machoFile, error) {
 	if uint64(sizeofcmds) > uint64(len(data)-machoHeader64) {
 		return nil, errors.New("Mach-O load commands are out of range")
 	}
-	f := &machoFile{data: data}
+	f := &machoFile{data: data, cputype: le.Uint32(data[4:])}
 	off, end := machoHeader64, machoHeader64+int(sizeofcmds)
 	for i := uint32(0); i < ncmds; i++ {
 		if end-off < 8 {
@@ -160,7 +184,7 @@ func parseMachO(data []byte) (*machoFile, error) {
 				h := c[72+80*j:]
 				s := machoSection{
 					sectname: strings.TrimRight(string(h[:16]), "\x00"), segname: strings.TrimRight(string(h[16:32]), "\x00"),
-					reloff: le.Uint32(h[56:]), nreloc: le.Uint32(h[60:]), flags: le.Uint32(h[64:]),
+					addr: le.Uint64(h[32:]), size: le.Uint64(h[40:]), reloff: le.Uint32(h[56:]), nreloc: le.Uint32(h[60:]), flags: le.Uint32(h[64:]),
 				}
 				if uint64(s.reloff)+8*uint64(s.nreloc) > uint64(len(data)) {
 					return nil, fmt.Errorf("Mach-O section %s,%s relocations are out of range", s.segname, s.sectname)
@@ -177,6 +201,15 @@ func parseMachO(data []byte) (*machoFile, error) {
 				return nil, errors.New("malformed or repeated Mach-O dynamic symbol table command")
 			}
 			f.dysymtab = off
+		case lcDataInCode, lcLinkerHints:
+			if size < 16 || uint64(le.Uint32(c[8:]))+uint64(le.Uint32(c[12:])) > uint64(len(data)) {
+				return nil, errors.New("malformed Mach-O linkedit data command")
+			}
+			if cmd == lcDataInCode {
+				f.dataInCode = off
+			} else {
+				f.hints = off
+			}
 		}
 		off += size
 	}
@@ -204,7 +237,7 @@ func parseMachO(data []byte) (*machoFile, error) {
 			}
 			name = string(strtab[strx : int(strx)+end])
 		}
-		f.symbols[i] = machoSymbol{name: name, typ: e[4], desc: le.Uint16(e[6:]), value: le.Uint64(e[8:])}
+		f.symbols[i] = machoSymbol{name: name, typ: e[4], sect: e[5], desc: le.Uint16(e[6:]), value: le.Uint64(e[8:])}
 	}
 	if f.dysymtab != 0 {
 		d := data[f.dysymtab:]
@@ -255,9 +288,13 @@ func (f *machoFile) undefined() []string {
 	return out
 }
 
-// relocations calls fn with each relocation's second word, by file offset.
+// relocations calls fn with each relocation's second word, by file offset,
+// in the sections that are kept.
 func (f *machoFile) relocations(out []byte, fn func(s machoSection, off int) error) error {
-	for _, s := range f.sections {
+	for k, s := range f.sections {
+		if f.ordinals != nil && f.ordinals[k+1] == 0 {
+			continue
+		}
 		for i := uint32(0); i < s.nreloc; i++ {
 			off := int(s.reloff) + 8*int(i)
 			// Scattered relocations exist only in 32-bit objects.
@@ -281,6 +318,54 @@ func (f *machoFile) indirect(out []byte) []byte {
 	return out[off : off+4*n]
 }
 
+// sectionOrdinals applies -remove-section and -only-section, which name a
+// section SEGMENT,SECTION as llvm-objcopy does. It sets f.ordinals when a
+// section goes and returns how many do.
+func (f *machoFile) sectionOrdinals(e Edits) (int, error) {
+	if e.RemoveSection.empty() && e.OnlySection.empty() {
+		return 0, nil
+	}
+	ordinals := make([]int, len(f.sections)+1)
+	next, dropped := 1, 0
+	for k, s := range f.sections {
+		if e.RemoveSection.Match(s.name()) || !e.OnlySection.empty() && !e.OnlySection.Match(s.name()) {
+			if s.indirect() && len(f.indirect(f.data)) > 0 {
+				return 0, fmt.Errorf("cannot remove Mach-O section %s, whose entries the indirect symbol table lists", s.name())
+			}
+			dropped++
+			continue
+		}
+		ordinals[k+1] = next
+		next++
+	}
+	if dropped > 0 {
+		f.ordinals = ordinals
+	}
+	return dropped, nil
+}
+
+// sectionOf returns the input ordinal of the section a symbol is defined
+// in, or 0. Stabs record one too.
+func (s machoSymbol) sectionOf() int {
+	if s.typ&nType == nSect || s.stab() {
+		return int(s.sect)
+	}
+	return 0
+}
+
+// sectionReference returns the input section ordinal that a non-extern
+// relocation word names, or 0 for an absolute one or an ARM64 addend.
+func (f *machoFile) sectionReference(word uint32) int {
+	if word&relocExtern != 0 || f.cputype == cpuARM64 && word>>28 == arm64RelocAddend {
+		return 0
+	}
+	return int(word & (relocSymbolMax - 1))
+}
+
+func (f *machoFile) removed(ordinal int) bool {
+	return f.ordinals != nil && ordinal > 0 && ordinal < len(f.ordinals) && f.ordinals[ordinal] == 0
+}
+
 // editMachO applies the edits to an object, matching C names. It always
 // rebuilds the symbol table in the order ld64 and LLVM write: locals in input
 // order, then external definitions and undefined symbols, each sorted by name.
@@ -289,11 +374,18 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
-	if e.editsSections() {
-		return objectResult{}, errors.New("section edits and added symbols are supported only for ELF, not Mach-O")
-	}
-	if e.empty() || f.symtab == 0 {
+	if e.empty() {
 		return objectResult{data: data}, nil
+	}
+	if f.symtab == 0 {
+		if e.editsSections() {
+			return objectResult{}, errors.New("section edits need a Mach-O symbol table")
+		}
+		return objectResult{data: data}, nil
+	}
+	droppedCount, err := f.sectionOrdinals(e)
+	if err != nil {
+		return objectResult{}, err
 	}
 	symbols := append([]machoSymbol{}, f.symbols...)
 	n := len(symbols)
@@ -379,8 +471,12 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 	if len(symbols) > n && retargeted == 0 {
 		symbols = symbols[:n]
 	}
+	added, err := f.addSymbols(&symbols, e.AddSymbols)
+	if err != nil {
+		return objectResult{}, err
+	}
 	referenced := make([]bool, len(symbols))
-	err = f.relocations(out, func(_ machoSection, off int) error {
+	err = f.relocations(out, func(s machoSection, off int) error {
 		word := le.Uint32(out[off:])
 		if word&relocExtern != 0 {
 			sym := word & (relocSymbolMax - 1)
@@ -388,6 +484,8 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 				return fmt.Errorf("Mach-O relocation names symbol %d of %d", sym, len(referenced))
 			}
 			referenced[sym] = true
+		} else if k := f.sectionReference(word); f.removed(k) {
+			return fmt.Errorf("cannot remove Mach-O section %s: a kept relocation in %s refers to it", f.sections[k-1].name(), s.name())
 		}
 		return nil
 	})
@@ -403,29 +501,33 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 			referenced[sym] = true
 		}
 	}
-	for i, s := range f.symbols {
-		// Removing such a symbol would let the linker dead strip its atom.
-		if !s.stab() && s.desc&(nNoDeadStrip|referencedDynamically) != 0 {
-			referenced[i] = true
-		}
-	}
 	rebound, removedCount := 0, 0
 	var hidden []string
 	for i, s := range f.symbols {
 		if removed[i] {
 			continue
 		}
+		if symbols[i].typ&nType != s.typ&nType {
+			continue // -add-symbol defined it
+		}
 		v := s.view()
 		bind := e.binding(v)
 		local := bind == elf.STB_LOCAL
 		name := s.cname()
+		// Removing such a symbol would let the linker dead strip its atom.
+		kept := referenced[i] || !s.stab() && s.desc&(nNoDeadStrip|referencedDynamically) != 0
 		switch {
-		case name != "" && e.Strip.Match(name):
+		case f.removed(s.sectionOf()):
 			if referenced[i] {
+				return objectResult{}, fmt.Errorf("cannot remove Mach-O section %s: a kept relocation or indirect symbol names %s, defined in it", f.sections[s.sect-1].name(), s.name)
+			}
+			removed[i] = true
+		case name != "" && e.Strip.Match(name):
+			if kept {
 				return objectResult{}, fmt.Errorf("not stripping symbol %s because a relocation or indirect symbol names it, or it is marked no-dead-strip", name)
 			}
 			removed[i] = true
-		case e.StripUnneeded && !referenced[i] && !s.stab() && !s.common() && (local || s.undefined()):
+		case e.StripUnneeded && !kept && !s.stab() && !s.common() && (local || s.undefined()):
 			removed[i] = true
 		}
 		if removed[i] {
@@ -438,19 +540,215 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 			hidden = append(hidden, strings.TrimPrefix(symbols[i].name, "_"))
 		}
 	}
-	edited := renamed + retargeted + rebound + removedCount
+	edited := renamed + retargeted + rebound + removedCount + droppedCount + len(e.AddSymbols)
 	if edited == 0 {
 		return objectResult{data: data}, nil
+	}
+	if err := f.dropHints(&out); err != nil {
+		return objectResult{}, err
 	}
 	if err := f.rewrite(&out, symbols, removed); err != nil {
 		return objectResult{}, err
 	}
-	return objectResult{data: out, edited: edited, hidden: hidden}, nil
+	if f.ordinals != nil {
+		f.compactSections(out)
+	}
+	return objectResult{data: out, edited: edited, hidden: hidden, added: added}, nil
+}
+
+// addSymbols applies -add-symbol. A value is an offset in its section, as
+// in ELF relocatable objects. Hidden makes an external symbol a private
+// extern; Mach-O has no protected visibility, and the symbol type has no
+// equivalent. An undefined symbol of the name becomes the definition, so
+// the object's references bind to it. It returns the names it defines
+// externally.
+func (f *machoFile) addSymbols(symbols *[]machoSymbol, adds []AddedSymbol) ([]string, error) {
+	// Names are output names: those after renames and wraps.
+	existing := map[string]int{}
+	for i, s := range *symbols {
+		if _, ok := existing[s.name]; !ok && s.external() {
+			existing[s.name] = i
+		}
+	}
+	var added []string
+	for _, a := range adds {
+		s := machoSymbol{name: "_" + a.Name, typ: nAbs, value: a.Value}
+		if a.Section != "" {
+			k := 0
+			for j, sec := range f.sections {
+				if sec.name() == a.Section {
+					k = j + 1
+					break
+				}
+			}
+			if k == 0 || f.removed(k) {
+				return nil, fmt.Errorf("cannot add symbol %s to missing Mach-O section %s; name it SEGMENT,SECTION", a.Name, a.Section)
+			}
+			s.typ, s.sect, s.value = nSect, byte(k), f.sections[k-1].addr+a.Value
+		}
+		switch a.Bind {
+		case elf.STB_WEAK:
+			s.typ |= nExt
+			s.desc |= nWeakDef
+		case elf.STB_GLOBAL:
+			s.typ |= nExt
+		}
+		switch a.Visibility {
+		case elf.STV_HIDDEN:
+			if s.typ&nExt != 0 {
+				s.typ |= nPext
+			}
+		case elf.STV_PROTECTED:
+			return nil, fmt.Errorf("cannot add symbol %s: Mach-O has no protected visibility", a.Name)
+		}
+		if s.typ&nExt != 0 {
+			added = append(added, a.Name)
+		}
+		if at, ok := existing[s.name]; ok {
+			if old := (*symbols)[at]; !old.undefined() || old.common() {
+				return nil, fmt.Errorf("cannot add symbol %s, which is already defined", a.Name)
+			}
+			(*symbols)[at] = s
+			continue
+		}
+		if s.typ&nExt != 0 {
+			existing[s.name] = len(*symbols)
+		}
+		*symbols = append(*symbols, s)
+	}
+	return added, nil
+}
+
+// dropHints removes the data-in-code entries and linker optimization hints
+// that describe addresses in removed sections. Neither is needed for
+// correctness, and a kept one would name an address no section holds.
+func (f *machoFile) dropHints(out *[]byte) error {
+	if f.ordinals == nil {
+		return nil
+	}
+	gone := func(addr uint64) bool {
+		for k, s := range f.sections {
+			if f.ordinals[k+1] == 0 && addr >= s.addr && addr-s.addr < s.size {
+				return true
+			}
+		}
+		return false
+	}
+	place := func(cmd int, kept []byte) {
+		for len(*out)%8 != 0 {
+			*out = append(*out, 0)
+		}
+		le.PutUint32((*out)[cmd+8:], uint32(len(*out)))
+		le.PutUint32((*out)[cmd+12:], uint32(len(kept)))
+		*out = append(*out, kept...)
+	}
+	blob := func(cmd int) []byte {
+		off, size := le.Uint32(f.data[cmd+8:]), le.Uint32(f.data[cmd+12:])
+		return f.data[off : off+size]
+	}
+	if f.dataInCode != 0 {
+		// Entries are an address, a length and a kind.
+		old := blob(f.dataInCode)
+		var kept []byte
+		for i := 0; i+8 <= len(old); i += 8 {
+			if !gone(uint64(le.Uint32(old[i:]))) {
+				kept = append(kept, old[i:i+8]...)
+			}
+		}
+		if len(kept) != len(old) {
+			place(f.dataInCode, kept)
+		}
+	}
+	if f.hints != 0 {
+		// Each hint is a kind, an address count and the addresses, all
+		// ULEB128; zeros pad the list.
+		old := blob(f.hints)
+		var kept []byte
+		changed := false
+		uleb := func(data []byte) (uint64, []byte, error) {
+			v, k := binary.Uvarint(data)
+			if k <= 0 {
+				return 0, nil, errors.New("malformed Mach-O linker optimization hints")
+			}
+			return v, data[k:], nil
+		}
+		for data := old; len(data) > 0; {
+			start := data
+			kind, rest, err := uleb(data)
+			if err != nil {
+				return err
+			}
+			if kind == 0 {
+				break
+			}
+			count, rest, err := uleb(rest)
+			if err != nil {
+				return err
+			}
+			drop := false
+			for j := uint64(0); j < count; j++ {
+				var addr uint64
+				if addr, rest, err = uleb(rest); err != nil {
+					return err
+				}
+				drop = drop || gone(addr)
+			}
+			if drop {
+				changed = true
+			} else {
+				kept = append(kept, start[:len(start)-len(rest)]...)
+			}
+			data = rest
+		}
+		if changed {
+			for len(kept)%8 != 0 {
+				kept = append(kept, 0)
+			}
+			place(f.hints, kept)
+		}
+	}
+	return nil
+}
+
+// compactSections rewrites the segment commands without the headers of
+// removed sections. The segments keep their extents and the removed
+// sections' bytes stay unreferenced, so no other offset moves; the load
+// commands after a segment move up and the space they leave is zeroed.
+func (f *machoFile) compactSections(out []byte) {
+	ncmds, sizeofcmds := le.Uint32(out[16:]), int(le.Uint32(out[20:]))
+	cmds := out[machoHeader64 : machoHeader64+sizeofcmds]
+	packed := make([]byte, 0, len(cmds))
+	ordinal := 0
+	for i, off := uint32(0), 0; i < ncmds; i++ {
+		c := cmds[off : off+int(le.Uint32(cmds[off+4:]))]
+		off += len(c)
+		if le.Uint32(c) != lcSegment64 {
+			packed = append(packed, c...)
+			continue
+		}
+		n := int(le.Uint32(c[64:]))
+		seg := append([]byte{}, c[:72]...)
+		kept := 0
+		for j := 0; j < n; j++ {
+			ordinal++
+			if f.ordinals[ordinal] != 0 {
+				seg = append(seg, c[72+80*j:72+80*(j+1)]...)
+				kept++
+			}
+		}
+		seg = append(seg, c[72+80*n:]...)
+		le.PutUint32(seg[4:], uint32(len(seg)))
+		le.PutUint32(seg[64:], uint32(kept))
+		packed = append(packed, seg...)
+	}
+	copy(cmds, packed)
+	clear(cmds[len(packed):])
+	le.PutUint32(out[20:], uint32(len(packed)))
 }
 
 // rewrite places a new symbol and string table at the end of out, then
-// renumbers extern relocations and indirect symbols. Entries of symbols past
-// the input's are added undefined symbols.
+// renumbers extern relocations, indirect symbols and, when sections go,
+// section ordinals. Entries of symbols past the input's are added ones.
 func (f *machoFile) rewrite(out *[]byte, symbols []machoSymbol, removed []bool) error {
 	n := len(f.symbols)
 	var locals, defs, undefs []int
@@ -484,6 +782,9 @@ func (f *machoFile) rewrite(out *[]byte, symbols []machoSymbol, removed []bool) 
 	err := f.relocations(*out, func(_ machoSection, off int) error {
 		word := le.Uint32((*out)[off:])
 		if word&relocExtern == 0 {
+			if k := f.sectionReference(word); k != 0 && f.ordinals != nil && k < len(f.ordinals) {
+				le.PutUint32((*out)[off:], word&^(relocSymbolMax-1)|uint32(f.ordinals[k]))
+			}
 			return nil
 		}
 		sym := index[word&(relocSymbolMax-1)]
@@ -529,8 +830,12 @@ func (f *machoFile) rewrite(out *[]byte, symbols []machoSymbol, removed []bool) 
 			}
 			le.PutUint32(entry, off)
 		}
-		entry[4] = s.typ
+		entry[4], entry[5] = s.typ, s.sect
+		if k := s.sectionOf(); f.ordinals != nil && k > 0 && k < len(f.ordinals) {
+			entry[5] = byte(f.ordinals[k])
+		}
 		le.PutUint16(entry[6:], s.desc)
+		le.PutUint64(entry[8:], s.value)
 		table = append(table, entry...)
 	}
 	for len(strtab)%8 != 0 {

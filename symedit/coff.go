@@ -24,6 +24,10 @@ const (
 	coffClassStatic       = 3
 	coffClassWeakExternal = 105
 
+	coffSymAbsolute       = -1
+	coffTypeFunction      = 0x20
+	coffSelectAssociative = 5
+
 	coffNrelocOvfl  = 0x01000000
 	coffComdat      = 0x00001000
 	coffDiscardable = 0x02000000
@@ -46,6 +50,7 @@ type coffSymbol struct {
 	name      string
 	value     uint32
 	section   int16
+	typ       uint16
 	class     byte
 	naux      int
 	isSection bool // the section-definition symbol of its section
@@ -86,6 +91,9 @@ type coffFile struct {
 	records  int // symbol table records, including auxiliary ones
 	symoff   uint32
 	strtab   []byte // including its 4-byte size
+	// numbers maps a section's input number to its output one, or to 0 for
+	// a removed section. It is nil when no section is removed.
+	numbers []int
 }
 
 func isCOFF(data []byte) bool {
@@ -170,7 +178,7 @@ func parseCOFF(data []byte) (*coffFile, error) {
 	}
 	for i := 0; i < f.records; {
 		e := data[int(f.symoff)+i*coffSymbolSize:]
-		s := coffSymbol{index: i, value: le.Uint32(e[8:]), section: int16(le.Uint16(e[12:])), class: e[16], naux: int(e[17])}
+		s := coffSymbol{index: i, value: le.Uint32(e[8:]), section: int16(le.Uint16(e[12:])), typ: le.Uint16(e[14:]), class: e[16], naux: int(e[17])}
 		if le.Uint32(e) == 0 {
 			name, err := str(le.Uint32(e[4:]))
 			if err != nil {
@@ -236,7 +244,7 @@ func (f *coffFile) rewriteDirectives(renamed map[string]string, hidden map[strin
 		return n
 	}
 	for i, s := range f.sections {
-		if s.name != ".drectve" {
+		if s.name != ".drectve" || f.removed(i+1) {
 			continue
 		}
 		contents := strings.Trim(string(f.data[s.contents:s.contents+s.size]), "\x00")
@@ -285,8 +293,13 @@ func (f *coffFile) rewriteDirectives(renamed map[string]string, hidden map[strin
 	return out, nil
 }
 
+// relocations calls fn with the symbol index field of each relocation in
+// the sections that are kept.
 func (f *coffFile) relocations(out []byte, fn func(s coffSection, off int) error) error {
-	for _, s := range f.sections {
+	for k, s := range f.sections {
+		if f.removed(k + 1) {
+			continue
+		}
 		for i := s.firstReloc; i < s.nreloc; i++ {
 			if err := fn(s, int(s.reloff)+int(i)*coffRelocSize+4); err != nil {
 				return err
@@ -302,6 +315,137 @@ func (s coffSection) runtimeReference() bool {
 	return !strings.HasPrefix(s.name, ".debug$") && !strings.HasPrefix(s.name, ".pdata") && !strings.HasPrefix(s.name, ".xdata") && s.flags&coffDiscardable == 0
 }
 
+func (f *coffFile) removed(number int) bool {
+	return f.numbers != nil && number > 0 && number < len(f.numbers) && f.numbers[number] == 0
+}
+
+// aux returns the first auxiliary record of a symbol.
+func (f *coffFile) aux(s coffSymbol) []byte {
+	return f.data[int(f.symoff)+(s.index+1)*coffSymbolSize:][:coffSymbolSize]
+}
+
+// sectionNumbers applies -remove-section and -only-section. As in
+// llvm-objcopy, an associative COMDAT section goes with the section it is
+// associated with. It sets f.numbers when a section goes and returns how
+// many do.
+func (f *coffFile) sectionNumbers(e Edits) (int, error) {
+	if e.RemoveSection.empty() && e.OnlySection.empty() {
+		return 0, nil
+	}
+	drop := make([]bool, len(f.sections)+1)
+	for k, s := range f.sections {
+		drop[k+1] = e.RemoveSection.Match(s.name) || !e.OnlySection.empty() && !e.OnlySection.Match(s.name)
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, s := range f.symbols {
+			if !s.isSection || drop[s.section] || f.sections[s.section-1].flags&coffComdat == 0 {
+				continue
+			}
+			if aux := f.aux(s); aux[14] == coffSelectAssociative {
+				if to := int(le.Uint16(aux[12:])); to < len(drop) && drop[to] {
+					drop[s.section], changed = true, true
+				}
+			}
+		}
+	}
+	numbers := make([]int, len(drop))
+	next, dropped := 1, 0
+	for k := 1; k < len(drop); k++ {
+		if drop[k] {
+			dropped++
+		} else {
+			numbers[k] = next
+			next++
+		}
+	}
+	if dropped > 0 {
+		f.numbers = numbers
+	}
+	return dropped, nil
+}
+
+// addSymbols applies -add-symbol. COFF has no symbol visibility and its weak
+// externals need a default definition, so hidden, protected and weak are
+// rejected; function sets the function type. An undefined symbol of the
+// name becomes the definition, so the object's references bind to it. It
+// returns the names it defines externally.
+func (f *coffFile) addSymbols(symbols *[]coffSymbol, adds []AddedSymbol) ([]string, error) {
+	// Names are output names: those after renames and wraps.
+	existing := map[string]int{}
+	for i, s := range *symbols {
+		if _, ok := existing[s.name]; !ok && s.external() {
+			existing[s.name] = i
+		}
+	}
+	var added []string
+	for _, a := range adds {
+		if a.Value > 0xffffffff {
+			return nil, fmt.Errorf("cannot add symbol %s: COFF symbol values have 32 bits", a.Name)
+		}
+		s := coffSymbol{index: -1, name: a.Name, class: coffClassExternal, section: coffSymAbsolute, value: uint32(a.Value)}
+		if a.Section != "" {
+			k := 0
+			for j, sec := range f.sections {
+				if sec.name != a.Section || f.removed(j+1) {
+					continue
+				}
+				if k != 0 {
+					return nil, fmt.Errorf("cannot add symbol %s: more than one COFF section is named %s", a.Name, a.Section)
+				}
+				k = j + 1
+			}
+			if k == 0 {
+				return nil, fmt.Errorf("cannot add symbol %s to missing COFF section %s", a.Name, a.Section)
+			}
+			s.section = int16(k)
+		}
+		switch a.Bind {
+		case elf.STB_LOCAL:
+			s.class = coffClassStatic
+		case elf.STB_WEAK:
+			return nil, fmt.Errorf("cannot add weak symbol %s: COFF weak externals need a default definition", a.Name)
+		default:
+			added = append(added, a.Name)
+		}
+		if a.Visibility != elf.STV_DEFAULT {
+			return nil, fmt.Errorf("cannot add symbol %s with a visibility: COFF has none", a.Name)
+		}
+		if a.Type == elf.STT_FUNC {
+			s.typ = coffTypeFunction
+		}
+		if at, ok := existing[s.name]; ok {
+			old := (*symbols)[at]
+			if !old.undefined() {
+				return nil, fmt.Errorf("cannot add symbol %s, which is already defined", a.Name)
+			}
+			s.index, s.naux = old.index, old.naux
+			(*symbols)[at] = s
+			continue
+		}
+		if s.class == coffClassExternal {
+			existing[s.name] = len(*symbols)
+		}
+		*symbols = append(*symbols, s)
+	}
+	return added, nil
+}
+
+// compactSections writes the section header table without the removed
+// sections. Their contents and relocations stay unreferenced, so no other
+// offset moves.
+func (f *coffFile) compactSections(out []byte) {
+	var table []byte
+	for k, s := range f.sections {
+		if !f.removed(k + 1) {
+			table = append(table, out[s.header:s.header+coffSectionHeader]...)
+		}
+	}
+	copy(out[coffFileHeader:], table)
+	clear(out[coffFileHeader+len(table) : coffFileHeader+len(f.sections)*coffSectionHeader])
+	le.PutUint16(out[2:], uint16(len(table)/coffSectionHeader))
+}
+
 // editCOFF applies the edits to an amd64 or arm64 COFF object. Local and
 // global symbols need no order in COFF, so binding changes edit the storage
 // class in place; removals rebuild the table and renumber references.
@@ -310,14 +454,21 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
-	if e.editsSections() {
-		return objectResult{}, errors.New("section edits and added symbols are supported only for ELF, not COFF")
+	if e.empty() {
+		return objectResult{data: data}, nil
 	}
-	if e.empty() || f.records == 0 {
+	if f.records == 0 {
+		if e.editsSections() {
+			return objectResult{}, errors.New("section edits need a COFF symbol table")
+		}
 		return objectResult{data: data}, nil
 	}
 	if !e.Weaken.empty() {
 		return objectResult{}, errors.New("weakening is unsupported for COFF, whose weak externals need a default definition")
+	}
+	droppedCount, err := f.sectionNumbers(e)
+	if err != nil {
+		return objectResult{}, err
 	}
 	symbols := append([]coffSymbol{}, f.symbols...)
 	n := len(symbols)
@@ -423,6 +574,10 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	if len(symbols) > n && retargeted == 0 {
 		symbols = symbols[:n]
 	}
+	added, err := f.addSymbols(&symbols, e.AddSymbols)
+	if err != nil {
+		return objectResult{}, err
+	}
 	referenced := make([]bool, len(symbols))
 	err = f.relocations(out, func(_ coffSection, off int) error {
 		sym := le.Uint32(out[off:])
@@ -443,7 +598,7 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	// A COMDAT section's key is the first symbol after its section
 	// definition; a weak external's default is named by its tag.
 	for i, s := range f.symbols {
-		if s.isSection && s.section > 0 && f.sections[s.section-1].flags&coffComdat != 0 {
+		if s.isSection && s.section > 0 && !f.removed(int(s.section)) && f.sections[s.section-1].flags&coffComdat != 0 {
 			for j := i + 1; j < n; j++ {
 				if f.symbols[j].section == s.section && !f.symbols[j].isSection {
 					referenced[j] = true
@@ -468,11 +623,19 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 		if removed[i] {
 			continue
 		}
+		if symbols[i].section != s.section {
+			continue // -add-symbol defined it
+		}
 		name := s.cname()
 		v := s.view()
 		bind := e.binding(v)
 		local := bind == elf.STB_LOCAL
 		switch {
+		case f.removed(int(s.section)):
+			if referenced[i] {
+				return objectResult{}, fmt.Errorf("cannot remove COFF section %s: a kept relocation, COMDAT section or weak external names %s, defined in it", f.sections[s.section-1].name, s.name)
+			}
+			removed[i] = true
 		case name != "" && e.Strip.Match(name):
 			if referenced[i] {
 				return objectResult{}, fmt.Errorf("not stripping symbol %s because a relocation, COMDAT section or weak external names it", name)
@@ -494,7 +657,7 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 			hidden = append(hidden, symbols[i].name)
 		}
 	}
-	edited := renamed + retargeted + rebound + removedCount
+	edited := renamed + retargeted + rebound + removedCount + droppedCount + len(e.AddSymbols)
 	if edited == 0 {
 		return objectResult{data: data}, nil
 	}
@@ -522,7 +685,10 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	if err := f.rewrite(&out, symbols, classes, removed, byRecord, directives); err != nil {
 		return objectResult{}, err
 	}
-	return objectResult{data: out, edited: edited, hidden: hidden}, nil
+	if f.numbers != nil {
+		f.compactSections(out)
+	}
+	return objectResult{data: out, edited: edited, hidden: hidden, added: added}, nil
 }
 
 // rewrite places a new symbol and string table at the end of out and
@@ -577,10 +743,21 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 			continue
 		}
 		entry := make([]byte, coffSymbolSize*(1+s.naux))
-		if i < n {
+		if s.index >= 0 {
 			copy(entry, f.data[int(f.symoff)+s.index*coffSymbolSize:])
-		} else {
-			entry[16] = s.class
+		}
+		section := s.section
+		if f.numbers != nil && section > 0 {
+			section = int16(f.numbers[section])
+		}
+		le.PutUint32(entry[8:], s.value)
+		le.PutUint16(entry[12:], uint16(section))
+		le.PutUint16(entry[14:], s.typ)
+		// An associative COMDAT section names the section it follows.
+		if s.isSection && f.numbers != nil && entry[coffSymbolSize+14] == coffSelectAssociative {
+			if to := int(le.Uint16(entry[coffSymbolSize+12:])); to < len(f.numbers) {
+				le.PutUint16(entry[coffSymbolSize+12:], uint16(f.numbers[to]))
+			}
 		}
 		if i >= n || s.name != f.symbols[i].name {
 			for j := 0; j < 8; j++ {
@@ -617,8 +794,8 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 	}
 	le.PutUint32(strtab, uint32(len(strtab)))
 	// LLVM's address-significance table lists symbol indices as ULEB128.
-	for _, s := range f.sections {
-		if s.name != ".llvm_addrsig" || s.size == 0 {
+	for k, s := range f.sections {
+		if s.name != ".llvm_addrsig" || s.size == 0 || f.removed(k+1) {
 			continue
 		}
 		var list []byte

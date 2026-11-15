@@ -855,39 +855,79 @@ bao objcopy -localize-hidden -strip-unneeded libpython.o libpython-private.o
 #### Section edits
 
 These flags remove sections or add symbols, as the llvm-objcopy flags of the
-same names do. They are for ELF only, and Mach-O and COFF inputs reject them.
-In `bao build` each names its component first, as for the binding flags.
+same names do, in ELF, Mach-O and COFF objects. In `bao build` each names its
+component first, as for the binding flags.
 
 | Flag | Effect |
 | --- | --- |
-| `-remove-section SECTION` | Remove the section, its relocation sections and the symbols defined in it |
-| `-only-section SECTION` | Keep only matching sections, with their relocations, groups, and the symbol, string and section name tables |
+| `-remove-section SECTION` | Remove the section, its relocations and the symbols defined in it |
+| `-only-section SECTION` | Keep only matching sections, with their relocations; ELF also keeps groups and the symbol, string and section name tables |
 | `-add-symbol NAME=[SECTION:]VALUE[,FLAGS]` | Add a symbol at an offset in a section, or an absolute one without a section |
 
-`-wildcard` makes section names shell patterns too. `-add-symbol` flags are
-`global` (the default), `local`, `weak`, `default`, `hidden`, `protected`,
-`object`, `function` and `notype`. Adding a name the object already defines
-is an error.
+Mach-O sections are named `SEGMENT,SECTION`, such as `__TEXT,__text`, as
+llvm-objcopy names them. `-wildcard` makes section names shell patterns too.
+`-add-symbol` flags are `global` (the default), `local`, `weak`, `default`,
+`hidden`, `protected`, `object`, `function` and `notype`. Adding a name the
+object already defines is an error. In an archive, a symbol is added to each
+member that has its section, and two members defining it is an error.
 
-Removal renumbers every section index: symbol sections, the extended index
-table, links, relocation targets, group members and the section name table
-index. A section group goes when its last member does. The edit is refused
-in these cases:
+On ELF, removal renumbers every section index: symbol sections, the extended
+index table, links, relocation targets, group members and the section name
+table index. A section group goes when its last member does. On Mach-O and
+COFF, the removed sections' headers leave the segment command or section
+table, and symbol and relocation section numbers are renumbered. Their
+contents stay in the file, unreferenced, so no other offset moves. The edit
+is refused in these cases:
 
 - A kept relocation or section group names a symbol defined in a removed
-  section. That includes its section symbol, which `.eh_frame` and debug data
-  usually name, as llvm-objcopy also refuses.
-- A kept section links to a removed one.
-- A removal targets the symbol, string or section name table.
+  section. That includes an ELF or COFF section symbol, which unwind and
+  debug data usually name, as llvm-objcopy also refuses.
+- A kept Mach-O section-relative relocation names a removed section.
+  `__compact_unwind` and DWARF use these for `__text`. llvm-objcopy drops such
+  relocations instead, which leaves those entries unrelocated.
+- A Mach-O symbol pointer or stub section would go, since the indirect symbol
+  table lists its entries.
+- A kept ELF section links to a removed one.
+- A removal targets the ELF symbol, string or section name table.
 
-Unlike llvm-objcopy, `-only-section` keeps the relocations of the sections it
-keeps, so the result still links.
+Unlike llvm-objcopy, `-only-section` keeps the relocations of the ELF sections
+it keeps, so the result still links.
+
+Format notes:
+
+- Mach-O data-in-code entries and linker optimization hints for addresses in
+  removed sections are dropped.
+- A COFF associative COMDAT section, such as the `.pdata` and `.xdata` of an
+  MSVC-environment function section, goes with the section it is associated
+  with, as in llvm-objcopy. MinGW function sections such as `.text$f` keep
+  their unwind data in COMDAT sections of their own, `.xdata$f` and
+  `.pdata$f`; remove them together with `-wildcard -remove-section '*$f'`.
+- A COFF `.llvm_addrsig` entry for a removed symbol is dropped. llvm-objcopy
+  keeps it, with an index past the new symbol table.
+- A Mach-O `-add-symbol` value is an offset in its section, as in ELF objects.
+  `hidden` makes a private extern; Mach-O has no `protected` visibility and no
+  symbol types.
+- A COFF `-add-symbol` section name must be unique in the object. Several
+  COMDAT sections often share one, such as `.text` with clang-cl (`/Gy-`
+  avoids that) and `.text$mn` with `/Gy`. COFF has no symbol visibility, and
+  its weak externals need a default definition, so `hidden`, `protected` and
+  `weak` are refused. `function` sets the function type.
+- On Mach-O and COFF, an undefined symbol of the added name becomes the
+  definition, so the object's references bind to it. ELF adds a separate
+  symbol, as llvm-objcopy does.
+- `ld -r` merges a Darwin primary archive's sections when `bao build` combines
+  it first, so section names then cover every member, and `ld -r` itself
+  drops `__DWARF` sections.
 
 ```sh
 # Export an alias at the start of a function's section, and drop .comment.
 bao build -target linux/arm64 -symbol app_main -symbol app_entry_alias \
   -add-symbol 'libapp.a=app_entry_alias=.text.app_main:0,function' \
   -remove-section libapp.a=.comment -o ./native libapp.a
+
+# Drop Mach-O debug data and alias the function at the start of __text.
+bao objcopy -wildcard -remove-section '__DWARF,*' \
+  -add-symbol 'app_alias=__TEXT,__text:0,function' app.o app-nodebug.o
 ```
 
 ### Function bindings and native debug stripping

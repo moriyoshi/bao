@@ -47,9 +47,9 @@ func (f *symbolEditFlags) register(fs *flag.FlagSet, scoped bool, prefixUsage st
 	if scoped {
 		section, add = "PATH=SECTION", "PATH="+add
 	}
-	fs.Var(&f.removeSection, "remove-section", section+": remove that ELF section"+where+", its relocations and its symbols; repeatable")
-	fs.Var(&f.onlySection, "only-section", section+": keep only the matching ELF sections"+where+" and the symbol and string tables; repeatable")
-	fs.Var(&f.addSymbol, "add-symbol", add+": add an ELF symbol"+where+", as llvm-objcopy --add-symbol; FLAGS are global, local, weak, default, hidden, protected, object, function or notype; repeatable")
+	fs.Var(&f.removeSection, "remove-section", section+": remove that section"+where+", its relocations and its symbols; Mach-O sections are SEGMENT,SECTION; repeatable")
+	fs.Var(&f.onlySection, "only-section", section+": keep only the matching sections"+where+", with their relocations; repeatable")
+	fs.Var(&f.addSymbol, "add-symbol", add+": add a symbol"+where+" at an offset in SECTION, or an absolute one, as llvm-objcopy --add-symbol; FLAGS are global, local, weak, default, hidden, protected, object, function or notype; repeatable")
 	if scoped {
 		fs.Var(&f.localizeHidden, "localize-hidden", "PATH: make the hidden and internal definitions in the input or -link-archive at PATH local; repeatable")
 		fs.Var(&f.stripUnneeded, "strip-unneeded", "PATH: remove the local and undefined symbols in the input or -link-archive at PATH that no relocation needs; repeatable")
@@ -401,7 +401,7 @@ func (b *buildEdits) apply(components []editComponent, stderr io.Writer) (*symbo
 }
 
 func objcopy(args []string, stdout, stderr io.Writer) error {
-	fs := newFlags("objcopy", "objcopy [options] input output", "Rename, wrap, localize or strip symbols in an ELF, Mach-O or COFF relocatable object or archive, as llvm-objcopy and ld.lld --wrap do. Mach-O names omit the C underscore. Other object bytes are preserved; an edited archive gets a new GNU, BSD or Microsoft symbol index. The output must not exist.")
+	fs := newFlags("objcopy", "objcopy [options] input output", "Rename, wrap, localize, strip or add symbols, or remove sections, in an ELF, Mach-O or COFF relocatable object or archive, as llvm-objcopy and ld.lld --wrap do. Mach-O names omit the C underscore. Other object bytes are preserved; an edited archive gets a new GNU, BSD or Microsoft symbol index. The output must not exist.")
 	var f symbolEditFlags
 	f.register(fs, false, "prefix every symbol the input defines, and the input's references to them, with PREFIX; other undefined references keep their names")
 	if err := parseFlags(fs, args, stdout); err != nil {
