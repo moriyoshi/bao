@@ -36,6 +36,8 @@ func parseObject(data []byte) (object, error) {
 	switch {
 	case isMachO(data):
 		return parseMachO(data)
+	case isCOFFImport(data):
+		return parseCOFFImport(data)
 	case isCOFF(data):
 		return parseCOFF(data)
 	}
@@ -46,6 +48,8 @@ func editObject(data []byte, e Edits) (objectResult, error) {
 	switch {
 	case isMachO(data):
 		return editMachO(data, e)
+	case isCOFFImport(data):
+		return editCOFFImport(data, e)
 	case isCOFF(data):
 		return editCOFF(data, e)
 	}
