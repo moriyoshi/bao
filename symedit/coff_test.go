@@ -23,6 +23,9 @@ type testCOFFSymbol struct {
 	text, debug, pdata bool
 	// tag names a weak external's default symbol.
 	tag string
+	// funcAux adds a zeroed function definition auxiliary record, as GNU
+	// as writes for functions.
+	funcAux bool
 	// addrsig lists the symbol in .llvm_addrsig.
 	addrsig bool
 }
@@ -60,7 +63,7 @@ func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 	for _, s := range symbols {
 		index[s.name] = next
 		next++
-		if s.tag != "" {
+		if s.tag != "" || s.funcAux {
 			next++
 		}
 	}
@@ -90,10 +93,13 @@ func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 		le.PutUint32(e[8:], s.value)
 		le.PutUint16(e[12:], uint16(s.section))
 		e[16] = s.class
-		if s.tag != "" {
+		if s.tag != "" || s.funcAux {
 			e[17] = 1
 		}
 		record(e)
+		if s.funcAux {
+			record(make([]byte, coffSymbolSize))
+		}
 		if s.tag != "" {
 			aux := make([]byte, coffSymbolSize)
 			le.PutUint32(aux, uint32(index[s.tag]))
@@ -759,5 +765,36 @@ func TestCOFFWeakenNoDuplicatesKey(t *testing.T) {
 	}
 	if v := readCOFF(t, out); v.tags["comdat_key"] != def {
 		t.Fatalf("tags = %v", v.tags)
+	}
+}
+
+// MinGW GCC writes a function definition auxiliary record for each function.
+// The definition keeps it when renamed to its default.
+func TestCOFFWeakenFunctionWithAux(t *testing.T) {
+	in := testCOFF([]testCOFFSymbol{
+		{name: "value", section: coffText, class: ext, funcAux: true, text: true},
+		{name: "use_value", section: coffText, class: ext, funcAux: true},
+	}, "")
+	out, n, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "value")}})
+	if err != nil || n != 1 {
+		t.Fatalf("Edit = %d, %v", n, err)
+	}
+	v := readCOFF(t, out)
+	if v.tags["value"] != ".weak.value.default.use_value" || !reflect.DeepEqual(v.relocs[".text"], []string{"value"}) {
+		t.Fatalf("tags %v, relocs %q", v.tags, v.relocs)
+	}
+	f, err := parseCOFF(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range f.symbols {
+		if s.name == ".weak.value.default.use_value" && (s.naux != 1 || s.section != coffText) {
+			t.Fatalf("default = %+v", s)
+		}
+	}
+	// A reference with auxiliary records cannot become the weak external.
+	ref := testCOFF([]testCOFFSymbol{{name: "hook", class: ext, funcAux: true, text: true}}, "")
+	if _, _, err := Edit(ref, Edits{Visibility: Visibility{Weaken: matcher(t, false, "hook")}}); err == nil || !strings.Contains(err.Error(), "undefined symbol with auxiliary records") {
+		t.Errorf("reference with aux: %v", err)
 	}
 }

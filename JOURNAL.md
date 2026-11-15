@@ -6408,3 +6408,23 @@ Verification. `bao build -target windows/amd64` was run locally on clang
 - Without `-weaken-symbol value`, the control fails with "duplicate
   NODUPLICATES COMDAT external:value".
 - Nothing ran here. Native results come from CI.
+
+## 2026-11-15: Weakening COFF definitions with auxiliary records
+
+Problem. With the strong member pulled in (previous entry), Actions run
+43706011567 passed `windowsWeaken` natively on windows-amd64 for clang,
+clang-cl and msvc: strong `weak: 20`, alone `weak: 10`. MinGW GCC then
+failed in symedit with "cannot weaken COFF symbol value, which is common or
+has auxiliary records". GNU as writes a function definition auxiliary record
+for each function.
+
+Change. Only a weakened reference needs a record without auxiliaries, since
+its record becomes the weak external. A weakened definition is renamed in
+place, and its auxiliary records stay with it. The refusal now covers common
+symbols and undefined symbols with auxiliary records.
+
+Verification. `TestCOFFWeakenFunctionWithAux` weakens a function that has a
+function definition auxiliary record. The default keeps the record and its
+section, code relocations name the weak external, and an undefined symbol
+with an auxiliary record is still refused. Native MinGW GCC results come
+from CI.

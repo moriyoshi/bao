@@ -776,8 +776,11 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 			if linkOnce[i] {
 				break
 			}
-			if s.common() || s.naux > 0 {
-				return objectResult{}, fmt.Errorf("cannot weaken COFF symbol %s, which is common or has auxiliary records", name)
+			// A definition keeps its record, auxiliary ones included, such
+			// as the function definition record GNU as writes; a reference's
+			// record becomes the weak external.
+			if s.common() || s.naux > 0 && s.section == 0 {
+				return objectResult{}, fmt.Errorf("cannot weaken COFF symbol %s, which is common or an undefined symbol with auxiliary records", name)
 			}
 			weakened = append(weakened, i)
 			rebound++
