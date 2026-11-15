@@ -714,8 +714,9 @@ to input names; a renamed symbol is not edited again.
 `-wrap` follows lld rather than GNU ld: when an object both defines and calls
 `SYM`, that call also goes to `__wrap_SYM`. Bao adds an undefined `__wrap_SYM`
 to that object and redirects its runtime relocations. Relocations in debug
-sections keep describing the definition. Redirecting relocations stored in
-LLVM's CREL format is rejected.
+sections keep describing the definition. Relocations in LLVM's CREL format
+(`-Wa,--crel`) are decoded, edited like RELA ones, and encoded again as LLVM
+encodes them when they change.
 
 `-prefix-symbols` makes a component's definitions private. Only symbols
 defined in that component, and that component's references to them, gain the
@@ -783,8 +784,8 @@ such as `$x`. Unlike llvm-objcopy, it does not remove debug sections;
 `-strip-debug` does that after binding inference.
 Local symbols must precede the others in ELF. Bao therefore rewrites the symbol
 table and renumbers every relocation, section group, extended section index
-and LLVM address-significance entry. It rejects any other section that refers
-to symbol indices, and CREL relocations.
+and LLVM address-significance entry, in REL, RELA and CREL relocation
+sections. It rejects any other section that refers to symbol indices.
 
 `-wrap` applies to every input of the link. `-keep-global-symbol` and
 `-localize-hidden` therefore leave a wrapped symbol's definition and its
@@ -917,8 +918,6 @@ is refused in these cases:
 - A kept Mach-O section-relative relocation names a removed section.
   `__compact_unwind` and DWARF use these for `__text`. llvm-objcopy drops such
   relocations instead, which leaves those entries unrelocated.
-- A Mach-O symbol pointer or stub section would go, since the indirect symbol
-  table lists its entries.
 - A kept ELF section links to a removed one.
 - A removal targets the ELF symbol, string or section name table.
 
@@ -929,6 +928,12 @@ Format notes:
 
 - Mach-O data-in-code entries and linker optimization hints for addresses in
   removed sections are dropped.
+- A removed Mach-O symbol pointer or stub section takes its run of the
+  indirect symbol table with it. The later sections' `reserved1` moves down,
+  and the run's symbols no longer count as referenced. llvm-objcopy leaves the
+  entries in the table, unreferenced. Apple's current `ld` rejects such
+  sections in 64-bit objects anyway ("non-lazy pointers sections no longer
+  supported"), so this matters for 32-bit objects.
 - A COFF associative COMDAT section, such as the `.pdata` and `.xdata` of an
   MSVC-environment function section, goes with the section it is associated
   with, as in llvm-objcopy. MinGW function sections such as `.text$f` keep

@@ -6428,3 +6428,98 @@ function definition auxiliary record. The default keeps the record and its
 section, code relocations name the weak external, and an undefined symbol
 with an auxiliary record is still refused. Native MinGW GCC results come
 from CI.
+
+## 2026-11-15: Removing Mach-O pointer and stub sections
+
+Problem. Mach-O section removal refused symbol pointer and stub sections
+(types 0x6, 0x7, 0x8, 0x10 and 0x14) whenever the object had indirect
+symbol entries (2026-11-15 Mach-O and COFF section edits entry).
+
+Change (`symedit/macho.go`).
+- Each such section owns `reserved1`'s run of the indirect symbol table:
+  size/8 entries for pointers, or size/`reserved2` for stubs. A stub section
+  without a stub size, or a run past the table, is refused as malformed.
+- Removing the section drops its run in place and updates `nindirectsyms`.
+  Each kept section's `reserved1` moves down by the entries dropped before
+  it.
+- The dropped entries no longer make their symbols referenced, so
+  `-strip-unneeded` can remove those symbols.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestMachORemoveIndirectSections` uses a pointer run of `_a`, `_b` and a
+    stub run of `_c`, LOCAL.
+    - Removing the pointers leaves `[_c, LOCAL]` with the stubs'
+      `reserved1` at 0, and `-strip-unneeded` drops `_a` and `_b`.
+    - Removing the stubs leaves `[_a, _b]`.
+  - The malformed-stub refusal is tested too.
+- `.work/symind` used a hand-written object (top-level asm in `ptrs.c`) on
+  macOS 26.6.2 x86_64 with Apple clang 17.0.0 and ld-1230.1. It has an
+  unused `__DATA,__unused_ptrs` (`_abort`) before a `__DATA,__kept_ptrs`
+  (`_strlen`) that the code loads through.
+  - Removing `__unused_ptrs` changed the indirect table from `_abort _strlen`
+    to `_strlen`, and `__kept_ptrs` reserved1 from 1 to 0, as read by
+    `otool -Iv` and `otool -l` on both architectures.
+  - Removing `__kept_ptrs` is refused, because the code's section-relative
+    relocation names it.
+  - Linking was not possible for either object, edited or not: ld-1230.1
+    rejects "non-lazy pointers sections no longer supported for 64-bit
+    architectures". Nothing ran.
+- Against llvm-objcopy (rust-objcopy, LLVM 22), log `.work/symind/parity.log`:
+  - Sections and symbols match.
+  - llvm-objcopy keeps the removed section's `_abort` entry and leaves
+    `__kept_ptrs` reserved1 at 1, while Bao compacts the table. Both are
+    valid, because no kept section covers the dropped entries.
+- The practical use is 32-bit Mach-O (a later item), where such sections are
+  normal.
+
+## 2026-11-15: ELF CREL relocations in symbol edits
+
+Problem. ELF objects with CREL relocation sections (SHT_CREL 0x40000014,
+clang `-Wa,--crel,--allow-experimental-crel`) were refused for any edit that
+redirects references, changes bindings, removes sections or adds symbols.
+Such edits renumber or retarget relocation symbol indices, and CREL stores
+them delta-encoded. CREL relocations also did not count as references for
+`-strip-unneeded` and `-strip-symbol`.
+
+Change (`symedit/crel.go`, `symedit/edit.go`).
+- `decodeCREL` follows LLVM's decoder (`llvm/lib/Object/ELF.cpp`) and turns
+  a section into RELA entries. The ULEB128 header holds count*8, 4 for
+  addends, and the shift; each entry has a flags byte with offset bits, then
+  SLEB128 deltas.
+- `encodeCREL` follows `encodeCrel` in `llvm/include/llvm/MC/MCELFExtras.h`:
+  the shift comes from the trailing zeros of 8|offsets, and an offset delta
+  is continued in ULEB128 past the first byte.
+  - Go's `binary.Varint` is zigzag, not SLEB128, so the codec has its own
+    SLEB128 helpers.
+  - A first encoder tested `b&4` for the addend flag. Without addends that
+    bit belongs to the offset, which the round-trip test caught.
+- `editELF` decodes every CREL section linked to the symbol table. Its
+  relocation walks (retargeting, referenced symbols) and `reorder`'s
+  renumbering go through the decoded entries.
+- A section is encoded again and placed at the end of the file only if its
+  entries changed.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestCRELRoundTrip` encodes and decodes 200 random entries with and
+    without addends, and refuses four malformed inputs.
+  - `TestCRELEditsMatchRELA` converts two fixtures' RELA sections to CREL and
+    checks wrap, localize with strip-unneeded, section removal and an added
+    symbol. Decoded relocations and symbols must equal the RELA results.
+- `.work/symcrel/run.sh` (log `run3.log`) ran natively on linux/arm64 in
+  bao-cpp-cross:20261108. clang 19.1.7 built
+  `-Wa,--crel,--allow-experimental-crel` objects, which ld.lld (rust-lld,
+  LLD 22.1.8) linked.
+  - A copy of crel.go (`parity`) re-encoded all 64 relocations of clang's 8
+    CREL sections in vis.o, and the glue's 2, byte for byte. Every
+    bao-edited output passes the same check.
+  - Each edited object linked and ran:
+    - a wrap of strlen printed `3 9 1005 5`;
+    - keep-global with strip-unneeded, `.debug*` removal, and an added symbol
+      printed the unedited `3 9 5 5`.
+  - Each output's decoded relocations (target, offset, type, symbol name,
+    addend) equal those of the same edit on a RELA build of the same source.
+  - `main` refuses `-strip-unneeded` on the CREL object.
+  - `ld.lld -r` preserves CREL, so GNU readelf 2.42 could not be the
+    comparison reader; the parity tool's dump mode was.

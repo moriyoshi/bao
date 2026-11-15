@@ -149,28 +149,39 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 			addedNames = append(addedNames, a.Name)
 		}
 	}
-	var crel bool
+	// CREL sections are edited as RELA entries and encoded again at the end
+	// if they changed.
+	crel, crelAddend, crelInput := map[int][]byte{}, map[int]bool{}, map[int][]byte{}
 	for i, s := range f.sections {
-		crel = crel || s.typ == shtCREL && int(s.link) == f.symtab && !dropped(i)
-	}
-	if crel && (len(retarget) > 0 || !e.Visibility.empty() || sectionIndex != nil || len(userAdded) > 0) {
-		return objectResult{}, errors.New("CREL relocations are unsupported when redirecting references or changing symbol bindings; build without -Wa,--crel")
+		if s.typ == shtCREL && int(s.link) == f.symtab && !dropped(i) {
+			entries, addend, err := decodeCREL(f.section(i))
+			if err != nil {
+				return objectResult{}, fmt.Errorf("ELF section %s: %w", s.name, err)
+			}
+			crel[i], crelAddend[i], crelInput[i] = entries, addend, bytes.Clone(entries)
+		}
 	}
 	out := bytes.Clone(data)
 	relocs := func(fn func(s elfSection, entry []byte) error) error {
 		for i, s := range f.sections {
-			if s.typ != elf.SHT_RELA && s.typ != elf.SHT_REL || int(s.link) != f.symtab || dropped(i) {
+			if s.typ != elf.SHT_RELA && s.typ != elf.SHT_REL && s.typ != shtCREL || int(s.link) != f.symtab || dropped(i) {
 				continue
 			}
-			size := uint64(16)
-			if s.typ == elf.SHT_RELA {
+			size, entries := uint64(16), []byte(nil)
+			switch s.typ {
+			case shtCREL:
+				size, entries = 24, crel[i]
+			case elf.SHT_RELA:
 				size = 24
+				fallthrough
+			default:
+				if s.size%size != 0 {
+					return fmt.Errorf("malformed ELF relocation section %d", i)
+				}
+				entries = out[s.offset : s.offset+s.size]
 			}
-			if s.size%size != 0 {
-				return fmt.Errorf("malformed ELF relocation section %d", i)
-			}
-			for off := s.offset; off < s.offset+s.size; off += size {
-				if err := fn(s, out[off:off+size]); err != nil {
+			for off := uint64(0); off < uint64(len(entries)); off += size {
+				if err := fn(s, entries[off:off+size]); err != nil {
 					return err
 				}
 			}
@@ -336,11 +347,16 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 				}
 			}
 		}
-	} else if err := f.reorder(&out, entries, removed, sectionIndex, place, header); err != nil {
+	} else if err := f.reorder(&out, entries, removed, sectionIndex, crel, place, header); err != nil {
 		return objectResult{}, err
 	}
 	if len(offsets) > 0 {
 		place(int(symtab.link), strtab, 1)
+	}
+	for i, entries := range crel {
+		if !bytes.Equal(entries, crelInput[i]) {
+			place(i, encodeCREL(entries, crelAddend[i]), 1)
+		}
 	}
 	if sectionIndex != nil {
 		if err := f.compactSections(&out, sectionIndex, place, header); err != nil {
@@ -353,7 +369,7 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 // reorder writes a symbol table whose local symbols precede the others, as
 // ELF requires, without the removed ones, and renumbers every reference to a
 // symbol index. entries beyond the input's symbols are added globals.
-func (f *elfFile) reorder(out *[]byte, entries [][]byte, removed []bool, sectionIndex []int, place func(int, []byte, int), header func(int) []byte) error {
+func (f *elfFile) reorder(out *[]byte, entries [][]byte, removed []bool, sectionIndex []int, crel map[int][]byte, place func(int, []byte, int), header func(int) []byte) error {
 	n := len(f.symbols)
 	order := []int{0}
 	for pass := 0; pass < 2; pass++ {
@@ -388,13 +404,16 @@ func (f *elfFile) reorder(out *[]byte, entries [][]byte, removed []bool, section
 			continue
 		}
 		switch s.typ {
-		case elf.SHT_REL, elf.SHT_RELA:
-			size := uint64(16)
-			if s.typ == elf.SHT_RELA {
+		case elf.SHT_REL, elf.SHT_RELA, shtCREL:
+			size, table := uint64(16), (*out)[s.offset:s.offset+s.size]
+			switch s.typ {
+			case elf.SHT_RELA:
 				size = 24
+			case shtCREL:
+				size, table = 24, crel[i]
 			}
-			for off := s.offset; off < s.offset+s.size; off += size {
-				info := le.Uint64((*out)[off+8:])
+			for off := uint64(0); off < uint64(len(table)); off += size {
+				info := le.Uint64(table[off+8:])
 				if info>>32 == 0 {
 					continue
 				}
@@ -402,7 +421,7 @@ func (f *elfFile) reorder(out *[]byte, entries [][]byte, removed []bool, section
 				if err != nil {
 					return err
 				}
-				le.PutUint64((*out)[off+8:], uint64(sym)<<32|info&0xffffffff)
+				le.PutUint64(table[off+8:], uint64(sym)<<32|info&0xffffffff)
 			}
 		case elf.SHT_GROUP:
 			sym, err := renumber(uint64(s.info))
