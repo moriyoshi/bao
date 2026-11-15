@@ -373,7 +373,7 @@ func (b *buildEdits) apply(components []editComponent, stderr io.Writer) (*symbo
 }
 
 func objcopy(args []string, stdout, stderr io.Writer) error {
-	fs := newFlags("objcopy", "objcopy [options] input output", "Rename, wrap, localize or strip symbols in an ELF or Mach-O relocatable object or archive, as llvm-objcopy and ld.lld --wrap do. Mach-O names omit the C underscore. Other object bytes are preserved; an edited archive gets a new GNU or BSD symbol index. The output must not exist.")
+	fs := newFlags("objcopy", "objcopy [options] input output", "Rename, wrap, localize or strip symbols in an ELF, Mach-O or COFF relocatable object or archive, as llvm-objcopy and ld.lld --wrap do. Mach-O names omit the C underscore. Other object bytes are preserved; an edited archive gets a new GNU, BSD or Microsoft symbol index. The output must not exist.")
 	var f symbolEditFlags
 	f.register(fs, false, "prefix every symbol the input defines, and the input's references to them, with PREFIX; other undefined references keep their names")
 	if err := parseFlags(fs, args, stdout); err != nil {

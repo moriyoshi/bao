@@ -145,17 +145,23 @@ func TestSymbolEditUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr strings.Builder
-	err := run([]string{"build", "-target", "windows/amd64", "-wrap", "answer", "-o", filepath.Join(dir, "out"), input}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "not Windows COFF") || exitCode(err) != 2 {
-		t.Fatalf("build: %v", err)
-	}
 	if err := run([]string{"objcopy", "-wrap", "answer", input}, &stdout, &stderr); err == nil || exitCode(err) != 2 {
 		t.Fatalf("objcopy without output: %v", err)
 	}
-	if err := run([]string{"objcopy", "-wrap", "answer", input, filepath.Join(dir, "x.obj")}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "not an ELF object") {
-		t.Fatalf("objcopy of COFF: %v", err)
+	out := filepath.Join(dir, "x.obj")
+	if err := run([]string{"objcopy", "-weaken-symbol", "answer", input, out}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "weakening is unsupported for COFF") {
+		t.Fatalf("objcopy -weaken-symbol of COFF: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "x.obj")); err == nil {
+	if _, err := os.Stat(out); err == nil {
 		t.Fatal("objcopy wrote an output after failing")
+	}
+	// A Windows build applies the edits and translates the result.
+	err := run([]string{"build", "-target", "windows/amd64", "-redefine-sym", "answer=renamed", "-symbol", "renamed", "-o", filepath.Join(dir, "pkg"), input}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("build: %v\n%s", err, stderr.String())
+	}
+	record, err := os.ReadFile(filepath.Join(dir, "pkg", "bao-build.json"))
+	if err != nil || !strings.Contains(string(record), `"answer": "renamed"`) {
+		t.Fatalf("bao-build.json: %v\n%s", err, record)
 	}
 }

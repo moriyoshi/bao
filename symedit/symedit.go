@@ -5,8 +5,9 @@
 // Every other byte of an object is preserved and an edited archive gets a new
 // symbol index, so the results remain ordinary inputs to a native linker.
 //
-// Little-endian ELF64 and 64-bit Mach-O relocatable objects are supported.
-// Names are C names: on Mach-O, edits add and match the leading underscore.
+// Little-endian ELF64, 64-bit Mach-O and amd64/arm64 COFF relocatable
+// objects are supported. Names are C names: on Mach-O, edits add and match
+// the leading underscore.
 package symedit
 
 import (

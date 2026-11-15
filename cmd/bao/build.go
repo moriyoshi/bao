@@ -353,9 +353,6 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
-	if edits.any() && strings.HasPrefix(target.Name, "windows/") {
-		return usage("symbol edits support Linux ELF and macOS Mach-O inputs, not Windows COFF yet")
-	}
 	if strings.HasPrefix(target.Name, "windows/") && *linker != "" {
 		return usage("Windows COFF archive selection is built in; -ld is unsupported")
 	}
@@ -428,8 +425,10 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	// A hidden symbol usually binds members of one archive together, so the
 	// primary archive is partially linked on its own before its bindings
 	// change. A -link-archive is searched, so its members are edited
-	// separately and must not lose a definition another member uses.
-	if archive && resolved.changesBindings(0) {
+	// separately and must not lose a definition another member uses. Bao
+	// selects Windows COFF members itself, without a partial linker, so a
+	// Windows primary archive is edited by member too.
+	if archive && resolved.changesBindings(0) && !strings.HasPrefix(target.Name, "windows/") {
 		fmt.Fprintf(stderr, "Combining the input before changing its symbol bindings\n")
 		unedited := filepath.Join(work, "primary-unedited.a")
 		if err := writeNew(unedited, inputBytes); err != nil {

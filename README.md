@@ -625,7 +625,7 @@ bao help build
 | `translate` | Translate an already-combined object; auto-detect Darwin/ELF input |
 | `inspect` | Report Darwin raw-input compatibility or Linux ELF/Windows COFF structure |
 | `bindings` | Infer selected C ABI function types from full native DWARF |
-| `objcopy` | Rename, wrap, prefix, localize or strip symbols in an ELF or Mach-O object or archive; see [symbol edits](#symbol-edits) |
+| `objcopy` | Rename, wrap, prefix, localize or strip symbols in an ELF, Mach-O or COFF object or archive; see [symbol edits](#symbol-edits) |
 | `doctor` | Check the full producer toolchain; installs nothing |
 | `targets` | List target names and Rust triples |
 | `sign`, `keygen` | Produce Ed25519 release envelopes and local signing keys |
@@ -687,12 +687,13 @@ translation itself needs no native compiler/linker.
 
 ### Symbol edits
 
-`bao build` can rename symbols in its Linux ELF and macOS Mach-O inputs before
-they are combined, so a producer needs neither `objcopy` nor a second relinking
-step. The same edits are available on single files as `bao objcopy`. Supported
-inputs are little-endian ELF64 and 64-bit Mach-O relocatable objects and
-archives of them; split a universal file with `lipo` first. Windows targets
-reject these flags.
+`bao build` can rename symbols in its Linux ELF, macOS Mach-O and Windows COFF
+inputs before they are combined, so a producer needs neither `objcopy` nor a
+second relinking step. The same edits are available on single files as
+`bao objcopy`. Supported inputs are little-endian ELF64, 64-bit Mach-O, and
+amd64/arm64 COFF relocatable objects, and archives of them. Split a universal
+Mach-O file with `lipo` first. COFF bigobj files and import libraries are not
+edited.
 
 Names are C names on both formats, as for `-symbol`. On Mach-O, Bao matches and
 writes them with the leading underscore that C symbols carry, so
@@ -801,6 +802,35 @@ renumbers extern relocations and the indirect symbol table. A wrapped
 definition's references in debug sections, `__LD,__compact_unwind` and
 `__eh_frame` keep naming the definition. An undefined `__real_SYM` beside a
 defined `SYM` in one object is bound directly to it and removed.
+
+On COFF, names need no underscore on amd64 and arm64. A `dllimport` caller's
+`__imp_SYM` follows its function: `-wrap SYM` turns it into
+`__imp___wrap_SYM`, and a rename renames it. COFF has no ordering between
+local and global symbols, so binding changes edit the storage class in place.
+Removing symbols renumbers relocations, weak-external tags and
+`.llvm_addrsig`. Rules specific to COFF:
+
+- COFF has no hidden visibility, so `-localize-hidden` matches nothing.
+- `-weaken-symbol` is rejected, because a COFF weak external needs a default
+  definition.
+- A COMDAT section's key symbol is never stripped, even by `-strip-unneeded`.
+  Neither are section definitions or `@feat.00`.
+- A wrap does not redirect debug sections, `.pdata` or `.xdata`.
+- Calls within one section usually carry no relocation, so a wrap cannot
+  redirect them, as with lld-link. Compile with `-ffunction-sections` or
+  `/Gy` to keep them redirectable. GNU as for PE (MinGW GCC) refers to a
+  function defined in the same object through its section even then. Such
+  objects therefore get GNU ld's wrap semantics: only references through
+  the symbol move.
+- `.drectve` directives follow renames from `-redefine-sym` and
+  `-prefix-symbols`; a wrap leaves them alone. An `-exclude-symbols` entry
+  for a symbol that is no longer exported is dropped. An `/INCLUDE` or
+  `/ALTERNATENAME` of one is an error.
+- Bao selects Windows archive members itself, without a partial linker. A
+  Windows primary archive's binding edits are therefore applied member by
+  member, like a `-link-archive`.
+- Edited COFF archives use the Microsoft library format: two linker members
+  and NUL-terminated long names.
 
 A hidden symbol usually links the members of one archive together, so
 localizing it in each member separately breaks the archive. When the build's

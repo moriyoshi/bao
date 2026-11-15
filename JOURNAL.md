@@ -5676,3 +5676,138 @@ Bazel was not run.
 
 Remaining: COFF. Native darwin/arm64 execution is left to CI's
 `darwin_symbol_edits` step.
+
+## 2026-11-15: COFF symbol edits (phase 3, COFF)
+
+Problem: the second half of phase 3, after Mach-O (#13), at the user's
+request: the same symbol edits for Windows COFF inputs.
+
+Decisions:
+- Scope:
+  - amd64 and arm64 COFF only. Their C names carry no underscore, so names
+    map directly.
+  - i386, ARM64EC, bigobj and short import members are rejected. Bao's own
+    COFF translator handles no bigobj either.
+- `__imp_` pointers:
+  - A dllimport caller's `__imp_SYM` follows its function:
+    `-wrap SYM` turns it into `__imp___wrap_SYM`, and `__imp___real_SYM`
+    into `__imp_SYM`, as lld-link `-wrap` does.
+  - A rename of `SYM` renames `__imp_SYM` too.
+- Bindings:
+  - COFF has no local/global ordering, so binding changes rewrite the
+    storage class in place (EXTERNAL and STATIC).
+  - There is no hidden visibility, so `-localize-hidden` matches nothing.
+  - `-weaken-symbol` is rejected: a weak external needs a default
+    definition.
+- Removal rebuilds the table and renumbers:
+  - relocations;
+  - weak-external TagIndex auxiliary records;
+  - `.llvm_addrsig` ULEB lists.
+  COFF line numbers are rejected if present.
+- Never stripped:
+  - COMDAT keys (the first symbol after a COMDAT section's definition);
+  - weak-external defaults;
+  - section definitions;
+  - `@feat.00`.
+- Wrap: redirection skips `.debug$*`, `.pdata`, `.xdata` and discardable
+  sections. A `__real_SYM` beside its definition is bound to it and
+  removed, as on Mach-O.
+- `.drectve` (found while testing):
+  - The first version refused any edit to a symbol a directive names. But
+    MinGW clang writes `-exclude-symbols:` for every hidden-visibility
+    symbol, so `-keep-global-symbol` on an ordinary MinGW object failed with
+    "a .drectve linker directive names hidden_helper".
+  - Directives are now rewritten. Explicit renames (`-redefine-sym`,
+    prefixes) follow into `/INCLUDE`, `-exclude-symbols` and
+    `/ALTERNATENAME`. A wrap does not, since a directive naming `malloc`
+    still means the real `malloc`.
+  - An exclusion of a symbol that is no longer exported is dropped. An
+    include or alternate name of one is an error.
+  - The section moves to the end of the file, with its section-definition
+    length updated.
+- Windows builds select archive members inside Bao, without a partial
+  linker. A Windows primary archive's binding edits therefore run member by
+  member with the cross-member check, like a `-link-archive`.
+- Edited COFF archives use the Microsoft library format: two linker members
+  (the second little-endian and name-sorted) and NUL-terminated long names.
+  Bao's own `internal/ar.ParseCOFFForMachine` reads it.
+
+Reference tool: llvm-objcopy (rust-objcopy, LLVM 22). For COFF it supports
+only `--redefine-sym`, `--strip-symbol` and `--strip-unneeded`; it rejects
+localize, keep-global, globalize, weaken and prefix-symbols. Under
+`--strip-unneeded` it also drops unreferenced section definitions and
+`@feat.00`, which Bao keeps: the former carry COMDAT selections, the latter
+the SafeSEH/CFG compatibility flags. With function sections, it also removes
+COMDAT keys that Bao refuses to strip.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Compiler: clang-19 in
+bao-cpp-cross:20261108, targets x86_64-pc-windows-msvc,
+aarch64-pc-windows-msvc and x86_64-w64-windows-gnu. Linker: lld-link from
+rust-lld (LLD 22.1.8, Rust 1.98.0). No Windows host or Wine was available,
+so nothing ran locally. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. New symedit tests use hand-built
+  amd64 COFF objects read back with debug/pe. They cover:
+  - wrap, rename and `__imp_` handling;
+  - the bound `__real_`;
+  - debug and `.pdata` relocations left alone;
+  - weak-external tag and `.llvm_addrsig` renumbering after a removal;
+  - keep-global, globalize and strip-unneeded with COMDAT keys, weak
+    defaults, commons and `@feat.00` kept;
+  - the strip and weaken refusals;
+  - directive rewriting and refusals;
+  - the Microsoft archive linker members, accepted by
+    ParseCOFFForMachine, and the archive cross-member error;
+  - rejected i386, bigobj and import members.
+  A `bao build -target windows/amd64` CLI test translates a renamed COFF
+  object.
+- Local driver `.work/symcoff/run.sh` (fixtures in `.work/symcoff/src`;
+  `inner.sh` runs in the container; `mkar` writes the indexed control
+  archives). Results:
+  - For each target, lld-link linked the wrapped objects. The call inside
+    the defining object went to `__wrap_target`, and `__imp_target` became
+    `__imp___wrap_target`.
+  - A prefixed archive linked as a searched library.
+  - Five binding/strip variants of the fixture linked.
+  - llvm-objcopy parity on all three targets: `--redefine-sym` (one long
+    name) and `--strip-symbol` matched exactly. `--strip-unneeded` matched
+    apart from the 5-6 section definitions and `@feat.00` that Bao keeps.
+  - `bao build` for windows/amd64 and windows/arm64 built the CI fixture,
+    compiled through the GNU and clang-cl drivers. The CGO_ENABLED=0
+    consumers cross-built but were not run.
+  - 69 checks passed in total, with none failing.
+- Negative controls, all targets:
+  - unedited glue fails to link;
+  - an unprefixed archive leaves references unresolved;
+  - localized and stripped definitions no longer link;
+  - stripping a COMDAT key is refused;
+  - builds without prefixes fail with "duplicate NODUPLICATES COMDAT
+    external".
+- The bao-verify windows suite gains a `windows_symbol_edits` step. It runs
+  on every Windows CI driver (llvm-mingw clang, clang-cl, MSVC, and MinGW
+  GCC on amd64) with `/Gy` or `-ffunction-sections`. The symedit testdata
+  fixtures now need only `<stddef.h>` and read their vendored string
+  through a volatile pointer, so no compiler folds the wrapped call. CI's
+  native Windows runs are the only execution evidence for COFF.
+
+CI on 0b65679 (#14). `windows_symbol_edits` reported PASS on native Windows
+under the llvm-mingw clang, clang-cl and MSVC drivers on both windows-arm64
+and windows-amd64. The MinGW GCC leg (amd64 only) failed with `wrapped:
+2021003`, the value without in-object wrapping. GCC targeting PE treats
+`target` as unpreemptible and propagated `target(1)` into its callers despite
+`-fno-inline`, so no call was left to redirect; lld-link would give the same
+result for those objects. The fixture now marks its wrapped functions
+`__attribute__((noipa))` for GCC only; MSVC rejects the syntax, and clang
+keeps the calls.
+
+CI on c663b37 (#14). The MinGW GCC leg still read `wrapped: 2021003`, so
+the noipa change above was not the cause. A local check found the real one:
+x86_64-w64-mingw32-gcc 14 (Debian `gcc-mingw-w64-x86-64` in a throwaway
+bao-cpp-cross container), with CI's flags plus `-ffunction-sections`, emits
+`IMAGE_REL_AMD64_REL32 .text$target` for calls to `target` from the same
+object (objdump -dr). The calls go through the section symbol, not
+`target`, so neither Bao nor lld-link `-wrap` can redirect them. The step
+now expects `wrapped: 2021003 components: 11012` for the mingw driver: the
+in-object calls stay unwrapped, while strlen and cross-object references are
+wrapped. The other drivers keep 103021003, and the README notes the
+binutils behaviour. The noipa attribute stays, since it keeps GCC from
+folding the calls whatever the relocations are.
