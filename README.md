@@ -625,7 +625,7 @@ bao help build
 | `translate` | Translate an already-combined object; auto-detect Darwin/ELF input |
 | `inspect` | Report Darwin raw-input compatibility or Linux ELF/Windows COFF structure |
 | `bindings` | Infer selected C ABI function types from full native DWARF |
-| `objcopy` | Rename, wrap, prefix, localize or strip symbols in an ELF object or archive; see [symbol edits](#symbol-edits) |
+| `objcopy` | Rename, wrap, prefix, localize or strip symbols in an ELF or Mach-O object or archive; see [symbol edits](#symbol-edits) |
 | `doctor` | Check the full producer toolchain; installs nothing |
 | `targets` | List target names and Rust triples |
 | `sign`, `keygen` | Produce Ed25519 release envelopes and local signing keys |
@@ -687,11 +687,17 @@ translation itself needs no native compiler/linker.
 
 ### Symbol edits
 
-`bao build` can rename symbols in its Linux ELF inputs before they are
-combined, so a producer needs neither `objcopy` nor a second relinking step.
-The same edits are available on single files as `bao objcopy`. Only
-little-endian ELF64 relocatable objects and archives of them are supported;
-Darwin and Windows targets reject these flags.
+`bao build` can rename symbols in its Linux ELF and macOS Mach-O inputs before
+they are combined, so a producer needs neither `objcopy` nor a second relinking
+step. The same edits are available on single files as `bao objcopy`. Supported
+inputs are little-endian ELF64 and 64-bit Mach-O relocatable objects and
+archives of them; split a universal file with `lipo` first. Windows targets
+reject these flags.
+
+Names are C names on both formats, as for `-symbol`. On Mach-O, Bao matches and
+writes them with the leading underscore that C symbols carry, so
+`-wrap pthread_create` edits `_pthread_create`. Mach-O symbols without that
+underscore, such as assembler labels, are never edited.
 
 | Flag | Effect |
 | --- | --- |
@@ -732,8 +738,10 @@ bao build -target linux/arm64 -symbol app_main \
 
 Edits apply to Bao's private copies of the inputs. Symbol and section bytes
 other than the edited names, symbols and relocations are preserved. An edited
-archive is rewritten in GNU format with a new symbol index, because a searched
-archive's index must name the renamed definitions. `bao-build.json` records the
+archive is rewritten with a new symbol index, because a searched archive's index
+must name the renamed definitions. ELF archives use GNU format. Mach-O archives
+use the BSD format of Apple's `ar`, with a `__.SYMDEF` index and 8-byte-aligned
+members. `bao-build.json` records the
 edits under `symbol_edits`. Its source and link-archive digests stay those of
 the unedited files. `-bindings dwarf` reads the unedited input, so name renamed
 exports with a signature manifest instead.
@@ -776,6 +784,23 @@ Local symbols must precede the others in ELF. Bao therefore rewrites the symbol
 table and renumbers every relocation, section group, extended section index
 and LLVM address-significance entry. It rejects any other section that refers
 to symbol indices, and CREL relocations.
+
+`-wrap` applies to every input of the link. `-keep-global-symbol` and
+`-localize-hidden` therefore leave a wrapped symbol's definition and its
+`__wrap_` wrapper global, so the other inputs' wrapped references still
+resolve. Naming one with `-localize-symbol` still hides it.
+
+On Mach-O, a private extern (`N_PEXT`, from hidden visibility) counts as
+hidden. Localizing clears its external bits. Weakening sets `N_WEAK_DEF` on a
+definition or `N_WEAK_REF` on an import. Symbols marked no-dead-strip (from
+`__attribute__((used))`) or `REFERENCED_DYNAMICALLY` count as needed:
+`-strip-unneeded` keeps them, and `-strip-symbol` refuses them. Every Mach-O
+edit rewrites the symbol table in the order ld64 expects: locals in input
+order, then external definitions and imports, each sorted by name. It then
+renumbers extern relocations and the indirect symbol table. A wrapped
+definition's references in debug sections, `__LD,__compact_unwind` and
+`__eh_frame` keep naming the definition. An undefined `__real_SYM` beside a
+defined `SYM` in one object is bound directly to it and removed.
 
 A hidden symbol usually links the members of one archive together, so
 localizing it in each member separately breaks the archive. When the build's

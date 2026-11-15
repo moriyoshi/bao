@@ -353,8 +353,8 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
-	if edits.any() && !strings.HasPrefix(target.Name, "linux/") {
-		return usage("-wrap/-redefine-sym/-redefine-syms/-prefix-symbols support only Linux ELF inputs")
+	if edits.any() && strings.HasPrefix(target.Name, "windows/") {
+		return usage("symbol edits support Linux ELF and macOS Mach-O inputs, not Windows COFF yet")
 	}
 	if strings.HasPrefix(target.Name, "windows/") && *linker != "" {
 		return usage("Windows COFF archive selection is built in; -ld is unsupported")

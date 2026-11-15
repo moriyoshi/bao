@@ -242,3 +242,46 @@ func TestMatcherAndParseNames(t *testing.T) {
 		t.Fatalf("ParseNames = %q, %v", got, err)
 	}
 }
+
+func TestHidingKeepsWrapLinkGlobal(t *testing.T) {
+	elfIn := testObject([]testSymbol{
+		{"target", elf.STB_GLOBAL, elf.STT_FUNC, textSection, 0, false, false},
+		{"__wrap_target", elf.STB_GLOBAL, elf.STT_FUNC, textSection, elf.STV_HIDDEN, true, false},
+		{"__wrap_strlen", elf.STB_GLOBAL, elf.STT_FUNC, textSection, elf.STV_HIDDEN, true, false},
+		{"helper", elf.STB_GLOBAL, elf.STT_FUNC, textSection, elf.STV_HIDDEN, true, false},
+	}, "")
+	machoIn := testMachO([]testNlist{
+		{name: "___wrap_strlen", typ: hidden},
+		{name: "___wrap_target", typ: hidden},
+		{name: "_helper", typ: hidden},
+		{name: "_target", typ: global},
+	})
+	// Other inputs' wrapped references bind to these definitions, so the
+	// implicit forms leave them global; naming one still hides it.
+	for _, tc := range []struct {
+		v          Visibility
+		elf, macho []string
+	}{
+		{Visibility{LocalizeHidden: true}, []string{"helper:L", "target:G", "__wrap_target:G", "__wrap_strlen:G"}, []string{"_helper:L", "___wrap_strlen:H", "___wrap_target:H", "_target:G"}},
+		{Visibility{KeepGlobal: matcher(t, false, "api")}, []string{"helper:L", "target:G", "__wrap_target:G", "__wrap_strlen:G"}, []string{"_helper:L", "___wrap_strlen:H", "___wrap_target:H", "_target:G"}},
+		{Visibility{Localize: matcher(t, false, "__wrap_strlen")}, []string{"__wrap_strlen:L", "target:G", "__wrap_target:G", "helper:G"}, []string{"___wrap_strlen:L", "___wrap_target:H", "_helper:H", "_target:G"}},
+	} {
+		e := Edits{Wrap: []string{"target", "strlen"}, Visibility: tc.v}
+		out, _, err := Edit(elfIn, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Calls to the defined target move to an added __wrap_target symbol
+		// only when no wrapper exists; here the object defines one.
+		if got := readBound(t, out).symbols; !reflect.DeepEqual(got, tc.elf) {
+			t.Errorf("ELF %+v: %q, want %q", tc.v, got, tc.elf)
+		}
+		out, _, err = Edit(machoIn, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readMachO(t, out).symbols; !reflect.DeepEqual(got, tc.macho) {
+			t.Errorf("Mach-O %+v: %q, want %q", tc.v, got, tc.macho)
+		}
+	}
+}

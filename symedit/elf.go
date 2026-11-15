@@ -139,6 +139,19 @@ func (f *elfFile) section(i int) []byte {
 	return f.data[s.offset : s.offset+s.size]
 }
 
+func (f *elfFile) undefined() []string {
+	var out []string
+	for _, s := range f.symbols {
+		if s.global() && !s.defined() && s.named() {
+			out = append(out, s.name)
+		}
+	}
+	return out
+}
+
+// indexNames lists definitions, including common symbols, as GNU ar does.
+func (f *elfFile) indexNames() []string { return f.defined() }
+
 func (f *elfFile) defined() []string {
 	var out []string
 	for _, s := range f.symbols {
