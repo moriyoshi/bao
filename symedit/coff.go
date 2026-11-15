@@ -17,6 +17,12 @@ const (
 	coffSectionHeader = 40
 	coffSymbolSize    = 18
 	coffRelocSize     = 10
+	// The bigobj format (cl /bigobj, GNU as -mbig-obj) has a 56-byte header
+	// with 32-bit counts, 20-byte symbol and auxiliary records with 32-bit
+	// section numbers, and a high half of the associative section number in
+	// section definitions.
+	coffBigHeader     = 56
+	coffBigSymbolSize = 20
 
 	coffMachineAMD64 = 0x8664
 	coffMachineARM64 = 0xaa64
@@ -54,7 +60,7 @@ type coffSymbol struct {
 	index     int
 	name      string
 	value     uint32
-	section   int16
+	section   int32
 	typ       uint16
 	class     byte
 	naux      int
@@ -109,6 +115,87 @@ type coffFile struct {
 	// numbers maps a section's input number to its output one, or to 0 for
 	// a removed section. It is nil when no section is removed.
 	numbers []int
+	coffLayout
+}
+
+// coffLayout locates the fields that differ between regular and bigobj
+// objects.
+type coffLayout struct {
+	big bool
+	// header is the file header's size, which section headers follow, and
+	// symSize the size of a symbol or auxiliary record.
+	header, symSize int
+}
+
+var bigObjClassID = []byte{0xc7, 0xa1, 0xba, 0xd1, 0xee, 0xba, 0xa9, 0x4b, 0xaf, 0x20, 0xfa, 0xf6, 0x6a, 0xa4, 0xdc, 0xb8}
+
+// isBigObj reports an ANON_OBJECT_HEADER_BIGOBJ: Sig1 0, Sig2 0xffff,
+// version 2 or later and the bigobj class ID.
+func isBigObj(data []byte) bool {
+	return len(data) >= coffBigHeader && le.Uint16(data) == 0 && le.Uint16(data[2:]) == 0xffff && le.Uint16(data[4:]) >= 2 && bytes.Equal(data[12:28], bigObjClassID)
+}
+
+func (l coffLayout) machineAt() int { return map[bool]int{false: 0, true: 6}[l.big] }
+func (l coffLayout) countsAt() (sections, symoff, records int) {
+	if l.big {
+		return 44, 48, 52
+	}
+	return 2, 8, 12
+}
+
+func (l coffLayout) sectionCount(data []byte) int {
+	at, _, _ := l.countsAt()
+	if l.big {
+		return int(le.Uint32(data[at:]))
+	}
+	return int(le.Uint16(data[at:]))
+}
+
+func (l coffLayout) putSectionCount(data []byte, n int) {
+	at, _, _ := l.countsAt()
+	if l.big {
+		le.PutUint32(data[at:], uint32(n))
+	} else {
+		le.PutUint16(data[at:], uint16(n))
+	}
+}
+
+// symbolSection reads a symbol record's section number.
+func (l coffLayout) symbolSection(e []byte) int32 {
+	if l.big {
+		return int32(le.Uint32(e[12:]))
+	}
+	return int32(int16(le.Uint16(e[12:])))
+}
+
+func (l coffLayout) putSymbolSection(e []byte, v int32) {
+	if l.big {
+		le.PutUint32(e[12:], uint32(v))
+	} else {
+		le.PutUint16(e[12:], uint16(v))
+	}
+}
+
+// Offsets of a symbol record's type, storage class and auxiliary count.
+func (l coffLayout) typeAt() int  { return l.symSize - 4 }
+func (l coffLayout) classAt() int { return l.symSize - 2 }
+func (l coffLayout) nauxAt() int  { return l.symSize - 1 }
+
+// auxNumber reads a section definition's associated section number, whose
+// high half bigobj stores after the selection.
+func (l coffLayout) auxNumber(aux []byte) int {
+	n := int(le.Uint16(aux[12:]))
+	if l.big {
+		n |= int(le.Uint16(aux[16:])) << 16
+	}
+	return n
+}
+
+func (l coffLayout) putAuxNumber(aux []byte, n int) {
+	le.PutUint16(aux[12:], uint16(n))
+	if l.big {
+		le.PutUint16(aux[16:], uint16(n>>16))
+	}
 }
 
 func isCOFF(data []byte) bool {
@@ -128,29 +215,31 @@ func parseCOFF(data []byte) (*coffFile, error) {
 	if len(data) < coffFileHeader {
 		return nil, errors.New("short COFF object")
 	}
-	switch m := le.Uint16(data); m {
-	case coffMachineAMD64, coffMachineARM64:
-	case 0:
-		if len(data) >= 8 && le.Uint16(data[4:]) >= 2 {
-			return nil, errors.New("bigobj COFF objects are unsupported")
-		}
+	layout := coffLayout{header: coffFileHeader, symSize: coffSymbolSize}
+	if isBigObj(data) {
+		layout = coffLayout{big: true, header: coffBigHeader, symSize: coffBigSymbolSize}
+	}
+	switch m := le.Uint16(data[layout.machineAt():]); {
+	case m == coffMachineAMD64 || m == coffMachineARM64:
+	case !layout.big && m == 0:
 		return nil, errors.New("COFF short import members are not edited")
 	default:
 		return nil, fmt.Errorf("only amd64 and arm64 COFF objects are supported, not machine %#x", m)
 	}
-	if le.Uint16(data[16:]) != 0 {
+	if !layout.big && le.Uint16(data[16:]) != 0 {
 		return nil, errors.New("not a COFF relocatable object")
 	}
-	nsect := int(le.Uint16(data[2:]))
-	f := &coffFile{data: data, symoff: le.Uint32(data[8:]), records: int(le.Uint32(data[12:]))}
-	if coffFileHeader+nsect*coffSectionHeader > len(data) {
+	nsect := layout.sectionCount(data)
+	_, symoffAt, recordsAt := layout.countsAt()
+	f := &coffFile{data: data, symoff: le.Uint32(data[symoffAt:]), records: int(le.Uint32(data[recordsAt:])), coffLayout: layout}
+	if uint64(layout.header)+uint64(nsect)*coffSectionHeader > uint64(len(data)) {
 		return nil, errors.New("COFF section headers are out of range")
 	}
-	if f.records > 0 && (uint64(f.symoff)+uint64(f.records)*coffSymbolSize+4 > uint64(len(data))) {
+	if f.records > 0 && (uint64(f.symoff)+uint64(f.records)*uint64(f.symSize)+4 > uint64(len(data))) {
 		return nil, errors.New("COFF symbol table is out of range")
 	}
 	if f.records > 0 {
-		start := int(f.symoff) + f.records*coffSymbolSize
+		start := int(f.symoff) + f.records*f.symSize
 		size := int(le.Uint32(data[start:]))
 		if size < 4 || size > len(data)-start {
 			return nil, errors.New("COFF string table is out of range")
@@ -168,7 +257,7 @@ func parseCOFF(data []byte) (*coffFile, error) {
 		return string(f.strtab[off : int(off)+end]), nil
 	}
 	for i := 0; i < nsect; i++ {
-		h := data[coffFileHeader+i*coffSectionHeader:]
+		h := data[layout.header+i*coffSectionHeader:]
 		name := strings.TrimRight(string(h[:8]), "\x00")
 		if strings.HasPrefix(name, "/") && !strings.HasPrefix(name, "//") {
 			off, err := strconv.ParseUint(name[1:], 10, 32)
@@ -179,7 +268,7 @@ func parseCOFF(data []byte) (*coffFile, error) {
 				return nil, err
 			}
 		}
-		s := coffSection{name: name, size: le.Uint32(h[16:]), contents: le.Uint32(h[20:]), reloff: le.Uint32(h[24:]), nreloc: uint32(le.Uint16(h[32:])), nlines: le.Uint16(h[34:]), flags: le.Uint32(h[36:]), header: coffFileHeader + i*coffSectionHeader}
+		s := coffSection{name: name, size: le.Uint32(h[16:]), contents: le.Uint32(h[20:]), reloff: le.Uint32(h[24:]), nreloc: uint32(le.Uint16(h[32:])), nlines: le.Uint16(h[34:]), flags: le.Uint32(h[36:]), header: layout.header + i*coffSectionHeader}
 		if s.flags&coffNrelocOvfl != 0 && s.nreloc == 0xffff {
 			if int(s.reloff)+coffRelocSize > len(data) {
 				return nil, errors.New("COFF relocations are out of range")
@@ -193,8 +282,8 @@ func parseCOFF(data []byte) (*coffFile, error) {
 		f.imports = f.imports || name == ".idata" || strings.HasPrefix(name, ".idata$")
 	}
 	for i := 0; i < f.records; {
-		e := data[int(f.symoff)+i*coffSymbolSize:]
-		s := coffSymbol{index: i, value: le.Uint32(e[8:]), section: int16(le.Uint16(e[12:])), typ: le.Uint16(e[14:]), class: e[16], naux: int(e[17])}
+		e := data[int(f.symoff)+i*f.symSize:]
+		s := coffSymbol{index: i, value: le.Uint32(e[8:]), section: layout.symbolSection(e), typ: le.Uint16(e[layout.typeAt():]), class: e[layout.classAt()], naux: int(e[layout.nauxAt()])}
 		if le.Uint32(e) == 0 {
 			name, err := str(le.Uint32(e[4:]))
 			if err != nil {
@@ -357,7 +446,7 @@ func (f *coffFile) removed(number int) bool {
 
 // aux returns the first auxiliary record of a symbol.
 func (f *coffFile) aux(s coffSymbol) []byte {
-	return f.data[int(f.symoff)+(s.index+1)*coffSymbolSize:][:coffSymbolSize]
+	return f.data[int(f.symoff)+(s.index+1)*f.symSize:][:f.symSize]
 }
 
 // sectionNumbers applies -remove-section and -only-section. As in
@@ -379,7 +468,7 @@ func (f *coffFile) sectionNumbers(e Edits) (int, error) {
 				continue
 			}
 			if aux := f.aux(s); aux[14] == coffSelectAssociative {
-				if to := int(le.Uint16(aux[12:])); to < len(drop) && drop[to] {
+				if to := f.auxNumber(aux); to < len(drop) && drop[to] {
 					drop[s.section], changed = true, true
 				}
 			}
@@ -417,7 +506,7 @@ func (f *coffFile) addSymbols(symbols *[]coffSymbol, adds []AddedSymbol) ([]stri
 	var added []string
 	for _, a := range adds {
 		value := a.Value
-		section := int16(coffSymAbsolute)
+		section := int32(coffSymAbsolute)
 		if a.Symbol != "" {
 			var globals, locals []int
 			for i, t := range f.symbols {
@@ -457,7 +546,7 @@ func (f *coffFile) addSymbols(symbols *[]coffSymbol, adds []AddedSymbol) ([]stri
 			if k == 0 {
 				return nil, fmt.Errorf("cannot add symbol %s to missing COFF section %s", a.Name, a.Section)
 			}
-			s.section = int16(k)
+			s.section = int32(k)
 		}
 		switch a.Bind {
 		case elf.STB_LOCAL:
@@ -500,9 +589,9 @@ func (f *coffFile) compactSections(out []byte) {
 			table = append(table, out[s.header:s.header+coffSectionHeader]...)
 		}
 	}
-	copy(out[coffFileHeader:], table)
-	clear(out[coffFileHeader+len(table) : coffFileHeader+len(f.sections)*coffSectionHeader])
-	le.PutUint16(out[2:], uint16(len(table)/coffSectionHeader))
+	copy(out[f.header:], table)
+	clear(out[f.header+len(table) : f.header+len(f.sections)*coffSectionHeader])
+	f.putSectionCount(out, len(table)/coffSectionHeader)
 }
 
 // weaken turns each weakened symbol into a weak external, as clang encodes
@@ -514,7 +603,7 @@ func (f *coffFile) compactSections(out []byte) {
 // absolute zero default. SUFFIX, as in LLVM, is the object's first strong
 // external definition, which keeps the defaults of different objects apart;
 // without one it is a digest of the object.
-func weaken(data []byte, symbols []coffSymbol, classes []byte, weakened []int) ([]coffSymbol, []byte, map[int]int) {
+func weaken(data []byte, symSize int, symbols []coffSymbol, classes []byte, weakened []int) ([]coffSymbol, []byte, map[int]int) {
 	if len(weakened) == 0 {
 		return symbols, classes, nil
 	}
@@ -533,7 +622,7 @@ func weaken(data []byte, symbols []coffSymbol, classes []byte, weakened []int) (
 		suffix = fmt.Sprintf("bao.%x", sha256.Sum256(data))[:20]
 	}
 	alias := func(tag int) []byte {
-		aux := make([]byte, coffSymbolSize)
+		aux := make([]byte, symSize)
 		le.PutUint32(aux, 1<<31|uint32(tag))
 		le.PutUint32(aux[4:], coffWeakSearchAlias)
 		return aux
@@ -729,7 +818,7 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 			}
 		}
 		if s.class == coffClassWeakExternal && s.naux > 0 {
-			tag := le.Uint32(f.data[int(f.symoff)+(s.index+1)*coffSymbolSize:])
+			tag := le.Uint32(f.aux(s))
 			if j, ok := byRecord[tag]; ok {
 				referenced[j] = true
 			}
@@ -800,7 +889,7 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 		return objectResult{data: data}, nil
 	}
 	var aliases map[int]int
-	symbols, classes, aliases = weaken(data, symbols, classes, weakened)
+	symbols, classes, aliases = weaken(data, f.symSize, symbols, classes, weakened)
 	if len(aliases) > 0 {
 		// Code refers to a weakened definition through its weak external,
 		// so a strong definition elsewhere wins here too. Unwind and debug
@@ -894,26 +983,27 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 		strtab = []byte{4, 0, 0, 0}
 	}
 	offsets := map[string]uint32{}
-	table := make([]byte, 0, int(next)*coffSymbolSize)
+	size := f.symSize
+	table := make([]byte, 0, int(next)*size)
 	for i, s := range symbols {
 		if index[i] == removedIndex {
 			continue
 		}
-		entry := make([]byte, coffSymbolSize*(1+s.naux))
+		entry := make([]byte, size*(1+s.naux))
 		if s.index >= 0 {
-			copy(entry, f.data[int(f.symoff)+s.index*coffSymbolSize:])
+			copy(entry, f.data[int(f.symoff)+s.index*size:])
 		}
 		section := s.section
 		if f.numbers != nil && section > 0 {
-			section = int16(f.numbers[section])
+			section = int32(f.numbers[section])
 		}
 		le.PutUint32(entry[8:], s.value)
-		le.PutUint16(entry[12:], uint16(section))
-		le.PutUint16(entry[14:], s.typ)
+		f.putSymbolSection(entry, section)
+		le.PutUint16(entry[f.typeAt():], s.typ)
 		// An associative COMDAT section names the section it follows.
-		if s.isSection && f.numbers != nil && entry[coffSymbolSize+14] == coffSelectAssociative {
-			if to := int(le.Uint16(entry[coffSymbolSize+12:])); to < len(f.numbers) {
-				le.PutUint16(entry[coffSymbolSize+12:], uint16(f.numbers[to]))
+		if s.isSection && f.numbers != nil && entry[size+14] == coffSelectAssociative {
+			if to := f.auxNumber(entry[size:]); to < len(f.numbers) {
+				f.putAuxNumber(entry[size:], f.numbers[to])
 			}
 		}
 		if s.index < 0 || s.name != f.symbols[i].name {
@@ -935,21 +1025,21 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 				le.PutUint32(entry[4:], off)
 			}
 		}
-		entry[16] = classes[i]
+		entry[f.classAt()] = classes[i]
 		if s.aux != nil {
-			copy(entry[coffSymbolSize:], s.aux)
-			entry[17] = byte(s.naux)
+			copy(entry[size:], s.aux)
+			entry[f.nauxAt()] = byte(s.naux)
 		}
 		// A section definition records its section's length.
 		if contents, ok := resized[int(s.section)-1]; ok && s.isSection {
-			le.PutUint32(entry[coffSymbolSize:], uint32(len(contents)))
+			le.PutUint32(entry[size:], uint32(len(contents)))
 		}
 		if s.class == coffClassWeakExternal && s.naux > 0 {
-			tag, err := renumber(le.Uint32(entry[coffSymbolSize:]))
+			tag, err := renumber(le.Uint32(entry[size:]))
 			if err != nil {
 				return err
 			}
-			le.PutUint32(entry[coffSymbolSize:], tag)
+			le.PutUint32(entry[size:], tag)
 		}
 		table = append(table, entry...)
 	}
@@ -985,8 +1075,9 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 	if uint64(len(*out))+uint64(len(table))+uint64(len(strtab)) >= 1<<32 {
 		return errors.New("COFF object is too large")
 	}
-	le.PutUint32((*out)[8:], uint32(len(*out)))
-	le.PutUint32((*out)[12:], next)
+	_, symoffAt, recordsAt := f.countsAt()
+	le.PutUint32((*out)[symoffAt:], uint32(len(*out)))
+	le.PutUint32((*out)[recordsAt:], next)
 	*out = append(append(*out, table...), strtab...)
 	return nil
 }

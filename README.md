@@ -690,10 +690,27 @@ translation itself needs no native compiler/linker.
 `bao build` can rename symbols in its Linux ELF, macOS Mach-O and Windows COFF
 inputs before they are combined, so a producer needs neither `objcopy` nor a
 second relinking step. The same edits are available on single files as
-`bao objcopy`. Supported inputs are little-endian ELF64, 64-bit Mach-O, and
-amd64/arm64 COFF relocatable objects, and archives of them. Split a universal
-Mach-O file with `lipo` first. COFF bigobj files are not edited. Import library
-members pass through unchanged (see the COFF notes).
+`bao objcopy`. Supported inputs are little-endian ELF64 relocatable objects,
+64- and 32-bit little-endian Mach-O objects and universal (fat) files of them,
+amd64/arm64 COFF relocatable objects (regular or bigobj), and archives of all
+of these. Import library members pass through unchanged (see the COFF notes).
+
+`bao objcopy` also handles formats that `bao build` does not translate:
+
+- COFF bigobj, which `cl /bigobj` and `-Wa,-mbig-obj` write, and which LLVM
+  writes for more than 65279 sections. `bao build` says so when given one.
+- Universal Mach-O files, objects or archives. Each slice is edited as if it
+  were alone, and the result keeps the architectures, their order and their
+  alignments, in FAT_MAGIC or FAT_MAGIC_64.
+- 32-bit Mach-O objects (i386, armv7). Their scattered relocations name an
+  address. A symbol at such an address counts as referenced, and its section
+  cannot be removed.
+  - A 32-bit ARM alias made with `@SYMBOL:0` keeps a Thumb function's
+    `N_ARM_THUMB_DEF`.
+  - 32-bit code also reaches local functions through section-relative
+    relocations, and each defined symbol starts an atom. So
+    `-strip-unneeded` keeps 32-bit section symbols, because `ld -r` fails on
+    an atom left without one.
 
 Names are C names on both formats, as for `-symbol`. On Mach-O, Bao matches and
 writes them with the leading underscore that C symbols carry, so
@@ -1547,7 +1564,8 @@ data alignment is limited to 32 bytes and code alignment to 16 bytes. TLS suppor
 alignment up to 8192 bytes and a 64 MiB template; unrecognized access forms and
 TLS template relocations are rejected. Managed FLS keys must stay within the
 image; destructor re-registration is bounded to four rounds. Native lifecycle
-callbacks must not throw. Bigobj, ARM64EC and MSVC Rust targets remain unsupported.
+callbacks must not throw. Bigobj inputs (which `bao objcopy` can still edit),
+ARM64EC and MSVC Rust targets remain unsupported.
 Debug stripping retains runtime unwind metadata.
 
 #### Windows DLLs

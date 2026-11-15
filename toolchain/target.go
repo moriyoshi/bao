@@ -118,11 +118,16 @@ func detectObject(b []byte) (Target, error) {
 	if len(b) >= 20 && binary.LittleEndian.Uint16(b) == 0x14c {
 		return Target{}, fmt.Errorf("Windows/386 COFF is unsupported; Windows targets are amd64/arm64")
 	}
-	if m, err := pecoff.Machine(b); err == nil {
+	m, err := pecoff.Machine(b)
+	if err == nil {
 		if m == 0x8664 {
 			return ParseTarget("windows/amd64")
 		}
 		return ParseTarget("windows/arm64")
+	}
+	// A bigobj header is recognized, but bigobj objects are not translated.
+	if len(b) >= 8 && binary.LittleEndian.Uint16(b) == 0 && binary.LittleEndian.Uint16(b[2:]) == 0xffff && binary.LittleEndian.Uint16(b[4:]) >= 2 {
+		return Target{}, err
 	}
 	if bytes.HasPrefix(b, []byte{0x7f, 'E', 'L', 'F'}) {
 		f, err := elf.NewFile(bytes.NewReader(b))

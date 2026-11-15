@@ -6523,3 +6523,132 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
   - `main` refuses `-strip-unneeded` on the CREL object.
   - `ld.lld -r` preserves CREL, so GNU readelf 2.42 could not be the
     comparison reader; the parity tool's dump mode was.
+
+## 2026-11-15: COFF bigobj in symbol edits
+
+Problem. symedit refused bigobj COFF objects (ANON_OBJECT_HEADER_BIGOBJ,
+version 2). MSVC writes them with `/bigobj`, GNU as with `-mbig-obj`, and
+LLVM whenever an object has more than 65279 sections.
+
+Change.
+- `symedit/coff.go` gains a `coffLayout` that locates every field that
+  differs between the formats:
+  - the header size (20 or 56 bytes) that section headers follow;
+  - the section count (16- or 32-bit), the symbol table pointer and the
+    record count;
+  - the record size (18 or 20 bytes) for symbols and auxiliary records, and
+    with it the type, storage class and auxiliary count offsets;
+  - 16-bit signed or 32-bit section numbers;
+  - the associative section number's high half, which bigobj stores at
+    offset 16 of a section definition.
+- Section numbers are `int32` throughout. Bigobj is recognized by its
+  signature, a version of 2 or more, and the bigobj class ID.
+- `bao build` still does not translate bigobj: `pecoff` reads COFF with
+  `debug/pe`, which has no bigobj support. A bigobj input used to fail deep in
+  the pipeline. `internal/ar` member selection, `pecoff.Machine` and target
+  detection now name the problem and point at `bao objcopy`.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `symedit/bigobj_test.go` converts objects between regular and bigobj.
+    The converters round-trip the fixture byte for byte.
+  - Six edit kinds give, on a bigobj copy, the same edit count and, read
+    back, the same symbols, relocations, weak tags, layout and `.drectve` as
+    on the regular object: wrap and rename, bindings, weakening, section
+    removal, `-only-section`, and added symbols including `@SYMBOL`.
+  - A bigobj archive member works with `Defined` and prefixing.
+  - The layout accessors handle section numbers 70000 and -2, and an
+    associative number 0x12345 with its high half.
+  - The `internal/ar` and target detection errors are tested, and a short
+    import record is not taken for bigobj.
+- Real bigobj, `.work/symbig/run.sh` (log `run2.log`):
+  - clang 19.1.7 in bao-cpp-cross:20261108 wrote bigobj automatically for
+    22000 non-leaf functions (`many.c`) built with `--target=x86_64-pc-windows-msvc -ffunction-sections`.
+    That gave 66004 sections, 44000 of them associative `.pdata`/`.xdata`,
+    with section numbers past 65535. Neither `-Wa,-mbig-obj` nor clang-cl
+    `/bigobj` made clang 19 write bigobj for a small file.
+  - A standalone dumper (`dump/`) reads both formats and prints sections by
+    COMDAT key, with each associative section's target key, plus symbols.
+  - Removing `.bss` renumbers 66001 sections. It matches llvm-objcopy
+    (rust-objcopy, LLVM 22) exactly, as does `-redefine-sym` to a long name.
+  - A combined edit removed `.bss`, renamed f100, weakened f5 (a
+    NODUPLICATES COMDAT key renamed in place, with its `.pdata`/`.xdata`
+    still associated to it) and added `f_alias=@f21999:0,function`. It linked
+    with lld-link (rust-lld, LLD 22.1.8), link-only.
+    - In the map, `f_alias` and `f21999` share an address, and f5 resolves
+      through its weak alias.
+  - `main` refuses the object ("bigobj COFF objects are unsupported").
+  - `bao build -target windows/amd64` of the object, or of a GNU ar archive
+    of it, now gives the new errors.
+
+## 2026-11-15: Universal and 32-bit Mach-O in symbol edits
+
+Problem. symedit refused universal (fat) Mach-O files ("split a universal
+file with lipo first") and 32-bit Mach-O objects.
+
+Change.
+- `symedit/fat.go`:
+  - `Edit` and `Defined` accept FAT_MAGIC and FAT_MAGIC_64 files. Each slice,
+    an object or an archive, is edited as if it were alone.
+  - The result keeps the architectures, their order and their alignments,
+    with offsets recomputed.
+  - Java class files share FAT_MAGIC, so a file is taken as universal only
+    with 1 to 31 architectures. A slice past the end of the file and nested
+    universal files are refused.
+- `symedit/macho.go` gains a `machoLayout`, as COFF did for bigobj, covering
+  the 28-byte header, LC_SEGMENT with 68-byte sections, and 12-byte nlist
+  entries with 32-bit values.
+- 32-bit relocations:
+  - Scattered relocations name an address, not a symbol or section. Symbol
+    walks skip them.
+  - A defined symbol at a scattered target counts as referenced, and a
+    scattered target in a removed section is refused.
+  - Non-scattered PAIR relocations (type 1 on i386 and ARM) carry no section
+    ordinal and are not renumbered.
+- On 32-bit ARM, an `@SYMBOL:0` alias copies the target's N_ARM_THUMB_DEF.
+  Without it, ld64 warned "ARM function not 4-byte aligned" for the alias.
+- `-strip-unneeded` keeps 32-bit section symbols.
+  - 32-bit code reaches local functions through section-relative
+    relocations, which give only an address.
+  - Under MH_SUBSECTIONS_VIA_SYMBOLS each defined symbol starts an atom. When
+    keep-global plus strip-unneeded removed localized armv7 functions,
+    `ld -r -arch armv7` failed with "internal error: atom is missing a
+    symbolIndex(anon)".
+  - 64-bit code refers to local functions through extern relocations, which
+    bao already counts.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4; Mac: macOS 26.6.2 x86_64,
+Apple clang 17.0.0, ld-1230.1. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. `symedit/macho32_test.go`:
+  - converts the 64-bit fixtures to i386, and four edit kinds (wrap/rename,
+    bindings, section removal, added symbols) give the same symbols,
+    relocations, indirect tables and layout;
+  - checks a scattered relocation: its target refuses `-strip-symbol`, its
+    section cannot be removed, and strip-unneeded keeps 32-bit section
+    symbols;
+  - checks the ARM Thumb alias;
+  - checks universal files with FAT_MAGIC and FAT_MAGIC_64 holding an i386
+    object and an archive. Each slice equals editing it alone, at 4096-byte
+    alignment, and `Defined` unions the slices.
+  - The class-file and truncated-slice refusals are tested too.
+  - `TestMachORejects` now checks the reason for each refusal.
+- Universal, `.work/symfat/mac.sh` on the Mac (log `run1.log`):
+  - `lipo -create` x86_64+arm64 objects and archives, edited with
+    keep-global+strip-unneeded, `__DWARF` removal and an `@Py_Api` alias.
+  - Each slice is byte-identical to editing that architecture alone
+    (`lipo -thin` + `cmp`).
+  - The edited universal files linked for both architectures. x86_64 ran
+    natively and printed `3 9 5 5`; arm64 only linked.
+  - Control: a definition localized in the universal file no longer links.
+- 32-bit, `.work/sym32/r4`:
+  - clang 19.1.7 in bao-cpp-cross:20261108 built i386-apple-macos10.13 and
+    armv7-apple-ios9 objects. Their `__text` carries 2 and 4 scattered
+    relocations.
+  - `__DWARF,*` removal, `-only-section` and `-redefine-sym` match
+    llvm-objcopy (rust-objcopy, LLVM 22), with 8 ok.
+  - bao-only edits (wrap, keep-global, strip-unneeded, an `@` alias) ran, and
+    removing `__TEXT,__text` is refused.
+  - ld-1230.1 cannot link 32-bit executables. `ld -r -arch i386|armv7` read
+    every bao and llvm output without error after the two fixes above (log
+    `mac.log`), with only i386's deprecation warning.
+- `.work/symmacho/run.sh` was rerun on this code: 78 ok, 0 FAIL, as before.

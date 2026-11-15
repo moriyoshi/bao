@@ -64,3 +64,13 @@ func TestDetectTargetAndRejectMixedArchives(t *testing.T) {
 		t.Fatal("unsupported ELF machine accepted")
 	}
 }
+
+func TestDetectBigObjObject(t *testing.T) {
+	big := make([]byte, 56)
+	binary.LittleEndian.PutUint16(big[2:], 0xffff)
+	binary.LittleEndian.PutUint16(big[4:], 2)
+	binary.LittleEndian.PutUint16(big[6:], 0x8664)
+	if _, err := detectObject(big); err == nil || !strings.Contains(err.Error(), "bigobj COFF objects are not translated") {
+		t.Fatalf("detectObject = %v", err)
+	}
+}
