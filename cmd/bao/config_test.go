@@ -33,7 +33,7 @@ func configFlags(t *testing.T, name, body string, args ...string) (*nativeFlags,
 		fs.String("ld", "", "")
 		fs.String("min-os", "11.0", "")
 		var edits symbolEditFlags
-		edits.register(fs, "")
+		edits.register(fs, true, "")
 	}
 	if err := fs.Parse(append([]string{"-config", path}, args...)); err != nil {
 		t.Fatal(err)

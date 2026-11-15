@@ -30,19 +30,55 @@ func editArchive(data []byte, e Edits) ([]byte, int, error) {
 		return nil, 0, err
 	}
 	total := 0
+	hiddenBy := map[string]int{}
 	for i, m := range members {
-		edited, n, err := editELF(m.Data, e)
+		r, err := editELF(m.Data, e)
 		if err != nil {
 			return nil, 0, fmt.Errorf("archive member %s: %w", m.Name, err)
 		}
-		members[i].Data = edited
-		total += n
+		members[i].Data = r.data
+		total += r.edited
+		for _, name := range r.hidden {
+			hiddenBy[name] = i
+		}
 	}
 	if total == 0 {
 		return data, 0, nil
 	}
+	if len(hiddenBy) > 0 {
+		if err := checkHidden(members, hiddenBy); err != nil {
+			return nil, 0, err
+		}
+	}
 	out, err := writeArchive(members)
 	return out, total, err
+}
+
+// checkHidden rejects a member reference that bound to a definition another
+// member no longer exports, unless some member still exports that name.
+func checkHidden(members []ar.Member, hiddenBy map[string]int) error {
+	files := make([]*elfFile, len(members))
+	exported := map[string]bool{}
+	for i, m := range members {
+		f, err := parseELF(m.Data)
+		if err != nil {
+			return fmt.Errorf("archive member %s: %w", m.Name, err)
+		}
+		files[i] = f
+		for _, name := range f.defined() {
+			exported[name] = true
+		}
+	}
+	for i, f := range files {
+		for _, s := range f.symbols {
+			owner, ok := hiddenBy[s.name]
+			if !ok || owner == i || exported[s.name] || !s.global() || s.defined() || !s.named() {
+				continue
+			}
+			return fmt.Errorf("archive member %s refers to %s, which member %s no longer exports; partially link the archive into one object first, or use a prefix instead", members[i].Name, s.name, members[owner].Name)
+		}
+	}
+	return nil
 }
 
 func writeArchive(members []ar.Member) ([]byte, error) {

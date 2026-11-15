@@ -625,7 +625,7 @@ bao help build
 | `translate` | Translate an already-combined object; auto-detect Darwin/ELF input |
 | `inspect` | Report Darwin raw-input compatibility or Linux ELF/Windows COFF structure |
 | `bindings` | Infer selected C ABI function types from full native DWARF |
-| `objcopy` | Rename, wrap or prefix symbols in an ELF object or archive; see [symbol edits](#symbol-edits) |
+| `objcopy` | Rename, wrap, prefix, localize or strip symbols in an ELF object or archive; see [symbol edits](#symbol-edits) |
 | `doctor` | Check the full producer toolchain; installs nothing |
 | `targets` | List target names and Rust triples |
 | `sign`, `keygen` | Produce Ed25519 release envelopes and local signing keys |
@@ -745,6 +745,57 @@ bao objcopy -prefix-symbols ext1_ libvendor.a libvendor-private.a
 
 `bao objcopy` takes one input and a new output, which must not exist.
 `-prefix-symbols PREFIX` there prefixes the input's own definitions.
+
+#### Symbol bindings and stripping
+
+These flags hide or remove symbols, as the llvm-objcopy flags of the same
+names do. In `bao build` each one names its component first, as `PATH=SYMBOL`,
+`PATH=FILE` or `PATH`. In `bao objcopy` it applies to the one input, so it
+takes only `SYMBOL` or `FILE`, or nothing.
+
+| Flag | Effect |
+| --- | --- |
+| `-localize-symbol SYM` | Make that definition local |
+| `-localize-symbols FILE` | `-localize-symbol` for each line of `FILE` |
+| `-localize-hidden` | Make hidden and internal definitions local |
+| `-keep-global-symbol SYM` | Keep `SYM` global and make every other definition local |
+| `-keep-global-symbols FILE` | `-keep-global-symbol` for each line of `FILE` |
+| `-globalize-symbol SYM` | Make that definition global |
+| `-weaken-symbol SYM` | Make that global symbol weak, defined or undefined |
+| `-strip-symbol SYM` | Remove that symbol; it is an error if a relocation or section group names it |
+| `-strip-unneeded` | Remove local and undefined symbols that no relocation or section group names |
+| `-wildcard` | Treat the names above as shell patterns; a pattern starting with `!` excludes names |
+
+Bindings change in llvm-objcopy's order: localize, then keep-global, then
+globalize, then weaken. Removal comes after that. Names match input names, as
+for the renames. Undefined and common symbols are never made local.
+`-strip-unneeded` keeps section symbols and ARM/AArch64/RISC-V mapping symbols
+such as `$x`. Unlike llvm-objcopy, it does not remove debug sections;
+`-strip-debug` does that after binding inference.
+Local symbols must precede the others in ELF. Bao therefore rewrites the symbol
+table and renumbers every relocation, section group, extended section index
+and LLVM address-significance entry. It rejects any other section that refers
+to symbol indices, and CREL relocations.
+
+A hidden symbol usually links the members of one archive together, so
+localizing it in each member separately breaks the archive. When the build's
+input is an archive with binding or strip flags, Bao first partially links it
+on its own with the native `ld -r`. It then edits the single object, and
+`bao-build.json` records `combined_first`. A `-link-archive` is searched, so its
+members are edited separately. So is any archive given to `bao objcopy`. That is
+an error when one member refers to a definition that another member no longer
+exports; use `-prefix-symbols` for such an archive.
+
+```sh
+# Keep only the Python C API and pythago's glue global in libpython.a. Its
+# vendored expat and HACL* symbols then cannot collide with a wheel's copies.
+bao build -target linux/arm64 -symbol pythago_main -wildcard \
+  -keep-global-symbol 'libpython.a=Py*' -keep-global-symbol 'libpython.a=_Py*' \
+  -keep-global-symbol 'libpython.a=pythago_*' -strip-unneeded libpython.a \
+  -link-archive wheels/libext1.a -o ./native libpython.a
+
+bao objcopy -localize-hidden -strip-unneeded libpython.o libpython-private.o
+```
 
 ### Function bindings and native debug stripping
 
@@ -1558,7 +1609,11 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
 `require_static_runtime`, the [symbol edits](#symbol-edits) `wrap`,
 `redefine_symbols` (`OLD=NEW` strings), `redefine_symbol_files` and
-`prefix_symbols` (an object from path to prefix), and `cargo` (`manifest_path`, `package`, `offline`,
+`prefix_symbols` (an object from path to prefix), `wildcard`, `symbol_visibility`
+(an object from path to `localize_symbols`, `localize_symbol_files`,
+`localize_hidden`, `keep_global_symbols`, `keep_global_symbol_files`,
+`globalize_symbols`, `weaken_symbols`, `strip_symbols` and `strip_unneeded`),
+and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
 `sysroot`, `ld`, `system_libraries`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
