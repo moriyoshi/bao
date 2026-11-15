@@ -31,6 +31,10 @@ func Machine(input []byte) (uint16, error) {
 	if len(input) < 20 || input[0] == 'M' && input[1] == 'Z' {
 		return 0, fmt.Errorf("requires an ordinary COFF relocatable object, not a PE image/import record")
 	}
+	// ANON_OBJECT_HEADER_BIGOBJ: Sig1 0, Sig2 0xffff, version 2 or more.
+	if binary.LittleEndian.Uint16(input) == 0 && binary.LittleEndian.Uint16(input[2:]) == 0xffff && binary.LittleEndian.Uint16(input[4:]) >= 2 {
+		return 0, fmt.Errorf("bigobj COFF objects are not translated: rebuild without /bigobj or -Wa,-mbig-obj, with fewer than 65279 sections (bao objcopy can still edit them)")
+	}
 	m := binary.LittleEndian.Uint16(input)
 	if m != pe.IMAGE_FILE_MACHINE_AMD64 && m != pe.IMAGE_FILE_MACHINE_ARM64 {
 		return 0, fmt.Errorf("unsupported COFF machine %#x", m)

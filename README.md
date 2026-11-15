@@ -691,9 +691,11 @@ translation itself needs no native compiler/linker.
 inputs before they are combined, so a producer needs neither `objcopy` nor a
 second relinking step. The same edits are available on single files as
 `bao objcopy`. Supported inputs are little-endian ELF64, 64-bit Mach-O, and
-amd64/arm64 COFF relocatable objects, and archives of them. Split a universal
-Mach-O file with `lipo` first. COFF bigobj files are not edited. Import library
-members pass through unchanged (see the COFF notes).
+amd64/arm64 COFF relocatable objects, regular or bigobj, and archives of them.
+Split a universal Mach-O file with `lipo` first. Import library members pass
+through unchanged (see the COFF notes). `bao objcopy` edits COFF bigobj
+objects, which `cl /bigobj` and `-Wa,-mbig-obj` write and which LLVM writes
+for more than 65279 sections. `bao build` does not translate them and says so.
 
 Names are C names on both formats, as for `-symbol`. On Mach-O, Bao matches and
 writes them with the leading underscore that C symbols carry, so
@@ -1547,7 +1549,8 @@ data alignment is limited to 32 bytes and code alignment to 16 bytes. TLS suppor
 alignment up to 8192 bytes and a 64 MiB template; unrecognized access forms and
 TLS template relocations are rejected. Managed FLS keys must stay within the
 image; destructor re-registration is bounded to four rounds. Native lifecycle
-callbacks must not throw. Bigobj, ARM64EC and MSVC Rust targets remain unsupported.
+callbacks must not throw. Bigobj inputs (which `bao objcopy` can still edit),
+ARM64EC and MSVC Rust targets remain unsupported.
 Debug stripping retains runtime unwind metadata.
 
 #### Windows DLLs

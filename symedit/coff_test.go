@@ -413,20 +413,20 @@ func TestCOFFRejects(t *testing.T) {
 	}
 }
 
-type coffLayout struct {
+type coffSectionView struct {
 	sections []string
 	symbols  []string // NAME:SECTION:VALUE:TYPE, with ABS and UNDEF for others
 	assoc    string   // the section .pdata$c is associated with
 }
 
-func readCOFFLayout(t *testing.T, data []byte) coffLayout {
+func readCOFFLayout(t *testing.T, data []byte) coffSectionView {
 	t.Helper()
 	readCOFF(t, data)
 	f, err := pe.NewFile(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var l coffLayout
+	var l coffSectionView
 	for _, s := range f.Sections {
 		l.sections = append(l.sections, s.Name)
 	}

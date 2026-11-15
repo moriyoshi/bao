@@ -182,3 +182,19 @@ func TestCOFFPrimaryImportRecordsKeepMachineChecks(t *testing.T) {
 		t.Fatal("cross-architecture import declaration was hidden")
 	}
 }
+
+// A bigobj member is reported by name rather than failing deep in debug/pe.
+func TestBigObjMemberRejected(t *testing.T) {
+	big := make([]byte, 56)
+	binary.LittleEndian.PutUint16(big[2:], 0xffff)
+	binary.LittleEndian.PutUint16(big[4:], 2)
+	binary.LittleEndian.PutUint16(big[6:], 0x8664)
+	b := append([]byte("!<arch>\n"), member("big.obj/", big)...)
+	if _, err := ParseCOFFForMachine(b, 0x8664); err == nil || !strings.Contains(err.Error(), "archive member big.obj is a bigobj COFF object") {
+		t.Fatalf("ParseCOFFForMachine = %v", err)
+	}
+	// Short import records (version 0) are not bigobj.
+	if IsBigObj([]byte{0, 0, 0xff, 0xff, 0, 0, 0x64, 0x86}) {
+		t.Fatal("short import record taken for bigobj")
+	}
+}

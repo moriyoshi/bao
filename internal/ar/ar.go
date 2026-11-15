@@ -55,6 +55,9 @@ func ParseCOFFForMachine(b []byte, expected uint16) ([]Member, error) {
 		if m.Kind != archive.Regular {
 			continue
 		}
+		if IsBigObj(m.Data) {
+			return nil, fmt.Errorf("archive member %s is a bigobj COFF object, which bao build does not translate: rebuild it without /bigobj or -Wa,-mbig-obj, with fewer than 65279 sections (bao objcopy can still edit it)", m.Name)
+		}
 		if ecAware && len(m.Data) >= 8 {
 			machine := binary.LittleEndian.Uint16(m.Data)
 			if machine == 0 && binary.LittleEndian.Uint16(m.Data[2:]) == 0xffff {
@@ -125,4 +128,11 @@ func shortCOFFImport(data []byte, expected uint16) bool {
 	}
 	parts := bytes.SplitN(data[20:20+size], []byte{0}, 3)
 	return len(parts) == 3 && len(parts[0]) > 0 && len(parts[1]) > 0
+}
+
+// IsBigObj reports a bigobj COFF object (ANON_OBJECT_HEADER_BIGOBJ): Sig1
+// 0, Sig2 0xffff and a version of 2 or more, which short import records,
+// version 0, never have.
+func IsBigObj(b []byte) bool {
+	return len(b) >= 8 && binary.LittleEndian.Uint16(b) == 0 && binary.LittleEndian.Uint16(b[2:]) == 0xffff && binary.LittleEndian.Uint16(b[4:]) >= 2
 }
