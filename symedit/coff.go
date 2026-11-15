@@ -391,10 +391,33 @@ func (f *coffFile) addSymbols(symbols *[]coffSymbol, adds []AddedSymbol) ([]stri
 	}
 	var added []string
 	for _, a := range adds {
-		if a.Value > 0xffffffff {
+		value := a.Value
+		section := int16(coffSymAbsolute)
+		if a.Symbol != "" {
+			var globals, locals []int
+			for i, t := range f.symbols {
+				if t.cname() == a.Symbol && (t.section > 0 || t.section == coffSymAbsolute) {
+					if t.external() {
+						globals = append(globals, i)
+					} else {
+						locals = append(locals, i)
+					}
+				}
+			}
+			at, err := pickTarget(a.Name, a.Symbol, globals, locals)
+			if err != nil {
+				return nil, err
+			}
+			t := f.symbols[at]
+			if f.removed(int(t.section)) {
+				return nil, fmt.Errorf("cannot add symbol %s at %s, whose section is removed", a.Name, a.Symbol)
+			}
+			section, value = t.section, uint64(t.value)+a.Value
+		}
+		if value > 0xffffffff {
 			return nil, fmt.Errorf("cannot add symbol %s: COFF symbol values have 32 bits", a.Name)
 		}
-		s := coffSymbol{index: -1, name: a.Name, class: coffClassExternal, section: coffSymAbsolute, value: uint32(a.Value)}
+		s := coffSymbol{index: -1, name: a.Name, class: coffClassExternal, section: section, value: uint32(value)}
 		if a.Section != "" {
 			k := 0
 			for j, sec := range f.sections {

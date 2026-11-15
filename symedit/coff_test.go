@@ -639,3 +639,33 @@ func TestCOFFImportMembers(t *testing.T) {
 		t.Fatalf("lone import: %d, %v", n, err)
 	}
 }
+
+func TestCOFFAddSymbolAtSymbol(t *testing.T) {
+	in := coffFixture("")
+	// comdat_key is in .text$c; the target's section is used even where a
+	// section name would be ambiguous.
+	out, _, err := Edit(in, Edits{AddSymbols: addSymbols(t, "key_alias=@comdat_key:2,function", "helper_alias=@helper:1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := readCOFFLayout(t, out)
+	have := map[string]bool{}
+	for _, s := range l.symbols {
+		have[s] = true
+	}
+	if !have["key_alias:.text$c:2:32"] || !have["helper_alias:.text:1:0"] {
+		t.Fatalf("symbols = %q", l.symbols)
+	}
+	for spec, want := range map[string]string{
+		"x=@malloc:0":    "does not define",
+		"x=@tentative:0": "does not define",
+	} {
+		if _, _, err := Edit(in, Edits{AddSymbols: addSymbols(t, spec)}); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", spec, err)
+		}
+	}
+	e := Edits{AddSymbols: addSymbols(t, "x=@comdat_key:0"), RemoveSection: matcher(t, false, ".text$c")}
+	if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), "whose section is removed") {
+		t.Errorf("removed target: %v", err)
+	}
+}

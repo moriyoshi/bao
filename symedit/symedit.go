@@ -46,13 +46,18 @@ type Edits struct {
 }
 
 // AddedSymbol is one llvm-objcopy --add-symbol: NAME=[SECTION:]VALUE[,FLAGS].
-// Without a section, the symbol is absolute.
+// Without a section, the symbol is absolute. Bao also accepts @SYMBOL in
+// place of SECTION: the symbol is then VALUE bytes past that definition, in
+// its section.
 type AddedSymbol struct {
 	Name, Section string
-	Value         uint64
-	Bind          elf.SymBind
-	Type          elf.SymType
-	Visibility    elf.SymVis
+	// Symbol names the definition a symbol-relative addition follows, by
+	// input name.
+	Symbol     string
+	Value      uint64
+	Bind       elf.SymBind
+	Type       elf.SymType
+	Visibility elf.SymVis
 }
 
 // ParseAddSymbol reads NAME=[SECTION:]VALUE[,FLAGS], where FLAGS are
@@ -70,6 +75,12 @@ func ParseAddSymbol(spec string) (AddedSymbol, error) {
 		a.Section, rest = rest[:i], rest[i+1:]
 		if a.Section == "" {
 			return a, fmt.Errorf("--add-symbol %q: empty section name", spec)
+		}
+		if target, ok := strings.CutPrefix(a.Section, "@"); ok {
+			if target == "" {
+				return a, fmt.Errorf("--add-symbol %q: empty symbol name after @", spec)
+			}
+			a.Section, a.Symbol = "", target
 		}
 	}
 	fields := strings.Split(rest, ",")
@@ -224,6 +235,20 @@ func (e Edits) empty() bool {
 
 func (e Edits) editsSections() bool {
 	return !e.RemoveSection.empty() || !e.OnlySection.empty() || len(e.AddSymbols) > 0
+}
+
+// pickTarget chooses the definition a symbol-relative -add-symbol follows:
+// the only global one of the name, or else the only local one.
+func pickTarget(added, target string, globals, locals []int) (int, error) {
+	switch {
+	case len(globals) == 1:
+		return globals[0], nil
+	case len(globals) == 0 && len(locals) == 1:
+		return locals[0], nil
+	case len(globals)+len(locals) > 1:
+		return -1, fmt.Errorf("cannot add symbol %s at %s, which names %d definitions", added, target, len(globals)+len(locals))
+	}
+	return -1, fmt.Errorf("cannot add symbol %s at %s, which the object does not define", added, target)
 }
 
 // ParseNames reads llvm-objcopy symbol list files, such as for

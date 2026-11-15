@@ -50,13 +50,13 @@ func (h *harness) darwinSymbolEdits(arch, sdk string) {
 	got, err = h.command("symedit-negative-producer.log", h.root, nil, append(append([]string{h.bao}, build...), "-o", filepath.Join(h.dst, "symedit-negative"), core)...)
 	check(err != nil && strings.Contains(string(got), "duplicate symbol"), "building without prefixes did not fail on duplicate symbols: %v\n%s", err, got)
 	h.darwinSectionEdits(dir, compile("section", "symedit_section.c", "-g"), sdk)
-	h.results["darwin_symbol_edits"] = map[string]any{"status": "PASS", "checks": "lld-style wrap including a call inside the defining object and __real_ bound to it, wrapped libSystem strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard on a partially linked primary archive; negative control without prefixes fails on duplicate symbols; section edits: __DWARF sections removed and an -add-symbol alias at the start of a function's section called natively, with removal of that code section refused"}
+	h.results["darwin_symbol_edits"] = map[string]any{"status": "PASS", "checks": "lld-style wrap including a call inside the defining object and __real_ bound to it, wrapped libSystem strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard on a partially linked primary archive; negative control without prefixes fails on duplicate symbols; section edits: __DWARF sections removed and -add-symbol aliases at the start of a function's section (objcopy) and at the function itself (build) called natively, with removal of that code section refused"}
 }
 
 // darwinSectionEdits removes the debug sections of testdata/symedit_section.c
-// and adds an alias at the start of its function's section, first with bao
-// objcopy, whose result it inspects, then in a bao build whose consumer calls
-// both names. The negative control removes the function's section, which the
+// and adds an alias of its function, first with bao objcopy at the start of
+// the function's section, whose result it inspects, then in a bao build at
+// the function itself (@bao_symedit_section), whose consumer calls both names. The negative control removes the function's section, which the
 // object's unwind and debug data describe.
 func (h *harness) darwinSectionEdits(dir, object, sdk string) {
 	f, err := macho.Open(object)
@@ -98,7 +98,7 @@ func (h *harness) darwinSectionEdits(dir, object, sdk string) {
 	app := filepath.Join(h.dst, "symedit-section-app")
 	require(os.Mkdir(app, 0o755))
 	build := []string{h.bao, "build", "-target", h.target, "-sdk", sdk, "-symbol", "bao_symedit_section", "-symbol", "bao_symedit_alias", "-wildcard"}
-	h.run("symedit-section-producer.log", h.root, nil, append(build, "-remove-section", lib+"=__DWARF,*", "-add-symbol", lib+"="+add, "-o", filepath.Join(app, "native"), lib)...)
+	h.run("symedit-section-producer.log", h.root, nil, append(build, "-remove-section", lib+"=__DWARF,*", "-add-symbol", lib+"=bao_symedit_alias=@bao_symedit_section:0,function", "-o", filepath.Join(app, "native"), lib)...)
 	h.module(app, "bao-symedit-section-check", "")
 	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(sectionEditsConsumer), 0o644))
 	exe := filepath.Join(h.dst, "symedit-section-check")
@@ -228,7 +228,7 @@ func (h *harness) windowsSymbolEdits(arch string) {
 	out, err = h.command("symedit-negative-producer.log", h.root, nil, append(build, "-o", filepath.Join(h.dst, "symedit-negative"), core)...)
 	check(err != nil && strings.Contains(string(out), "duplicate"), "building without prefixes did not fail on duplicate definitions: %v\n%s", err, out)
 	h.windowsSectionEdits(dir, compile("section", "symedit_section.c"), arch)
-	h.results["windows_symbol_edits"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "checks": "lld-style wrap including a call inside the defining object (except with MinGW GCC, whose assembler calls same-object functions through their section) and __real_ bound to it, wrapped UCRT strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard per member; negative control without prefixes fails on duplicate definitions; section edits: debug sections removed and an -add-symbol alias at the start of a function's section called natively, with removal of that code section refused"}
+	h.results["windows_symbol_edits"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "checks": "lld-style wrap including a call inside the defining object (except with MinGW GCC, whose assembler calls same-object functions through their section) and __real_ bound to it, wrapped UCRT strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard per member; negative control without prefixes fails on duplicate definitions; section edits: debug sections removed and -add-symbol aliases at the start of a function's section (objcopy) and at the function itself (build) called natively, with removal of that code section refused"}
 }
 
 // windowsSectionEdits is darwinSectionEdits for COFF: CodeView or DWARF
@@ -271,7 +271,7 @@ func (h *harness) windowsSectionEdits(dir, object, arch string) {
 	build := []string{h.bao, "build", "-target", h.target, "-bindings", signatures, "-wildcard"}
 	app := filepath.Join(h.dst, "symedit-section-app")
 	require(os.Mkdir(app, 0o755))
-	h.run("symedit-section-producer.log", h.root, nil, append(build, "-remove-section", lib+"=.debug*", "-add-symbol", lib+"="+add, "-o", filepath.Join(app, "native"), lib)...)
+	h.run("symedit-section-producer.log", h.root, nil, append(build, "-remove-section", lib+"=.debug*", "-add-symbol", lib+"=bao_symedit_alias=@bao_symedit_section:0,function", "-o", filepath.Join(app, "native"), lib)...)
 	require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-windows-symedit-section\ngo 1.26.0\n"), 0o644))
 	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(windowsSectionEditsConsumer), 0o644))
 	exe := filepath.Join(h.dst, "symedit-section.exe")

@@ -6267,3 +6267,51 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
 - `bao-verify -suite cpp -target linux/arm64 -cxx g++`, run natively here with
   Go 1.26.11, passed, including the new `missing_weak` step. That step runs
   only for amd64 and arm64.
+
+## 2026-11-15: Symbol-relative -add-symbol
+
+Problem. `-add-symbol NAME=SECTION:VALUE` needs a section name and an
+offset.
+- A COFF section name is often ambiguous. clang-cl and `/Gy` give every
+  function its own COMDAT `.text` or `.text$mn`, and the COFF implementation
+  refuses an ambiguous name.
+- On Darwin, `ld -r` merges a combined-first primary archive into one
+  `__TEXT,__text`, so an offset there depends on member order.
+- Both were recorded as limitations in the 2026-11-15 Mach-O and COFF entry.
+
+Decision and change. `SECTION` may be `@SYMBOL`, a Bao extension:
+`alias=@target:0,function` adds `alias` 0 bytes past `target`.
+- The target is the input C name of a definition: the only global one, or
+  else the only local one. More than one is an error, as are a missing,
+  undefined or common target and a target in a removed section.
+- The alias takes the target's section and its value plus the offset. It is
+  absolute when the target is. For Mach-O the value is the target's address.
+- `ParseAddSymbol` records the target in `AddedSymbol.Symbol`, and the ELF
+  parser now reads `st_value`.
+- The darwin and windows CI section edit steps now add the build's alias as
+  `@bao_symedit_section:0`. Their objcopy checks keep the section form.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. The new tests cover:
+  - parsing;
+  - ELF global and local targets, and an ambiguous pair of locals;
+  - Mach-O address arithmetic for a local at 144 (alias at 152) and a
+    removed target section;
+  - COFF COMDAT and `.text` targets with their function type;
+  - refused undefined, common and removed targets.
+- `.work/symrel/run.sh` (log `run1.log`):
+  - ELF, native linux/arm64 with gcc 13.3.0 `-ffunction-sections`:
+    `vis_alias=@Py_Api:0` took Py_Api's section and value, and a program
+    calling the alias ran.
+  - COFF, clang 19.1.7 `--driver-mode=cl /Gy` in bao-cpp-cross:20261108:
+    - vis.obj has 9 `.text` sections, so `vis_alias=.text:0` is refused.
+    - `@Py_Api:0` put the alias in Py_Api's section (number 5) at value 0.
+    - The calling program linked with lld-link, link-only: there is no
+      Windows host.
+  - Mach-O, macOS 26.6.2 x86_64 with Apple clang 17.0.0:
+    - objcopy aliases matched Py_Api's address (0x10 on x86_64, 0x8 on
+      arm64). The x86_64 program ran, and the arm64 one was only linked.
+    - `bao build` combined a two-member archive first (other.o, vis.o) and
+      added `@Py_Api:0`.
+    - The darwin/amd64 consumer ran natively and printed `direct: 3 alias: 3
+      same address: true`. The darwin/arm64 consumer was only built.

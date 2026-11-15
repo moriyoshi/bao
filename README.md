@@ -871,6 +871,7 @@ component first, as for the binding flags.
 | `-remove-section SECTION` | Remove the section, its relocations and the symbols defined in it |
 | `-only-section SECTION` | Keep only matching sections, with their relocations; ELF also keeps groups and the symbol, string and section name tables |
 | `-add-symbol NAME=[SECTION:]VALUE[,FLAGS]` | Add a symbol at an offset in a section, or an absolute one without a section |
+| `-add-symbol NAME=@SYMBOL:OFFSET[,FLAGS]` | Add a symbol OFFSET bytes past a definition, in its section (a Bao extension) |
 
 Mach-O sections are named `SEGMENT,SECTION`, such as `__TEXT,__text`, as
 llvm-objcopy names them. `-wildcard` makes section names shell patterns too.
@@ -878,6 +879,12 @@ llvm-objcopy names them. `-wildcard` makes section names shell patterns too.
 `hidden`, `protected`, `object`, `function` and `notype`. Adding a name the
 object already defines is an error. In an archive, a symbol is added to each
 member that has its section, and two members defining it is an error.
+
+`@SYMBOL` names the definition by its input C name: the only global one, or
+else the only local one. More than one is an error. The alias takes the
+target's section, or is absolute when the target is, so no section name is
+needed. That covers COFF objects whose COMDAT sections share a name. It also
+covers a Darwin primary archive that `ld -r` merges into one `__TEXT,__text`.
 
 On ELF, removal renumbers every section index: symbol sections, the extended
 index table, links, relocation targets, group members and the section name
@@ -917,7 +924,8 @@ Format notes:
   symbol types.
 - A COFF `-add-symbol` section name must be unique in the object. Several
   COMDAT sections often share one, such as `.text` with clang-cl (`/Gy-`
-  avoids that) and `.text$mn` with `/Gy`. COFF has no symbol visibility, and
+  avoids that) and `.text$mn` with `/Gy`; name a symbol with `@SYMBOL`
+  instead. COFF has no symbol visibility, and
   its weak externals need a default definition, so `hidden`, `protected` and
   `weak` are refused. `function` sets the function type.
 - On Mach-O and COFF, an undefined symbol of the added name becomes the
@@ -936,6 +944,9 @@ bao build -target linux/arm64 -symbol app_main -symbol app_entry_alias \
 # Drop Mach-O debug data and alias the function at the start of __text.
 bao objcopy -wildcard -remove-section '__DWARF,*' \
   -add-symbol 'app_alias=__TEXT,__text:0,function' app.o app-nodebug.o
+
+# Alias a function wherever it is, in any format.
+bao objcopy -add-symbol 'app_entry_alias=@app_main:0,function' app.obj app-alias.obj
 ```
 
 ### Function bindings and native debug stripping
