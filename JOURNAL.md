@@ -6227,3 +6227,43 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
 - `bao-verify -suite cpp -target linux/arm64 -cxx g++`, run natively here in
   bao-cpp-cross:20261108 with Go 1.26.11, passed, including the new
   `common_symbols` step on `testdata/linux_common.c`.
+
+## 2026-11-15: amd64 missing-weak GOT comparisons
+
+Problem. pythago reported "unsupported AMD64 missing-weak reference
+R_X86_64_GOTPCREL with addend -5".
+- GCC compiles `if (ZSTD_trace_compress_begin)` for an undefined weak hook
+  to `cmpq $0, sym@GOTPCREL(%rip)`. Its imm8 follows the displacement, so the
+  relocation's RIP bias is -5.
+- libzstd's optional trace hooks and CPython's weak `sem_clockwait` produce
+  it.
+- The translator retargets a missing weak GOT load to a zeroed cell, and
+  accepted only the -4 bias. The error also did not name the symbol.
+
+Change (`linuxelf/amd64.go`).
+- A GOTPCREL, GOTPCRELX or REX_GOTPCRELX reference to a missing weak symbol
+  with an addend from -4 to -8 becomes a PC32 reference to the zero cell with
+  the same addend. The range covers immediates of 0, 1, 2 or 4 bytes after
+  the displacement.
+- The instruction is kept, so a MOV, CMP or indirect CALL reads NULL.
+- Other addends are still refused, now naming the symbol, section and offset.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestAMD64StrongImportOverridesOtherImageWeak` now also checks a
+    `cmpq $0` with addends -5 and -8 retargeted to `.bao.weak_zero` with the
+    bias kept.
+  - The refused addends 0, 1 and -3 stay refused, and the error text was
+    checked.
+- `.work/symweak/run.sh` (log `run2.log`) used `testdata/linux_missing_weak.c`.
+  - x86_64-linux-gnu-gcc 14.2.0 -O2 -fPIC emitted `R_X86_64_GOTPCREL
+    ZSTD_trace_compress_begin - 5` on a `cmpq $0`. The `&bao_optional_data`
+    load emitted `REX_GOTPCRELX - 4`.
+  - linux/amd64, run under emulated qemu-x86_64 in bao-cpp-cross:20261108:
+    the consumer printed `weak: 21`. `main` refuses that build with the
+    reported error.
+  - Native linux/arm64 printed `weak: 21` with both this branch and `main`,
+    since arm64 already handled these forms.
+- `bao-verify -suite cpp -target linux/arm64 -cxx g++`, run natively here with
+  Go 1.26.11, passed, including the new `missing_weak` step. That step runs
+  only for amd64 and arm64.

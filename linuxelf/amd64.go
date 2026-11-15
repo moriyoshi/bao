@@ -184,14 +184,18 @@ func (p *Plan) bindAMD64(images []*image, index map[string]string) error {
 					case t == elf.R_X86_64_64 && r.add == 0:
 						binary.LittleEndian.PutUint64(s.data[r.off:], 0)
 						continue
-					case amd64GOT(t) && r.add == -4:
+					// A RIP-relative operand is biased by the bytes after its
+					// displacement: -4, or down to -8 with an immediate, as in
+					// `cmpq $0, sym@GOTPCREL(%rip)` (-5).
+					case amd64GOT(t) && r.add <= -4 && r.add >= -8:
 						if zeroCell == 0 {
 							sec := m.addSection(section{name: ".bao.weak_zero", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_WRITE, align: 8, size: 8, data: make([]byte, 8)})
 							zeroCell = m.addSymbol(fmt.Sprintf("%sweak_zero_%d", p.Namespace, oi), sec, 0, 8)
 							s = &m.sections[si]
 						}
-						// Keep the original MOV/indirect CALL. A plain PC32
-						// reference reads the NULL cell without Go GOT relaxation.
+						// Keep the original MOV, CMP or indirect CALL. A plain
+						// PC32 reference with the same bias reads the NULL
+						// cell without Go GOT relaxation.
 						r.typ, r.sym = elf.R_AARCH64(elf.R_X86_64_PC32), zeroCell
 					case (t == elf.R_X86_64_PLT32 || t == elf.R_X86_64_PC32) && r.add == -4 && r.off > 0 && (s.data[r.off-1] == 0xe8 || s.data[r.off-1] == 0xe9):
 						if zeroCall == 0 {
@@ -202,7 +206,7 @@ func (p *Plan) bindAMD64(images []*image, index map[string]string) error {
 						}
 						r.sym = zeroCall
 					default:
-						return fmt.Errorf("unsupported AMD64 missing-weak reference %s with addend %d", t, r.add)
+						return fmt.Errorf("unsupported AMD64 reference to missing weak symbol %s at %s+%#x: %s with addend %d", sym.name, s.name, r.off, t, r.add)
 					}
 					out = append(out, r)
 					continue

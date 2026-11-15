@@ -149,6 +149,7 @@ func (h *harness) cppLinux() {
 	h.cppLinuxScalars(arch, compiler, compilerFlags, archiveTool, container)
 	h.cppLinuxSymbolVersions(arch, compiler, compilerFlags, archiveTool, container)
 	h.cppLinuxCommons(arch, compiler, compilerFlags, archiveTool, container)
+	h.cppLinuxMissingWeak(arch, compiler, compilerFlags, archiveTool, container)
 }
 
 // cppLinuxSymbolVersions checks that imports bind versioned glibc symbols:
@@ -218,6 +219,29 @@ func (h *harness) cppLinuxCommons(arch, compiler, compilerFlags, archiveTool str
 	out := string(h.run("common-run.log", h.root, nil, h.cppLinuxExec(arch, "common-executable", "1", nil)...))
 	check(strings.Contains(out, "common: 173 246\n"), "common symbols failed: %s", out)
 	h.results["common_symbols"] = map[string]any{"status": "PASS", "checks": "hidden assembler .comm with 16-byte alignment and a -fcommon tentative definition: zero-initialized, aligned, persistent"}
+}
+
+// cppLinuxMissingWeak checks NULL tests of weak symbols that no library
+// defines, in the forms zstd's optional trace hooks use: on amd64 GCC emits
+// `cmpq $0, sym@GOTPCREL(%rip)`, whose -5 bias was refused. Only amd64 and
+// arm64 are checked; the cross-ISA targets keep their own weak profiles.
+func (h *harness) cppLinuxMissingWeak(arch, compiler, compilerFlags, archiveTool string, container func(bool, ...string) []string) {
+	if arch != "amd64" && arch != "arm64" {
+		return
+	}
+	flags := strings.Replace(compilerFlags, "-std=c++20", "-std=gnu11 -x c", 1)
+	h.run("missing-weak-compile.log", h.root, nil, container(false, "set -eu\n"+compiler+" "+flags+" -c /testdata/linux_missing_weak.c -o /work/missing-weak.o\n"+archiveTool+" rcs /work/missing-weak.a /work/missing-weak.o")...)
+	app := filepath.Join(h.dst, "missing-weak")
+	require(os.Mkdir(app, 0755))
+	h.run("missing-weak-producer.log", h.root, nil, container(false, "/work/bao-linux build -target "+h.target+" -sysroot "+cppLinuxSysroot(arch)+" -bindings dwarf -symbol bao_weak -o /work/missing-weak/native /work/missing-weak.a")...)
+	require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-missing-weak\ngo 1.26.0\n"), 0644))
+	main := "package main\n\nimport (\n\t\"fmt\"\n\n\t\"bao-missing-weak/native\"\n)\n\nfunc main() { fmt.Println(\"weak:\", native.BaoWeak()) }\n"
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(main), 0644))
+	cross := h.consumerEnv(map[string]string{"GOOS": "linux", "GOARCH": arch})
+	h.run("missing-weak-build.log", app, cross, h.goTool, "build", "-o", filepath.Join(h.dst, "missing-weak-executable"), ".")
+	out := string(h.run("missing-weak-run.log", h.root, nil, h.cppLinuxExec(arch, "missing-weak-executable", "1", nil)...))
+	check(strings.Contains(out, "weak: 21\n"), "missing weak references failed: %s", out)
+	h.results["missing_weak"] = map[string]any{"status": "PASS", "checks": "NULL tests of an undefined weak function and data address, including the amd64 GCC cmpq $0, sym@GOTPCREL(%rip) form"}
 }
 
 func (h *harness) cppLinuxExec(arch, executable, procs string, extra map[string]string, args ...string) []string {
