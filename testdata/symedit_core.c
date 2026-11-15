@@ -5,9 +5,16 @@
 #include <stddef.h>
 /* Declared here so that freestanding Windows compiles need no C library headers. */
 size_t strlen(const char *);
-int target(int x) { return x + 1; }
-int calls_target(int x) { return target(x) * 10; }
-size_t measure(const char *s) { return strlen(s); }
+/* GCC targeting PE treats these as unpreemptible and would propagate their
+   results across functions, leaving no call to wrap. */
+#if defined(__GNUC__) && !defined(__clang__)
+#define NOIPA __attribute__((noipa))
+#else
+#define NOIPA
+#endif
+NOIPA int target(int x) { return x + 1; }
+NOIPA int calls_target(int x) { return target(x) * 10; }
+NOIPA size_t measure(const char *s) { return strlen(s); }
 long a_entry(void);
 long b_entry(void);
 long bao_symedit_wrapped(void) { return target(1) * 1000000L + calls_target(1) * 1000L + (long)measure("abc"); }

@@ -5788,3 +5788,13 @@ so nothing ran locally. Bazel was not run.
   fixtures now need only `<stddef.h>` and read their vendored string
   through a volatile pointer, so no compiler folds the wrapped call. CI's
   native Windows runs are the only execution evidence for COFF.
+
+CI on 0b65679 (#14). `windows_symbol_edits` reported PASS on native Windows
+under the llvm-mingw clang, clang-cl and MSVC drivers on both windows-arm64
+and windows-amd64. The MinGW GCC leg (amd64 only) failed with `wrapped:
+2021003`, the value without in-object wrapping. GCC targeting PE treats
+`target` as unpreemptible and propagated `target(1)` into its callers despite
+`-fno-inline`, so no call was left to redirect; lld-link would give the same
+result for those objects. The fixture now marks its wrapped functions
+`__attribute__((noipa))` for GCC only; MSVC rejects the syntax, and clang
+keeps the calls.
