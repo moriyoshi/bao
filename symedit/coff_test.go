@@ -23,6 +23,9 @@ type testCOFFSymbol struct {
 	text, debug, pdata bool
 	// tag names a weak external's default symbol.
 	tag string
+	// funcAux adds a zeroed function definition auxiliary record, as GNU
+	// as writes for functions.
+	funcAux bool
 	// addrsig lists the symbol in .llvm_addrsig.
 	addrsig bool
 }
@@ -60,7 +63,7 @@ func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 	for _, s := range symbols {
 		index[s.name] = next
 		next++
-		if s.tag != "" {
+		if s.tag != "" || s.funcAux {
 			next++
 		}
 	}
@@ -90,10 +93,13 @@ func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 		le.PutUint32(e[8:], s.value)
 		le.PutUint16(e[12:], uint16(s.section))
 		e[16] = s.class
-		if s.tag != "" {
+		if s.tag != "" || s.funcAux {
 			e[17] = 1
 		}
 		record(e)
+		if s.funcAux {
+			record(make([]byte, coffSymbolSize))
+		}
 		if s.tag != "" {
 			aux := make([]byte, coffSymbolSize)
 			le.PutUint32(aux, uint32(index[s.tag]))
@@ -286,9 +292,6 @@ func TestCOFFVisibility(t *testing.T) {
 			t.Errorf("strip %s: %v", name, err)
 		}
 	}
-	if _, _, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "PyList_New")}}); err == nil || !strings.Contains(err.Error(), "weakening is unsupported") {
-		t.Errorf("weaken: %v", err)
-	}
 	// COFF has no hidden visibility.
 	if _, n, err := Edit(in, Edits{Visibility: Visibility{LocalizeHidden: true}}); err != nil || n != 0 {
 		t.Errorf("localize-hidden = %d, %v", n, err)
@@ -378,7 +381,9 @@ func TestCOFFArchive(t *testing.T) {
 	for i, s := range strs {
 		got[s] = binary.LittleEndian.Uint16(second[16+2*i:])
 	}
-	want := map[string]uint16{"p_PyList_New": 1, "p_XML_Parse": 1, "p_after_weak": 1, "p_comdat_key": 1, "p_tentative": 1, ".weak.opt.default": 1}
+	// The weak alias opt, whose default is defined, is indexed as llvm-lib
+	// indexes it.
+	want := map[string]uint16{"p_PyList_New": 1, "p_XML_Parse": 1, "p_after_weak": 1, "p_comdat_key": 1, "p_tentative": 1, ".weak.opt.default": 1, "opt": 1}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("index = %v, want %v", got, want)
 	}
@@ -667,5 +672,129 @@ func TestCOFFAddSymbolAtSymbol(t *testing.T) {
 	e := Edits{AddSymbols: addSymbols(t, "x=@comdat_key:0"), RemoveSection: matcher(t, false, ".text$c")}
 	if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), "whose section is removed") {
 		t.Errorf("removed target: %v", err)
+	}
+}
+
+func TestCOFFWeaken(t *testing.T) {
+	in := coffFixture("")
+	out, n, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "PyList_New", "absent", "comdat_key")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two weakened symbols; the COMDAT key, selection ANY, is already
+	// link-once.
+	if n != 2 {
+		t.Fatalf("edited %d, want 2", n)
+	}
+	v := readCOFF(t, out)
+	// The first strong external definition names the defaults.
+	def, ref := ".weak.PyList_New.default.comdat_key", ".weak.absent.default.comdat_key"
+	if v.tags["PyList_New"] != def || v.tags["absent"] != ref || v.tags["opt"] != ".weak.opt.default" {
+		t.Fatalf("tags = %v", v.tags)
+	}
+	l := readCOFFLayout(t, out)
+	have := map[string]bool{}
+	for _, s := range l.symbols {
+		have[s] = true
+	}
+	// The definition keeps its section, value and function type; the weak
+	// reference's default is absolute zero.
+	if !have[def+":.text:0:0"] || !have[ref+":ABS:0:0"] || !have["comdat_key:.text$c:0:0"] {
+		t.Fatalf("layout = %q", l.symbols)
+	}
+	// Code refers to the weak external, so a strong definition elsewhere
+	// wins for this object too; unwind and debug data and the
+	// address-significance table keep describing this definition.
+	if got := v.relocs[".text"]; !reflect.DeepEqual(got, []string{"helper", "PyList_New", "XML_Parse", "__real_PyList_New", "malloc", "__imp_free", "__imp_dep", "opt", "after_weak"}) {
+		t.Errorf(".text relocs = %q", got)
+	}
+	if !reflect.DeepEqual(v.relocs[".debug$S"], []string{def}) || !reflect.DeepEqual(v.relocs[".pdata"], []string{def}) {
+		t.Errorf("debug/unwind relocs = %q %q", v.relocs[".debug$S"], v.relocs[".pdata"])
+	}
+	if !reflect.DeepEqual(v.addrsig, []string{def, "XML_Parse", "after_weak"}) {
+		t.Fatalf("addrsig = %q", v.addrsig)
+	}
+	f, err := parseCOFF(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := f.indexNames()
+	sort.Strings(index)
+	// The weakened definition stays indexed under its name; the weak
+	// reference does not.
+	for _, name := range []string{"PyList_New", def} {
+		if i := sort.SearchStrings(index, name); i == len(index) || index[i] != name {
+			t.Errorf("index lacks %s: %q", name, index)
+		}
+	}
+	for _, name := range []string{"absent"} {
+		if i := sort.SearchStrings(index, name); i < len(index) && index[i] == name {
+			t.Errorf("index has the weak reference %s", name)
+		}
+	}
+	if _, _, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "tentative")}}); err == nil || !strings.Contains(err.Error(), "cannot weaken COFF symbol tentative") {
+		t.Errorf("weaken common: %v", err)
+	}
+}
+
+// A /Gy function is the key of a COMDAT section with selection
+// NODUPLICATES. Weakening renames the key in place, as clang names a weak
+// function's section, so it stays the section's first symbol.
+func TestCOFFWeakenNoDuplicatesKey(t *testing.T) {
+	in := coffFixture("")
+	symoff := binary.LittleEndian.Uint32(in[8:])
+	in[symoff+uint32(2*coffComdatS-1)*coffSymbolSize+14] = coffSelectNoDuplicates
+	out, n, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "comdat_key")}})
+	if err != nil || n != 1 {
+		t.Fatalf("Edit = %d, %v", n, err)
+	}
+	f, err := parseCOFF(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := ".weak.comdat_key.default.PyList_New"
+	// The key is the first symbol in the section after its definition.
+	key := ""
+	for _, s := range f.symbols {
+		if key == "" && !s.isSection && int(s.section) == coffComdatS {
+			key = s.name
+		}
+	}
+	if key != def {
+		t.Fatalf("COMDAT key = %q, want %q", key, def)
+	}
+	if v := readCOFF(t, out); v.tags["comdat_key"] != def {
+		t.Fatalf("tags = %v", v.tags)
+	}
+}
+
+// MinGW GCC writes a function definition auxiliary record for each function.
+// The definition keeps it when renamed to its default.
+func TestCOFFWeakenFunctionWithAux(t *testing.T) {
+	in := testCOFF([]testCOFFSymbol{
+		{name: "value", section: coffText, class: ext, funcAux: true, text: true},
+		{name: "use_value", section: coffText, class: ext, funcAux: true},
+	}, "")
+	out, n, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "value")}})
+	if err != nil || n != 1 {
+		t.Fatalf("Edit = %d, %v", n, err)
+	}
+	v := readCOFF(t, out)
+	if v.tags["value"] != ".weak.value.default.use_value" || !reflect.DeepEqual(v.relocs[".text"], []string{"value"}) {
+		t.Fatalf("tags %v, relocs %q", v.tags, v.relocs)
+	}
+	f, err := parseCOFF(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range f.symbols {
+		if s.name == ".weak.value.default.use_value" && (s.naux != 1 || s.section != coffText) {
+			t.Fatalf("default = %+v", s)
+		}
+	}
+	// A reference with auxiliary records cannot become the weak external.
+	ref := testCOFF([]testCOFFSymbol{{name: "hook", class: ext, funcAux: true, text: true}}, "")
+	if _, _, err := Edit(ref, Edits{Visibility: Visibility{Weaken: matcher(t, false, "hook")}}); err == nil || !strings.Contains(err.Error(), "undefined symbol with auxiliary records") {
+		t.Errorf("reference with aux: %v", err)
 	}
 }

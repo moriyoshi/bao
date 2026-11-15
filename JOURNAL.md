@@ -6315,3 +6315,116 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
       added `@Py_Api:0`.
     - The darwin/amd64 consumer ran natively and printed `direct: 3 alias: 3
       same address: true`. The darwin/arm64 consumer was only built.
+
+## 2026-11-15: COFF -weaken-symbol
+
+Problem. COFF refused `-weaken-symbol` because a COFF weak external needs a
+default definition (2026-11-15 COFF entry). llvm-objcopy also refuses
+`--weaken-symbol` for COFF ("option is not supported for COFF").
+
+Decision and change (`symedit/coff.go`). Weakening writes clang's own weak
+encoding. clang 19 compiles `__attribute__((weak))` definitions and
+references to a weak external NAME with IMAGE_WEAK_EXTERN_SEARCH_ALIAS (3),
+whose tag is an external `.weak.NAME.default.SUFFIX`. SUFFIX is the first
+strong external definition in the module.
+- Definitions:
+  - The record is renamed to its default in place. clang does the same with
+    `-ffunction-sections`, where the default is the NODUPLICATES COMDAT key
+    of the function's section, so the key stays first in its section.
+  - A new weak external is appended.
+  - Relocations in runtime sections are retargeted to the weak external, so
+    a strong definition elsewhere wins for the object's own calls. Unwind and
+    debug data keep naming the default, as for a wrap.
+- References: the record becomes the weak external, with a new absolute zero
+  default.
+- COMDAT keys whose selection merges copies (not NODUPLICATES) are left
+  alone. Common symbols, and symbols with auxiliary records, are refused.
+- SUFFIX is the object's first strong external definition, or else a digest
+  of the object.
+- `indexNames` adds weak aliases whose default is in a section, as llvm-lib
+  indexes them, including the existing fixture's `opt`. It omits weak
+  references, so the linker cannot pull such a member instead of the one with
+  the strong definition.
+- `.drectve` handling now treats only symbols made static as no longer
+  exported.
+- `bao-verify` gains `windowsWeaken`:
+  - `testdata/symedit_weak.c` gets its `value` definition and its `hook`
+    reference weakened.
+  - A strong `-link-archive` built from `testdata/symedit_strong.c` must make
+    the consumer print `weak: 20`, and the weak default alone `weak: 10`.
+  - MinGW GCC calls same-object functions through their section, so it
+    expects 10 both times, as for its wrap.
+  - Without weakening, the two definitions must collide.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. clang 19.1.7 in
+bao-cpp-cross:20261108 and lld-link (rust-lld, LLD 22.1.8). These were
+link-only checks: there is no Windows host. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestCOFFWeaken` checks the tags, defaults, relocation targets (code to
+    the weak external; debug, unwind and addrsig to the default), the index
+    entries and the refusal for a common symbol.
+  - `TestCOFFWeakenNoDuplicatesKey` checks an in-place COMDAT key.
+  - The CLI usage test now expects COFF weakening to succeed.
+- `.work/symweaken/run.sh` (log `run3.log`). The targets were x86_64 and
+  aarch64 windows-msvc and x86_64 windows-gnu, with `-ffunction-sections`.
+  - Weakening `value` in v.c and `hook` in h.c gives the same records and
+    relocations as clang's `-DWEAK` objects, apart from order and the
+    default suffix.
+  - lld-link map files show the resolution:
+    - With a strong b.obj, `value` comes from b.obj.
+    - Alone, the weakened default serves `value`, and `hook` is absolute 0.
+    - A member weakened inside an archive bao wrote is pulled by name.
+  - Controls: unweakened v.obj and b.obj collide, and an unweakened hook
+    reference is unresolved.
+  - Fixture note: without a volatile read, clang folded `value()` into
+    `use_value` for the non-weak build. lld-link then dropped `value`, so the
+    first run's map had no entry for it.
+- `bao build -target windows/amd64` accepted clang gnu-mode objects weakened
+  with and without a strong `-link-archive`. A follow-up local run for
+  msvc-mode objects was not done: a safety check refused the command because
+  of docker's `--rm` flag. Native results for all four drivers come from the
+  new CI step.
+
+## 2026-11-15: COFF weakening CI fixture pulls the strong member
+
+Problem. In Actions run 43705103085, `windowsWeaken` failed on windows-amd64
+and windows-arm64. The build with the strong `-link-archive` printed
+`weak: 10`, not the expected 20.
+- An archive is searched only for unresolved names. Once weakened, the weak
+  default resolves `value`, so bao's COFF member selection never pulled
+  libstrong.a's member.
+- The same holds for archives on ELF.
+- The earlier lld-link check in `.work/symweaken` passed b.obj as an object,
+  which is always linked, so it did not show this.
+- The negative control had the same gap: without the member nothing could
+  collide.
+
+Change. `testdata/symedit_strong.c` also defines `bao_symedit_strong`. The
+strong build and the negative control export it, which pulls the member in.
+
+Verification. `bao build -target windows/amd64` was run locally on clang
+19.1.7 gnu- and msvc-mode objects (`.work/symweaken/pull`).
+- The strong build translated both objects ("2 Windows amd64 COFF objects").
+- Without `-weaken-symbol value`, the control fails with "duplicate
+  NODUPLICATES COMDAT external:value".
+- Nothing ran here. Native results come from CI.
+
+## 2026-11-15: Weakening COFF definitions with auxiliary records
+
+Problem. With the strong member pulled in (previous entry), Actions run
+43706011567 passed `windowsWeaken` natively on windows-amd64 for clang,
+clang-cl and msvc: strong `weak: 20`, alone `weak: 10`. MinGW GCC then
+failed in symedit with "cannot weaken COFF symbol value, which is common or
+has auxiliary records". GNU as writes a function definition auxiliary record
+for each function.
+
+Change. Only a weakened reference needs a record without auxiliaries, since
+its record becomes the weak external. A weakened definition is renamed in
+place, and its auxiliary records stay with it. The refusal now covers common
+symbols and undefined symbols with auxiliary records.
+
+Verification. `TestCOFFWeakenFunctionWithAux` weakens a function that has a
+function definition auxiliary record. The default keeps the record and its
+section, code relocations name the weak external, and an undefined symbol
+with an auxiliary record is still refused. Native MinGW GCC results come
+from CI.

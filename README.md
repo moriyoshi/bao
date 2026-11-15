@@ -811,8 +811,25 @@ Removing symbols renumbers relocations, weak-external tags and
 `.llvm_addrsig`. Rules specific to COFF:
 
 - COFF has no hidden visibility, so `-localize-hidden` matches nothing.
-- `-weaken-symbol` is rejected, because a COFF weak external needs a default
-  definition.
+- `-weaken-symbol` writes clang's weak encoding. Each symbol becomes a weak
+  external with `IMAGE_WEAK_EXTERN_SEARCH_ALIAS` and a default named
+  `.weak.NAME.default.SUFFIX`. SUFFIX is the object's first strong external
+  definition, as in LLVM.
+  - A weakened definition is renamed to its default in place, so a `/Gy`
+    COMDAT key stays its section's key.
+  - Code refers to the weak external, so a strong definition elsewhere wins
+    for the object's own calls too. Unwind and debug data keep naming the
+    default.
+  - A weakened reference gets an absolute zero default.
+  - The archive index lists a weakened definition under its name, but not a
+    weakened reference. Indexing that would let the linker pull its member
+    instead of the one with the strong definition.
+  - A COMDAT key whose selection already merges copies is left as it is.
+    Weakening a common symbol is refused.
+  - As with `-wrap`, a call that the assembler resolved inside one section
+    has no relocation and keeps the default. Compile with
+    `-ffunction-sections` or `/Gy`. MinGW GCC calls same-object functions
+    through their section even then.
 - A COMDAT section's key symbol is never stripped, even by `-strip-unneeded`.
   Neither are section definitions or `@feat.00`.
 - A wrap does not redirect debug sections, `.pdata` or `.xdata`.

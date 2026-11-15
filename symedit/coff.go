@@ -2,6 +2,7 @@ package symedit
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
@@ -24,9 +25,13 @@ const (
 	coffClassStatic       = 3
 	coffClassWeakExternal = 105
 
-	coffSymAbsolute       = -1
-	coffTypeFunction      = 0x20
-	coffSelectAssociative = 5
+	coffSymAbsolute        = -1
+	coffSelectNoDuplicates = 1
+	coffTypeFunction       = 0x20
+	coffSelectAssociative  = 5
+	// IMAGE_WEAK_EXTERN_SEARCH_ALIAS: the weak external is its default's
+	// alias, the encoding clang uses for weak definitions and references.
+	coffWeakSearchAlias = 3
 
 	coffNrelocOvfl  = 0x01000000
 	coffComdat      = 0x00001000
@@ -54,9 +59,15 @@ type coffSymbol struct {
 	class     byte
 	naux      int
 	isSection bool // the section-definition symbol of its section
+	// aux replaces the auxiliary records of a rewritten symbol. A weak
+	// external's tag may be 1<<31 plus the position of a symbol to number.
+	aux []byte
 }
 
-func (s coffSymbol) external() bool  { return s.class == coffClassExternal }
+func (s coffSymbol) external() bool { return s.class == coffClassExternal }
+func (s coffSymbol) weakAlias(f *coffFile) bool {
+	return s.class == coffClassWeakExternal && s.naux > 0 && s.index >= 0 && le.Uint32(f.aux(s)[4:]) == coffWeakSearchAlias
+}
 func (s coffSymbol) undefined() bool { return s.external() && s.section == 0 && s.value == 0 }
 func (s coffSymbol) common() bool    { return s.external() && s.section == 0 && s.value != 0 }
 
@@ -231,11 +242,25 @@ func (f *coffFile) undefined() []string {
 
 // indexNames lists external definitions, including common symbols, as
 // archivers do for COFF.
+//
+// A weak alias whose default is defined in a section is indexed too, as
+// llvm-lib does. One whose default is absolute, a weak reference, is not:
+// it would let the linker pull its member instead of the member holding a
+// strong definition.
 func (f *coffFile) indexNames() []string {
 	var out []string
+	byRecord := map[uint32]coffSymbol{}
+	for _, s := range f.symbols {
+		byRecord[uint32(s.index)] = s
+	}
 	for _, s := range f.symbols {
 		if s.external() && s.section != 0 || s.common() {
 			out = append(out, s.name)
+		}
+		if s.weakAlias(f) {
+			if d, ok := byRecord[le.Uint32(f.aux(s))]; ok && d.section > 0 {
+				out = append(out, s.name)
+			}
 		}
 	}
 	return out
@@ -480,6 +505,58 @@ func (f *coffFile) compactSections(out []byte) {
 	le.PutUint16(out[2:], uint16(len(table)/coffSectionHeader))
 }
 
+// weaken turns each weakened symbol into a weak external, as clang encodes
+// weak definitions and references, with IMAGE_WEAK_EXTERN_SEARCH_ALIAS and a
+// default named .weak.NAME.default.SUFFIX. A definition is renamed to its
+// default in place, so a COMDAT key stays its section's key, and a new weak
+// external NAME follows the table; it returns those, by the definition's
+// position. A weak reference becomes the weak external in place, with an
+// absolute zero default. SUFFIX, as in LLVM, is the object's first strong
+// external definition, which keeps the defaults of different objects apart;
+// without one it is a digest of the object.
+func weaken(data []byte, symbols []coffSymbol, classes []byte, weakened []int) ([]coffSymbol, []byte, map[int]int) {
+	if len(weakened) == 0 {
+		return symbols, classes, nil
+	}
+	skip := map[int]bool{}
+	for _, i := range weakened {
+		skip[i] = true
+	}
+	suffix := ""
+	for i, s := range symbols {
+		if !skip[i] && classes[i] == coffClassExternal && s.section > 0 && s.cname() != "" {
+			suffix = s.name
+			break
+		}
+	}
+	if suffix == "" {
+		suffix = fmt.Sprintf("bao.%x", sha256.Sum256(data))[:20]
+	}
+	alias := func(tag int) []byte {
+		aux := make([]byte, coffSymbolSize)
+		le.PutUint32(aux, 1<<31|uint32(tag))
+		le.PutUint32(aux[4:], coffWeakSearchAlias)
+		return aux
+	}
+	aliases := map[int]int{}
+	for _, i := range weakened {
+		s := symbols[i]
+		def := ".weak." + s.name + ".default." + suffix
+		weak := coffSymbol{index: -1, name: s.name, class: coffClassWeakExternal, naux: 1}
+		if s.section != 0 {
+			symbols[i].name = def
+			weak.aux = alias(i)
+			aliases[i] = len(symbols)
+			symbols, classes = append(symbols, weak), append(classes, coffClassWeakExternal)
+			continue
+		}
+		symbols, classes = append(symbols, coffSymbol{index: -1, name: def, class: coffClassExternal, section: coffSymAbsolute}), append(classes, coffClassExternal)
+		weak.aux = alias(len(symbols) - 1)
+		symbols[i], classes[i] = weak, coffClassWeakExternal
+	}
+	return symbols, classes, aliases
+}
+
 // editCOFF applies the edits to an amd64 or arm64 COFF object. Local and
 // global symbols need no order in COFF, so binding changes edit the storage
 // class in place; removals rebuild the table and renumber references.
@@ -508,9 +585,6 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 			return objectResult{}, errors.New("section edits need a COFF symbol table")
 		}
 		return objectResult{data: data}, nil
-	}
-	if !e.Weaken.empty() {
-		return objectResult{}, errors.New("weakening is unsupported for COFF, whose weak externals need a default definition")
 	}
 	droppedCount, err := f.sectionNumbers(e)
 	if err != nil {
@@ -643,11 +717,13 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	}
 	// A COMDAT section's key is the first symbol after its section
 	// definition; a weak external's default is named by its tag.
+	// linkOnce marks COMDAT keys whose selection already merges copies.
+	linkOnce := make([]bool, n)
 	for i, s := range f.symbols {
 		if s.isSection && s.section > 0 && !f.removed(int(s.section)) && f.sections[s.section-1].flags&coffComdat != 0 {
 			for j := i + 1; j < n; j++ {
 				if f.symbols[j].section == s.section && !f.symbols[j].isSection {
-					referenced[j] = true
+					referenced[j], linkOnce[j] = true, f.aux(s)[14] != coffSelectNoDuplicates
 					break
 				}
 			}
@@ -661,6 +737,7 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	}
 	rebound, removedCount := 0, 0
 	var hidden []string
+	var weakened []int
 	classes := make([]byte, len(symbols))
 	for i := range symbols {
 		classes[i] = symbols[i].class
@@ -690,9 +767,24 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 		case e.StripUnneeded && !referenced[i] && name != "" && !s.common() && (local || s.undefined()):
 			removed[i] = true
 		}
-		if removed[i] {
+		switch {
+		case removed[i]:
 			removedCount++
-		} else if bind != elf.ST_BIND(v.info) {
+		case bind == elf.STB_WEAK && elf.ST_BIND(v.info) != elf.STB_WEAK:
+			// A COMDAT key whose selection merges copies is already
+			// link-once.
+			if linkOnce[i] {
+				break
+			}
+			// A definition keeps its record, auxiliary ones included, such
+			// as the function definition record GNU as writes; a reference's
+			// record becomes the weak external.
+			if s.common() || s.naux > 0 && s.section == 0 {
+				return objectResult{}, fmt.Errorf("cannot weaken COFF symbol %s, which is common or an undefined symbol with auxiliary records", name)
+			}
+			weakened = append(weakened, i)
+			rebound++
+		case bind != elf.ST_BIND(v.info):
 			classes[i] = coffClassExternal
 			if local {
 				classes[i] = coffClassStatic
@@ -707,10 +799,29 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	if edited == 0 {
 		return objectResult{data: data}, nil
 	}
+	var aliases map[int]int
+	symbols, classes, aliases = weaken(data, symbols, classes, weakened)
+	if len(aliases) > 0 {
+		// Code refers to a weakened definition through its weak external,
+		// so a strong definition elsewhere wins here too. Unwind and debug
+		// data keep describing this definition, as for a wrap.
+		err := f.relocations(out, func(s coffSection, off int) error {
+			sym := le.Uint32(out[off:])
+			if i, ok := byRecord[sym]; ok && sym&(1<<31) == 0 && s.runtimeReference() {
+				if alias, ok := aliases[i]; ok {
+					le.PutUint32(out[off:], uint32(alias)|1<<31)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return objectResult{}, err
+		}
+	}
 	renames, gone := map[string]string{}, map[string]bool{}
 	for i, s := range f.symbols {
 		switch {
-		case removed[i] || s.external() && classes[i] != coffClassExternal:
+		case removed[i] || s.external() && classes[i] == coffClassStatic:
 			gone[s.name] = true
 		case explicit[i] && symbols[i].name != s.name:
 			if _, ok := renames[s.name]; !ok {
@@ -805,7 +916,7 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 				le.PutUint16(entry[coffSymbolSize+12:], uint16(f.numbers[to]))
 			}
 		}
-		if i >= n || s.name != f.symbols[i].name {
+		if s.index < 0 || s.name != f.symbols[i].name {
 			for j := 0; j < 8; j++ {
 				entry[j] = 0
 			}
@@ -825,6 +936,10 @@ func (f *coffFile) rewrite(out *[]byte, symbols []coffSymbol, classes []byte, re
 			}
 		}
 		entry[16] = classes[i]
+		if s.aux != nil {
+			copy(entry[coffSymbolSize:], s.aux)
+			entry[17] = byte(s.naux)
+		}
 		// A section definition records its section's length.
 		if contents, ok := resized[int(s.section)-1]; ok && s.isSection {
 			le.PutUint32(entry[coffSymbolSize:], uint32(len(contents)))
