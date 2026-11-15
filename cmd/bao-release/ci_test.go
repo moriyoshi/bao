@@ -219,7 +219,9 @@ func TestCIDocsOnlyPullRequests(t *testing.T) {
 		}
 		git("add", "-A")
 		git("commit", "-qm", "base")
-		git("switch", "-q", "-c", "head")
+		// Not "head": on a case-insensitive file system, as on macOS,
+		// refs/heads/head would make HEAD ambiguous.
+		git("switch", "-q", "-c", "topic")
 		for path, data := range c.files {
 			if data == "" {
 				git("rm", "-q", path)
@@ -233,7 +235,7 @@ func TestCIDocsOnlyPullRequests(t *testing.T) {
 		write("other", "advance the base")
 		git("add", "-A")
 		git("commit", "-qm", "base moves on")
-		git("merge", "-q", "--no-ff", "-m", "merge", "head")
+		git("merge", "-q", "--no-ff", "-m", "merge", "topic")
 		cmd := exec.Command("bash", script)
 		cmd.Env = append(env, "BAO_CI_ROOT="+repo, "GITHUB_EVENT_NAME="+c.event)
 		b, err := cmd.CombinedOutput()

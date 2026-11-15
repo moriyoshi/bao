@@ -6788,3 +6788,19 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
 - Not yet observed in Actions: this pull request changes the workflow, so
   its own CI runs every suite. A later documentation-only pull request will
   show the skip.
+
+## 2026-11-15: Docs-only CI test fixture on macOS
+
+Problem. In #29's first CI run (Actions run 43722475978),
+`TestCIDocsOnlyPullRequests` failed under Bazel on darwin-arm64 and
+darwin-amd64. It passed on Linux and Windows. Every case printed "warning:
+refname 'HEAD' is ambiguous" and then docs_only=false.
+- The fixture named its pull-request branch `head`. On a case-insensitive
+  file system such as APFS, `refs/heads/head` collides with `HEAD`.
+- The script itself was not at fault: GitHub's checkout has no such branch.
+
+Change. The fixture branch is now `topic`.
+
+Verification. `go test -c` built darwin/amd64 binaries of the old and new
+tests, which ran on the Mac (macOS 26.6.2, APFS). The old one reproduced
+the ambiguous-HEAD failures; the new one passes. The Linux run passes.
