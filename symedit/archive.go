@@ -41,6 +41,9 @@ func parseObject(data []byte) (object, error) {
 	case isCOFF(data):
 		return parseCOFF(data)
 	}
+	if w, ok := wideELF(data); ok {
+		return parseWideELF(data, w)
+	}
 	return parseELF(data)
 }
 
@@ -52,6 +55,9 @@ func editObject(data []byte, e Edits) (objectResult, error) {
 		return editCOFFImport(data, e)
 	case isCOFF(data):
 		return editCOFF(data, e)
+	}
+	if w, ok := wideELF(data); ok {
+		return editWideELF(data, w, e)
 	}
 	return editELF(data, e)
 }
