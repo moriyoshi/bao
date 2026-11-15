@@ -6804,3 +6804,11 @@ Change. The fixture branch is now `topic`.
 Verification. `go test -c` built darwin/amd64 binaries of the old and new
 tests, which ran on the Mac (macOS 26.6.2, APFS). The old one reproduced
 the ambiguous-HEAD failures; the new one passes. The Linux run passes.
+
+## 2026-11-15: Docs-only CI script without a Go test
+
+Decision. On review the script's Go test (`TestCIDocsOnlyPullRequests`) was
+removed, together with its Bazel data entry and the `ci/BUILD.bazel`
+export. `ci/docs-only.sh` is a short classifier that the workflow runs
+directly. The two previous entries describe that test and its macOS fixture
+fix; neither applies any more.

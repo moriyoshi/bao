@@ -15,6 +15,6 @@ go_binary(
 go_test(
     name = "release_test",
     srcs = ["ci_test.go", "main_test.go", "metadata_test.go"],
-    data = ["//ci:await-source.sh", "//ci:cache.sh", "//ci:docs-only.sh", "//release:metadata.sh"],
+    data = ["//ci:await-source.sh", "//ci:cache.sh", "//release:metadata.sh"],
     embed = [":release_lib"],
 )
