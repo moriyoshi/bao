@@ -6042,3 +6042,25 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Reference: llvm-objcopy
   - `.work/symsect/run.sh` gave 34 ok, 0 FAIL.
 - The new CI steps have not run yet. Native execution on Windows and on
   darwin/arm64 is left to them.
+
+## 2026-11-15: CI for Mach-O and COFF section edits
+
+Problem. In the first CI run of the section edit change (Actions run
+43692532392), darwin-arm64 failed in the new `darwinSectionEdits` step with
+"bao: output parent must exist". The harness passed `-o` into a
+`symedit-section-app` directory it had not created. This was a harness bug,
+not a section edit result.
+
+Change. The step now creates the directory first, as `windowsSectionEdits`
+and `darwinSymbolEdits` already did.
+
+Result. Actions run 43693475713 passed every job: unit, linux-amd64,
+linux-arm64, darwin-amd64, darwin-arm64, windows-amd64 and windows-arm64.
+- In both darwin jobs, the section edit step ran natively and recorded PASS:
+  - `__DWARF` sections removed;
+  - the `-add-symbol` alias and the function called through purego, both
+    returning 7, at one address;
+  - the removal of `__TEXT,__text` refused.
+- The Windows section edit step ran natively and passed in both runs, for
+  msvc, clang-cl, clang and mingw on windows-amd64 and for msvc, clang-cl
+  and clang on windows-arm64.
