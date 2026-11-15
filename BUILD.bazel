@@ -19,7 +19,8 @@ alias(
 test_suite(
     name = "tests",
     tests = [
-        "//cmd/bao:bao_test",
+        "//internal/cli:cli_test",
+        "//build:build_test",
         "//cmd/bao-verify:verify_test",
         "//cmd/bao-release:release_test",
         "//ar:ar_test",

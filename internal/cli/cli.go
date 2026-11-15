@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -15,9 +15,46 @@ import (
 	"github.com/moriyoshi/bao/verify"
 )
 
-// Set with -ldflags '-X main.version=... -X main.commit=...' for releases.
+// Set with -ldflags '-X github.com/moriyoshi/bao/internal/cli.version=...
+// -X github.com/moriyoshi/bao/internal/cli.commit=...' for releases.
 var version = "devel"
 var commit string
+
+// baoVersion is the stamped release version or, in a program that imports
+// bao as a module, the module version that Go records.
+func baoVersion() string {
+	if version != "devel" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Path == "github.com/moriyoshi/bao" {
+			if v := info.Main.Version; v != "" && v != "(devel)" {
+				return v
+			}
+			return version
+		}
+		for _, dep := range info.Deps {
+			if dep.Path == "github.com/moriyoshi/bao" {
+				if dep.Replace != nil {
+					return dep.Version + " => " + dep.Replace.Path
+				}
+				return dep.Version
+			}
+		}
+	}
+	return version
+}
+
+// Run runs a bao command line, without the program name, as the bao command
+// does. Help writes to stdout and returns nil. It may run more than once in
+// one process.
+func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runContext(ctx, args, stdout, stderr)
+}
+
+// ExitCode returns the bao command's exit status for an error from Run: 2
+// for usage errors, 130 after cancellation and 1 otherwise.
+func ExitCode(err error) int { return exitCode(err) }
 
 type usageError struct{ error }
 
@@ -182,7 +219,7 @@ func showVersion(args []string, stdout io.Writer) error {
 		Commit  string `json:"commit,omitempty"`
 		Go      string `json:"built_with"`
 		Linker  string `json:"verified_go_linker"`
-	}{version, revision, runtime.Version(), "go1.26.11"}
+	}{baoVersion(), revision, runtime.Version(), "go1.26.11"}
 	if *asJSON {
 		return writeJSON(stdout, info)
 	}

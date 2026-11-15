@@ -641,6 +641,41 @@ producer commands use 130. Options precede positional inputs. Existing output
 directories are refused. Producer builds stage a complete package before
 publishing it and remove their own temporary files on failure.
 
+### Building from Go
+
+A producer that generates its native package from Go code, such as a
+`go generate` step, can import bao as a module instead of running a
+separately installed `bao`. The bao version then comes pinned through
+`go.mod` and `go.sum`. Package `github.com/moriyoshi/bao/build` runs
+`bao build` with the same behavior; its `Options` fields mirror the
+command's flags.
+
+```go
+err := build.Run(ctx, build.Options{
+	Input:   "glue.o",
+	Output:  "native",
+	Target:  "linux/arm64",
+	Sysroot: "/srv/sysroot",
+	Symbols: []string{"glue_run"},
+	Wrap:    []string{"pthread_create", "pthread_join"},
+	Linux: build.LinuxOptions{
+		SharedObject:      "libpython3.13.so.1.0",
+		MaxSymbolVersions: []string{"GLIBC_2.18"},
+	},
+	Stderr: os.Stderr,
+})
+```
+
+- `Args` takes any other `bao build` flags, as on the command line, such as
+  the per-input symbol edits.
+- `Options.CommandLine` shows the arguments `Run` passes.
+- `Run` can run more than once in one process, for example once per target.
+- Combining archives still runs the native partial linker as the command
+  does. A single relocatable object, with or without `Linux.SharedObject`,
+  needs none.
+- An unstamped build records bao's module version from the importing
+  program's build information in `bao-build.json`.
+
 ### Producing a Go package
 
 Native producer builds need the host Rust/Cargo toolchain and a compatible

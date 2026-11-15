@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cli",
+    srcs = glob(["*.go"], exclude = ["*_test.go"]),
+    importpath = "github.com/moriyoshi/bao/internal/cli",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//bindings",
+        "//internal/ar",
+        "//linuxelf",
+        "//pecoff",
+        "//symedit",
+        "//toolchain",
+        "//translate",
+        "//verify",
+    ],
+)
+
+go_test(
+    name = "cli_test",
+    srcs = glob(["*_test.go"]),
+    embed = [":cli"],
+)
