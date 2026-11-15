@@ -5811,3 +5811,81 @@ in-object calls stay unwrapped, while strlen and cross-object references are
 wrapped. The other drivers keep 103021003, and the README notes the
 binutils behaviour. The noipa attribute stays, since it keeps GCC from
 folding the calls whatever the relocations are.
+
+## 2026-11-15: ELF section edits (`-remove-section`, `-only-section`, `-add-symbol`)
+
+Problem: item 5, the last of pythago's objcopy-style request, which it marked
+low priority. The user asked to continue after the COFF phase (#14). ELF
+comes first, as in the earlier phases. Mach-O and COFF reject these flags
+with an explicit error.
+
+Decisions:
+- Removal:
+  - Relocation sections follow their targets. A group goes when its last
+    member does; otherwise its member list is rewritten.
+  - Symbols defined in a removed section (including its section symbol)
+    are removed. If a kept relocation or group still names one, the
+    removal is refused, as llvm-objcopy also refuses.
+  - A kept section linking to a removed one is refused, as is removing the
+    symbol, string or section name table.
+- Renumbering: every section index changes. That covers symbol `st_shndx`,
+  SHT_SYMTAB_SHNDX values, `sh_link`, relocation `sh_info` (and
+  SHF_INFO_LINK), group members, `e_shnum`/`e_shstrndx`, and the extended
+  forms in section 0. The compacted section header table goes at the end of
+  the file.
+- `-only-section` keeps the symbol, string and section name tables, the
+  extended index table, the kept sections' relocations, and groups with a
+  kept member. llvm-objcopy also drops those relocations, which leaves an
+  object that no longer links. GNU objcopy `-j` fails on a relocatable object
+  with undefined references ("symbol `strlen' required but not present").
+- `-add-symbol` uses llvm-objcopy's `NAME=[SECTION:]VALUE[,FLAGS]` syntax,
+  with flags global/local/weak, default/hidden/protected and
+  object/function/notype. A local addition joins the local block. Adding a
+  name the object already defines is an error.
+- In `bao build` these are component flags. The scoped `-add-symbol` splits
+  `PATH=` at the second-to-last `=`. As with the binding flags, they make a
+  primary archive combine first. Config files gain `remove_sections`,
+  `only_sections` and `add_symbols` under `symbol_visibility`.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Native linux/arm64 with
+GCC 13.3.0; linux/amd64 with x86_64-linux-gnu-gcc 14.2.0 in
+bao-cpp-cross:20261108, run under emulated qemu-x86_64 10.0.13. Reference:
+llvm-objcopy (rust-objcopy, LLVM 22). Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. New symedit tests cover:
+  - removal renumbering (relocation targets, links, group members, symbol
+    sections);
+  - refusals for a referenced definition, the symbol and string tables, and
+    a missing or removed target section of an added symbol;
+  - removing a section together with the group it alone fills;
+  - `-only-section` keeping relocations and groups;
+  - added symbols with value, binding, type and visibility, a local one
+    before `sh_info`;
+  - ParseAddSymbol;
+  - the Mach-O and COFF rejections.
+  CLI tests cover the scoped `-add-symbol` split and the config keys.
+- End to end, driver `.work/symsect/run.sh` (fixtures in `.work/symsect/src`).
+  The fixture was built with `-g -ffunction-sections`. On both
+  architectures:
+  - Every edited object linked and printed the unedited `3 9 5 5`: removing
+    `.comment` and the stack note, removing `.debug*`, `-only-section` with
+    text/data/bss/eh_frame/rodata, and three added symbols.
+  - A call through the added alias `vis_alias=.text.Py_Api:0,function`
+    reached Py_Api.
+  - `bao build` added `bao_alias=.text.bao_symedit_wrapped:0,function`,
+    removed `.comment` and exported the alias. CGO_ENABLED=0 consumers read
+    103021003 through both the function and the alias, natively on arm64
+    and under qemu on amd64.
+  - Section lists and symbol tables matched llvm-objcopy exactly for the
+    two removals and for `--add-symbol`.
+  - 34 checks passed in total, with none failing.
+- Negative controls, both architectures:
+  - Removing `.text.hidden_helper` (called) and `.text.unused_static`
+    (named by its FDE and debug data) is refused by Bao and by llvm-objcopy.
+  - A removed section's function no longer links.
+  - `bao build` refuses to remove `.text.target`.
+- The change touches the shared ELF rebuild path: locals are now chosen by
+  each entry's own binding, and section indices are remapped. So the earlier
+  Linux drivers were rerun on this code. `.work/symedit/e2e.sh` gave 26 ok,
+  0 FAIL, and `.work/symvis/e2e.sh` 50 ok, 0 FAIL.
+
+Remaining: section edits for Mach-O and COFF.

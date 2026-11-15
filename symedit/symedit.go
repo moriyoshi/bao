@@ -13,10 +13,12 @@ package symedit
 import (
 	"bufio"
 	"bytes"
+	"debug/elf"
 	"fmt"
 	"io"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -32,6 +34,74 @@ type Edits struct {
 	// defines NAME, and undefined __real_NAME becomes NAME.
 	Wrap []string
 	Visibility
+	// RemoveSection removes matching sections, with their relocations and
+	// the symbols defined in them, as llvm-objcopy --remove-section does.
+	// OnlySection keeps only matching sections, besides the symbol, string
+	// and section name tables. A kept reference to something removed is an
+	// error. Only ELF supports these.
+	RemoveSection, OnlySection Matcher
+	// AddSymbols adds symbols, as llvm-objcopy --add-symbol does. Only ELF
+	// supports it.
+	AddSymbols []AddedSymbol
+}
+
+// AddedSymbol is one llvm-objcopy --add-symbol: NAME=[SECTION:]VALUE[,FLAGS].
+// Without a section, the symbol is absolute.
+type AddedSymbol struct {
+	Name, Section string
+	Value         uint64
+	Bind          elf.SymBind
+	Type          elf.SymType
+	Visibility    elf.SymVis
+}
+
+// ParseAddSymbol reads NAME=[SECTION:]VALUE[,FLAGS], where FLAGS are
+// comma-separated global (the default), local, weak, default, hidden,
+// protected, object, function and notype.
+func ParseAddSymbol(spec string) (AddedSymbol, error) {
+	var a AddedSymbol
+	name, rest, ok := strings.Cut(spec, "=")
+	if !ok || name == "" || strings.IndexByte(name, 0) >= 0 {
+		return a, fmt.Errorf("--add-symbol %q: expected NAME=[SECTION:]VALUE[,FLAGS]", spec)
+	}
+	fields := strings.Split(rest, ",")
+	place := fields[0]
+	if i := strings.LastIndexByte(place, ':'); i >= 0 {
+		a.Section, place = place[:i], place[i+1:]
+		if a.Section == "" {
+			return a, fmt.Errorf("--add-symbol %q: empty section name", spec)
+		}
+	}
+	value, err := strconv.ParseUint(place, 0, 64)
+	if err != nil {
+		return a, fmt.Errorf("--add-symbol %q: invalid value %q", spec, place)
+	}
+	a.Name, a.Value, a.Bind, a.Type, a.Visibility = name, value, elf.STB_GLOBAL, elf.STT_NOTYPE, elf.STV_DEFAULT
+	for _, flag := range fields[1:] {
+		switch flag {
+		case "global":
+			a.Bind = elf.STB_GLOBAL
+		case "local":
+			a.Bind = elf.STB_LOCAL
+		case "weak":
+			a.Bind = elf.STB_WEAK
+		case "default":
+			a.Visibility = elf.STV_DEFAULT
+		case "hidden":
+			a.Visibility = elf.STV_HIDDEN
+		case "protected":
+			a.Visibility = elf.STV_PROTECTED
+		case "object":
+			a.Type = elf.STT_OBJECT
+		case "function":
+			a.Type = elf.STT_FUNC
+		case "notype":
+			a.Type = elf.STT_NOTYPE
+		default:
+			return a, fmt.Errorf("--add-symbol %q: unsupported flag %q", spec, flag)
+		}
+	}
+	return a, nil
 }
 
 // Visibility changes symbol bindings and removes symbols. Matching uses input
@@ -146,7 +216,13 @@ func (e Edits) Validate() error {
 	return nil
 }
 
-func (e Edits) empty() bool { return len(e.Rename) == 0 && len(e.Wrap) == 0 && e.Visibility.empty() }
+func (e Edits) empty() bool {
+	return len(e.Rename) == 0 && len(e.Wrap) == 0 && e.Visibility.empty() && !e.editsSections()
+}
+
+func (e Edits) editsSections() bool {
+	return !e.RemoveSection.empty() || !e.OnlySection.empty() || len(e.AddSymbols) > 0
+}
 
 // ParseNames reads llvm-objcopy symbol list files, such as for
 // --keep-global-symbols: one name per line. Blank lines and text after # are

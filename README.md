@@ -852,6 +852,44 @@ bao build -target linux/arm64 -symbol pythago_main -wildcard \
 bao objcopy -localize-hidden -strip-unneeded libpython.o libpython-private.o
 ```
 
+#### Section edits
+
+These flags remove sections or add symbols, as the llvm-objcopy flags of the
+same names do. They are for ELF only, and Mach-O and COFF inputs reject them.
+In `bao build` each names its component first, as for the binding flags.
+
+| Flag | Effect |
+| --- | --- |
+| `-remove-section SECTION` | Remove the section, its relocation sections and the symbols defined in it |
+| `-only-section SECTION` | Keep only matching sections, with their relocations, groups, and the symbol, string and section name tables |
+| `-add-symbol NAME=[SECTION:]VALUE[,FLAGS]` | Add a symbol at an offset in a section, or an absolute one without a section |
+
+`-wildcard` makes section names shell patterns too. `-add-symbol` flags are
+`global` (the default), `local`, `weak`, `default`, `hidden`, `protected`,
+`object`, `function` and `notype`. Adding a name the object already defines
+is an error.
+
+Removal renumbers every section index: symbol sections, the extended index
+table, links, relocation targets, group members and the section name table
+index. A section group goes when its last member does. The edit is refused
+in these cases:
+
+- A kept relocation or section group names a symbol defined in a removed
+  section. That includes its section symbol, which `.eh_frame` and debug data
+  usually name, as llvm-objcopy also refuses.
+- A kept section links to a removed one.
+- A removal targets the symbol, string or section name table.
+
+Unlike llvm-objcopy, `-only-section` keeps the relocations of the sections it
+keeps, so the result still links.
+
+```sh
+# Export an alias at the start of a function's section, and drop .comment.
+bao build -target linux/arm64 -symbol app_main -symbol app_entry_alias \
+  -add-symbol 'libapp.a=app_entry_alias=.text.app_main:0,function' \
+  -remove-section libapp.a=.comment -o ./native libapp.a
+```
+
 ### Function bindings and native debug stripping
 
 Choose the calling API and dependency profile before distributing your package.
@@ -1667,7 +1705,8 @@ keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `li
 `prefix_symbols` (an object from path to prefix), `wildcard`, `symbol_visibility`
 (an object from path to `localize_symbols`, `localize_symbol_files`,
 `localize_hidden`, `keep_global_symbols`, `keep_global_symbol_files`,
-`globalize_symbols`, `weaken_symbols`, `strip_symbols` and `strip_unneeded`),
+`globalize_symbols`, `weaken_symbols`, `strip_symbols`, `strip_unneeded`,
+`remove_sections`, `only_sections` and `add_symbols`),
 and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
 `sysroot`, `ld`, `system_libraries`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,

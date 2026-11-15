@@ -21,6 +21,8 @@ const (
 )
 
 type elfSection struct {
+	name                  string
+	nameOffset            uint32
 	typ                   elf.SectionType
 	flags                 elf.SectionFlag
 	offset, size, entsize uint64
@@ -32,6 +34,7 @@ type elfSymbol struct {
 	info  byte
 	other byte
 	shndx uint16
+	value uint64
 }
 
 func (s elfSymbol) global() bool { return elf.ST_BIND(s.info) != elf.STB_LOCAL }
@@ -60,6 +63,7 @@ type elfFile struct {
 	shoff    uint64
 	sections []elfSection
 	symtab   int // section index, or 0 when the object has no symbol table
+	shstrndx int
 	symbols  []elfSymbol
 }
 
@@ -95,7 +99,7 @@ func parseELF(data []byte) (*elfFile, error) {
 	for i := range f.sections {
 		h := data[f.shoff+uint64(i)*sectionHeaderSize:]
 		s := elfSection{
-			typ: elf.SectionType(le.Uint32(h[4:])), flags: elf.SectionFlag(le.Uint64(h[8:])),
+			nameOffset: le.Uint32(h), typ: elf.SectionType(le.Uint32(h[4:])), flags: elf.SectionFlag(le.Uint64(h[8:])),
 			offset: le.Uint64(h[24:]), size: le.Uint64(h[32:]), entsize: le.Uint64(h[56:]),
 			link: le.Uint32(h[40:]), info: le.Uint32(h[44:]),
 		}
@@ -109,6 +113,25 @@ func parseELF(data []byte) (*elfFile, error) {
 			f.symtab = i
 		}
 		f.sections[i] = s
+	}
+	f.shstrndx = int(le.Uint16(data[0x3e:]))
+	if f.shstrndx == int(elf.SHN_XINDEX) {
+		f.shstrndx = int(f.sections[0].link)
+	}
+	if f.shstrndx != 0 {
+		if f.shstrndx >= len(f.sections) || f.sections[f.shstrndx].typ != elf.SHT_STRTAB {
+			return nil, errors.New("malformed ELF section name table")
+		}
+		names := f.section(f.shstrndx)
+		for i := range f.sections {
+			off := f.sections[i].nameOffset
+			if int(off) >= len(names) {
+				return nil, fmt.Errorf("ELF section %d name is out of range", i)
+			}
+			if end := bytes.IndexByte(names[off:], 0); end >= 0 {
+				f.sections[i].name = string(names[off : int(off)+end])
+			}
+		}
 	}
 	if f.symtab == 0 {
 		return f, nil
@@ -160,4 +183,104 @@ func (f *elfFile) defined() []string {
 		}
 	}
 	return out
+}
+
+// xindex returns the extended section index table of the symbol table, or nil.
+func (f *elfFile) xindex() []byte {
+	for i, s := range f.sections {
+		if s.typ == elf.SHT_SYMTAB_SHNDX && int(s.link) == f.symtab {
+			return f.section(i)
+		}
+	}
+	return nil
+}
+
+// symbolSection returns the section index symbol i is defined in, or -1 for
+// an undefined, absolute or common symbol.
+func (f *elfFile) symbolSection(i int, xindex []byte) int {
+	switch shndx := f.symbols[i].shndx; {
+	case shndx == uint16(elf.SHN_XINDEX) && 4*i+4 <= len(xindex):
+		return int(le.Uint32(xindex[4*i:]))
+	case shndx != 0 && shndx < uint16(elf.SHN_LORESERVE):
+		return int(shndx)
+	}
+	return -1
+}
+
+// droppedSections applies -remove-section and -only-section. Relocation
+// sections follow their targets and a section group goes with its last
+// member. It returns nil when no section goes, and otherwise each section's
+// new index, or -1 for a removed one.
+func (f *elfFile) droppedSections(e Edits) ([]int, error) {
+	if e.RemoveSection.empty() && e.OnlySection.empty() {
+		return nil, nil
+	}
+	strtab := -1
+	if f.symtab != 0 {
+		strtab = int(f.sections[f.symtab].link)
+	}
+	essential := func(i int) bool {
+		s := f.sections[i]
+		return i == 0 || i == f.symtab || i == strtab || i == f.shstrndx || s.typ == elf.SHT_SYMTAB_SHNDX
+	}
+	follows := func(s elfSection) bool {
+		return s.typ == elf.SHT_REL || s.typ == elf.SHT_RELA || s.typ == shtCREL || s.typ == elf.SHT_GROUP
+	}
+	drop := make([]bool, len(f.sections))
+	for i, s := range f.sections {
+		if i == 0 {
+			continue
+		}
+		if e.RemoveSection.Match(s.name) {
+			if essential(i) {
+				return nil, fmt.Errorf("cannot remove ELF section %s, which the symbol table needs", s.name)
+			}
+			drop[i] = true
+		}
+		if !e.OnlySection.empty() && !essential(i) && !follows(s) && !e.OnlySection.Match(s.name) {
+			drop[i] = true
+		}
+	}
+	for i, s := range f.sections {
+		if (s.typ == elf.SHT_REL || s.typ == elf.SHT_RELA || s.typ == shtCREL) && int(s.info) < len(drop) && drop[s.info] {
+			drop[i] = true
+		}
+	}
+	for i, s := range f.sections {
+		if s.typ != elf.SHT_GROUP || drop[i] {
+			continue
+		}
+		members := f.section(i)
+		kept := false
+		for off := 4; off+4 <= len(members); off += 4 {
+			if m := int(le.Uint32(members[off:])); m < len(drop) && !drop[m] {
+				kept = true
+			}
+		}
+		drop[i] = !kept
+	}
+	index := make([]int, len(f.sections))
+	next, any := 0, false
+	for i := range f.sections {
+		index[i] = -1
+		if !drop[i] {
+			index[i] = next
+			next++
+		}
+		any = any || drop[i]
+	}
+	if !any {
+		return nil, nil
+	}
+	// A kept section may refer to a removed one only as a relocation target,
+	// which removes the relocations with it.
+	for i, s := range f.sections {
+		if drop[i] || i == 0 {
+			continue
+		}
+		if s.link != 0 && int(s.link) < len(drop) && drop[s.link] {
+			return nil, fmt.Errorf("cannot remove ELF section %s, which section %s links to", f.sections[s.link].name, s.name)
+		}
+	}
+	return index, nil
 }

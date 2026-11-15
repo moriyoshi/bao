@@ -310,6 +310,9 @@ func editCOFF(data []byte, e Edits) (objectResult, error) {
 	if err != nil {
 		return objectResult{}, err
 	}
+	if e.editsSections() {
+		return objectResult{}, errors.New("section edits and added symbols are supported only for ELF, not COFF")
+	}
 	if e.empty() || f.records == 0 {
 		return objectResult{data: data}, nil
 	}

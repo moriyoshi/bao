@@ -165,3 +165,46 @@ func TestSymbolEditUsage(t *testing.T) {
 		t.Fatalf("bao-build.json: %v\n%s", err, record)
 	}
 }
+
+func TestSectionEditFlags(t *testing.T) {
+	f := symbolEditFlags{scoped: true, removeSection: symbolFlags{"dir=x/lib.a=.comment"}, addSymbol: symbolFlags{"dir=x/lib.a=marker=.text:0x10,local,function"}, onlySection: symbolFlags{"other.a=.text*"}, wildcard: true}
+	specs, err := f.visibilitySpecs()
+	if err != nil || len(specs) != 2 {
+		t.Fatalf("%+v %v", specs, err)
+	}
+	s := specs[0]
+	if s.Path != "dir=x/lib.a" || strings.Join(s.RemoveSection, ",") != ".comment" || strings.Join(s.AddSymbol, ",") != "marker=.text:0x10,local,function" {
+		t.Fatalf("%+v", s)
+	}
+	e, err := s.compile(true)
+	if err != nil || len(e.AddSymbols) != 1 || e.AddSymbols[0].Value != 16 || !e.RemoveSection.Match(".comment") {
+		t.Fatalf("%+v %v", e, err)
+	}
+	if !specs[1].compileMatch(t, ".text.hot") {
+		t.Fatal("only-section pattern")
+	}
+	bad := symbolEditFlags{scoped: true, addSymbol: symbolFlags{"lib.a=x=1,bogus"}}
+	if _, err := bad.visibilitySpecs(); err == nil || exitCode(err) != 2 {
+		t.Fatalf("bad flag: %v", err)
+	}
+	body := `{"schema":1,"symbol_visibility":{"lib.a":{"remove_sections":[".comment"],"add_symbols":["marker=.text:4"]}}}`
+	_, fs, _, err := configFlags(t, "build", body, "-target", "linux/arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := fs.Lookup("remove-section").Value.String(); !strings.HasSuffix(v, "lib.a=.comment") || !filepath.IsAbs(strings.TrimSuffix(v, "=.comment")) {
+		t.Fatalf("remove-section = %q", v)
+	}
+	if v := fs.Lookup("add-symbol").Value.String(); !strings.HasSuffix(v, "lib.a=marker=.text:4") {
+		t.Fatalf("add-symbol = %q", v)
+	}
+}
+
+func (s *visibilitySpec) compileMatch(t *testing.T, name string) bool {
+	t.Helper()
+	e, err := s.compile(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.OnlySection.Match(name)
+}

@@ -45,6 +45,9 @@ type buildConfig struct {
 		WeakenSymbols         []string `json:"weaken_symbols"`
 		StripSymbols          []string `json:"strip_symbols"`
 		StripUnneeded         bool     `json:"strip_unneeded"`
+		RemoveSections        []string `json:"remove_sections"`
+		OnlySections          []string `json:"only_sections"`
+		AddSymbols            []string `json:"add_symbols"`
 	} `json:"symbol_visibility"`
 	Wildcard *bool `json:"wildcard"`
 	Cargo    *struct {
@@ -271,6 +274,7 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 					{"localize-symbol", v.LocalizeSymbols, false}, {"localize-symbols", v.LocalizeSymbolFiles, true},
 					{"keep-global-symbol", v.KeepGlobalSymbols, false}, {"keep-global-symbols", v.KeepGlobalSymbolFiles, true},
 					{"globalize-symbol", v.GlobalizeSymbols, false}, {"weaken-symbol", v.WeakenSymbols, false}, {"strip-symbol", v.StripSymbols, false},
+					{"remove-section", v.RemoveSections, false}, {"only-section", v.OnlySections, false}, {"add-symbol", v.AddSymbols, false},
 				} {
 					for _, name := range list.names {
 						if list.files {
