@@ -228,7 +228,44 @@ func (h *harness) windowsSymbolEdits(arch string) {
 	out, err = h.command("symedit-negative-producer.log", h.root, nil, append(build, "-o", filepath.Join(h.dst, "symedit-negative"), core)...)
 	check(err != nil && strings.Contains(string(out), "duplicate"), "building without prefixes did not fail on duplicate definitions: %v\n%s", err, out)
 	h.windowsSectionEdits(dir, compile("section", "symedit_section.c"), arch)
+	h.windowsWeaken(dir, archive("libweak.a", compile("weak", "symedit_weak.c")), archive("libstrong.a", compile("strong", "symedit_strong.c")), arch)
 	h.results["windows_symbol_edits"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "checks": "lld-style wrap including a call inside the defining object (except with MinGW GCC, whose assembler calls same-object functions through their section) and __real_ bound to it, wrapped UCRT strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard per member; negative control without prefixes fails on duplicate definitions; section edits: debug sections removed and -add-symbol aliases at the start of a function's section (objcopy) and at the function itself (build) called natively, with removal of that code section refused"}
+}
+
+// windowsWeaken weakens testdata/symedit_weak.c's value definition and its
+// hook reference with -weaken-symbol. With libstrong.a's value linked, the
+// consumer gets 20: the strong definition wins, for the weakened object's
+// own call too. Without it, the weak default gives 10. The hook stays NULL.
+// GNU as for PE calls a function in the same object through its section, so
+// with MinGW GCC that call keeps the default and both builds give 10.
+func (h *harness) windowsWeaken(dir, weak, strong, arch string) {
+	strongWant := "weak: 20\n"
+	if h.windowsDriver == "mingw" {
+		strongWant = "weak: 10\n"
+	}
+	signatures := filepath.Join(dir, "weak-signatures.json")
+	require(os.WriteFile(signatures, []byte(`{"schema":1,"abi":"c","functions":[{"name":"Weak","symbol":"bao_symedit_weak","params":[],"result":"int64"}]}`), 0o644))
+	results := map[string]string{}
+	for _, c := range []struct {
+		name, want string
+		extra      []string
+	}{{"strong", strongWant, []string{"-link-archive", strong}}, {"alone", "weak: 10\n", nil}} {
+		app := filepath.Join(h.dst, "symedit-weak-"+c.name)
+		require(os.Mkdir(app, 0o755))
+		build := append([]string{h.bao, "build", "-target", h.target, "-bindings", signatures, "-weaken-symbol", weak + "=value", "-weaken-symbol", weak + "=hook"}, c.extra...)
+		h.run("symedit-weak-"+c.name+"-producer.log", h.root, nil, append(build, "-o", filepath.Join(app, "native"), weak)...)
+		require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-windows-weak\ngo 1.26.0\n"), 0o644))
+		require(os.WriteFile(filepath.Join(app, "main.go"), []byte("package main\n\nimport (\n\t\"fmt\"\n\t\"runtime\"\n\n\tnative \"bao-windows-weak/native\"\n)\n\nfunc main() {\n\truntime.LockOSThread()\n\tv := native.Weak()\n\tnative.Shutdown()\n\tfmt.Println(\"weak:\", v)\n}\n"), 0o644))
+		exe := filepath.Join(h.dst, "symedit-weak-"+c.name+".exe")
+		h.run("symedit-weak-"+c.name+"-build.log", app, h.consumerEnv(map[string]string{"GOOS": "windows", "GOARCH": arch}), h.goTool, "build", "-o", exe, ".")
+		out, err := h.command("symedit-weak-"+c.name+"-run.log", h.root, nil, h.windowsExecute(exe)...)
+		check(err == nil && strings.Contains(string(out), c.want), "Windows weakening %s: want %q: %v\n%s", c.name, c.want, err, out)
+		results[c.name] = strings.TrimSpace(string(out))
+	}
+	// Without weakening, the two definitions collide.
+	out, err := h.command("symedit-weak-negative-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-bindings", signatures, "-weaken-symbol", weak+"=hook", "-link-archive", strong, "-o", filepath.Join(h.dst, "symedit-weak-negative"), weak)
+	check(err != nil && strings.Contains(string(out), "duplicate"), "unweakened definitions did not collide: %v\n%s", err, out)
+	h.results["windows_weaken"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "results": results, "checks": "-weaken-symbol on a definition and a reference: a strong -link-archive definition wins, the weak default serves alone, the weak reference is NULL; negative control without weakening collides"}
 }
 
 // windowsSectionEdits is darwinSectionEdits for COFF: CodeView or DWARF

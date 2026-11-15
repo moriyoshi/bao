@@ -149,11 +149,14 @@ func TestSymbolEditUsage(t *testing.T) {
 		t.Fatalf("objcopy without output: %v", err)
 	}
 	out := filepath.Join(dir, "x.obj")
-	if err := run([]string{"objcopy", "-weaken-symbol", "answer", input, out}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "weakening is unsupported for COFF") {
-		t.Fatalf("objcopy -weaken-symbol of COFF: %v", err)
+	if err := run([]string{"objcopy", "-add-symbol", "x=0,hidden", input, out}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "COFF has none") {
+		t.Fatalf("objcopy -add-symbol hidden on COFF: %v", err)
 	}
 	if _, err := os.Stat(out); err == nil {
 		t.Fatal("objcopy wrote an output after failing")
+	}
+	if err := run([]string{"objcopy", "-weaken-symbol", "answer", input, out}, &stdout, &stderr); err != nil {
+		t.Fatalf("objcopy -weaken-symbol of COFF: %v", err)
 	}
 	// A Windows build applies the edits and translates the result.
 	err := run([]string{"build", "-target", "windows/amd64", "-redefine-sym", "answer=renamed", "-symbol", "renamed", "-o", filepath.Join(dir, "pkg"), input}, &stdout, &stderr)
