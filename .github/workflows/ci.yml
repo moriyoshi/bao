@@ -56,6 +56,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A pull request's merge commit and its base, to classify changes.
+          fetch-depth: 2
+      - name: Classify documentation-only pull requests
+        id: docs
+        run: bash ci/docs-only.sh >> "$GITHUB_OUTPUT"
       - name: Address the exact CI inputs
         id: inputs
         run: bash ci/cache.sh fingerprint "$SUITE" >> "$GITHUB_OUTPUT"
@@ -71,8 +76,13 @@ jobs:
         env:
           RESTORED: ${{ steps.cache.outputs.cache-hit }}
           EXPECTED_KEY: ${{ steps.inputs.outputs.key }}
+          DOCS_ONLY: ${{ steps.docs.outputs.docs_only }}
+        # Markdown outside testdata is read by no check, so a pull request
+        # that changes only that passes without running the suite.
         run: |
-          if [[ "$RESTORED" == true ]] && bash ci/cache.sh validate "$SUITE" "$EXPECTED_KEY"; then
+          if [[ "$DOCS_ONLY" == true ]]; then
+            echo 'hit=true' >> "$GITHUB_OUTPUT"
+          elif [[ "$RESTORED" == true ]] && bash ci/cache.sh validate "$SUITE" "$EXPECTED_KEY"; then
             echo 'hit=true' >> "$GITHUB_OUTPUT"
           else
             echo 'hit=false' >> "$GITHUB_OUTPUT"
@@ -120,7 +130,12 @@ jobs:
           HIT: ${{ steps.result.outputs.hit }}
           KEY: ${{ steps.inputs.outputs.key }}
           TREE: ${{ steps.inputs.outputs.tree }}
+          DOCS_ONLY: ${{ steps.docs.outputs.docs_only }}
         run: |
+          if [[ "$DOCS_ONLY" == true ]]; then
+            printf '### %s CI\n\nSkipped: this pull request changes only documentation (Markdown outside testdata).\n' "$SUITE" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           printf '### %s CI\n\nSource tree: `%s`\n\nExact result cache hit: `%s`\n\nKey: `%s`\n' "$SUITE" "$TREE" "$HIT" "$KEY" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$HIT" == true ]]; then
             bash ci/cache.sh validate "$SUITE" "$KEY" >> "$GITHUB_STEP_SUMMARY"
