@@ -3,6 +3,7 @@ package symedit
 import (
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/moriyoshi/bao/ar"
@@ -32,15 +33,21 @@ type object interface {
 }
 
 func parseObject(data []byte) (object, error) {
-	if isMachO(data) {
+	switch {
+	case isMachO(data):
 		return parseMachO(data)
+	case isCOFF(data):
+		return parseCOFF(data)
 	}
 	return parseELF(data)
 }
 
 func editObject(data []byte, e Edits) (objectResult, error) {
-	if isMachO(data) {
+	switch {
+	case isMachO(data):
 		return editMachO(data, e)
+	case isCOFF(data):
+		return editCOFF(data, e)
 	}
 	return editELF(data, e)
 }
@@ -113,7 +120,7 @@ type indexed struct {
 
 func writeArchive(members []ar.Member) ([]byte, error) {
 	var symbols []indexed
-	names, machO := 0, 0
+	names, machO, coff := 0, 0, 0
 	for i, m := range members {
 		f, err := parseObject(m.Data)
 		if err != nil {
@@ -121,17 +128,22 @@ func writeArchive(members []ar.Member) ([]byte, error) {
 		}
 		if isMachO(m.Data) {
 			machO++
+		} else if isCOFF(m.Data) {
+			coff++
 		}
 		for _, name := range f.indexNames() {
 			symbols = append(symbols, indexed{i, name})
 			names += len(name) + 1
 		}
 	}
-	if machO > 0 && machO < len(members) {
-		return nil, fmt.Errorf("archive mixes Mach-O and ELF members")
+	if machO > 0 && machO < len(members) || coff > 0 && coff < len(members) {
+		return nil, fmt.Errorf("archive mixes object formats")
 	}
 	if machO > 0 {
 		return writeBSDArchive(members, symbols)
+	}
+	if coff > 0 {
+		return writeCOFFArchive(members, symbols)
 	}
 	// GNU ar stores names up to 15 bytes inline, terminated by /.
 	var longNames []byte
@@ -272,6 +284,77 @@ func writeBSDArchive(members []ar.Member, symbols []indexed) ([]byte, error) {
 	member(indexName, index)
 	for _, m := range members {
 		member(m.Name, m.Data)
+	}
+	return out, nil
+}
+
+// writeCOFFArchive writes the Microsoft library format that link.exe,
+// lld-link and MinGW ld read: a first linker member as in GNU ar, a second
+// one with little-endian member offsets and name-sorted symbols, and
+// NUL-terminated long names.
+func writeCOFFArchive(members []ar.Member, symbols []indexed) ([]byte, error) {
+	var strs []byte
+	for _, s := range symbols {
+		strs = append(append(strs, s.name...), 0)
+	}
+	sorted := append([]indexed{}, symbols...)
+	sort.SliceStable(sorted, func(a, b int) bool { return sorted[a].name < sorted[b].name })
+	var longNames []byte
+	headerNames := make([]string, len(members))
+	for i, m := range members {
+		if len(m.Name) <= 15 && !strings.ContainsAny(m.Name, "/ ") {
+			headerNames[i] = m.Name + "/"
+			continue
+		}
+		headerNames[i] = fmt.Sprintf("/%d", len(longNames))
+		longNames = append(append(longNames, m.Name...), 0)
+	}
+	padded := func(n int) int { return n + n%2 }
+	first := 4 + 4*len(symbols) + len(strs)
+	second := 4 + 4*len(members) + 4 + 2*len(symbols) + len(strs)
+	offset := 8 + 60 + padded(first) + 60 + padded(second)
+	if len(longNames) > 0 {
+		offset += 60 + padded(len(longNames))
+	}
+	offsets := make([]int, len(members))
+	for i, m := range members {
+		offsets[i] = offset
+		offset += 60 + padded(len(m.Data))
+	}
+	if offset > 0xffffffff || len(members) > 0xffff {
+		return nil, fmt.Errorf("COFF archive is too large for its symbol index")
+	}
+	out := make([]byte, 0, offset)
+	out = append(out, "!<arch>\n"...)
+	member := func(name string, data []byte) {
+		out = fmt.Appendf(out, "%-16s%-12d%-6d%-6d%-8s%-10d`\n", name, 0, 0, 0, "644", len(data))
+		out = append(out, data...)
+		if len(data)%2 != 0 {
+			out = append(out, '\n')
+		}
+	}
+	index := binary.BigEndian.AppendUint32(nil, uint32(len(symbols)))
+	for _, s := range symbols {
+		index = binary.BigEndian.AppendUint32(index, uint32(offsets[s.member]))
+	}
+	member("/", append(index, strs...))
+	index = binary.LittleEndian.AppendUint32(nil, uint32(len(members)))
+	for _, off := range offsets {
+		index = binary.LittleEndian.AppendUint32(index, uint32(off))
+	}
+	index = binary.LittleEndian.AppendUint32(index, uint32(len(sorted)))
+	for _, s := range sorted {
+		index = binary.LittleEndian.AppendUint16(index, uint16(s.member+1))
+	}
+	for _, s := range sorted {
+		index = append(append(index, s.name...), 0)
+	}
+	member("/", index)
+	if len(longNames) > 0 {
+		member("//", longNames)
+	}
+	for i, m := range members {
+		member(headerNames[i], m.Data)
 	}
 	return out, nil
 }

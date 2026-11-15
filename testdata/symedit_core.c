@@ -2,7 +2,9 @@
    defines target, calls it internally and imports strlen. With
    -wrap target -wrap strlen (ld.lld semantics) bao_symedit_wrapped returns
    102*1000000 + 1020*1000 + 1003; unwrapped it returns 2020003. */
-#include <string.h>
+#include <stddef.h>
+/* Declared here so that freestanding Windows compiles need no C library headers. */
+size_t strlen(const char *);
 int target(int x) { return x + 1; }
 int calls_target(int x) { return target(x) * 10; }
 size_t measure(const char *s) { return strlen(s); }

@@ -1,0 +1,404 @@
+package symedit
+
+import (
+	"bytes"
+	"debug/pe"
+	"encoding/binary"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/moriyoshi/bao/ar"
+	internalar "github.com/moriyoshi/bao/internal/ar"
+)
+
+type testCOFFSymbol struct {
+	name    string
+	section int16
+	class   byte
+	value   uint32
+	// text, debug and pdata list the sections whose relocations name it.
+	text, debug, pdata bool
+	// tag names a weak external's default symbol.
+	tag string
+	// addrsig lists the symbol in .llvm_addrsig.
+	addrsig bool
+}
+
+// Section numbers of testCOFF.
+const (
+	coffText    = 1
+	coffDebug   = 2
+	coffPdata   = 3
+	coffDrectve = 4
+	coffAddrsig = 5
+	coffComdatS = 6
+)
+
+// testCOFF builds an amd64 COFF object: a section definition symbol with one
+// auxiliary record for each section, then the given symbols. .text$c is a
+// COMDAT section.
+func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
+	le := binary.LittleEndian
+	names := []string{".text", ".debug$S", ".pdata", ".drectve", ".llvm_addrsig", ".text$c"}
+	flags := []uint32{0x60000020, 0x42100040, 0x40300040, 0x00100a00, 0x00100800, 0x60001020}
+	strtab := []byte{0, 0, 0, 0}
+	name := func(entry []byte, s string) {
+		if len(s) <= 8 {
+			copy(entry, s)
+			return
+		}
+		le.PutUint32(entry[4:], uint32(len(strtab)))
+		strtab = append(append(strtab, s...), 0)
+	}
+	// Record indices: sections take two records each.
+	index := map[string]int{}
+	next := 2 * len(names)
+	for _, s := range symbols {
+		index[s.name] = next
+		next++
+		if s.tag != "" {
+			next++
+		}
+	}
+	var table []byte
+	var relocs [3][]byte
+	var addrsig []byte
+	record := func(entry []byte) { table = append(table, entry...) }
+	for i, n := range names {
+		e := make([]byte, coffSymbolSize)
+		name(e, n)
+		le.PutUint16(e[12:], uint16(i+1))
+		e[16], e[17] = coffClassStatic, 1
+		record(e)
+		aux := make([]byte, coffSymbolSize)
+		if i+1 == coffComdatS {
+			aux[14] = 2 // IMAGE_COMDAT_SELECT_ANY
+		}
+		record(aux)
+	}
+	for _, s := range symbols {
+		e := make([]byte, coffSymbolSize)
+		name(e, s.name)
+		le.PutUint32(e[8:], s.value)
+		le.PutUint16(e[12:], uint16(s.section))
+		e[16] = s.class
+		if s.tag != "" {
+			e[17] = 1
+		}
+		record(e)
+		if s.tag != "" {
+			aux := make([]byte, coffSymbolSize)
+			le.PutUint32(aux, uint32(index[s.tag]))
+			le.PutUint32(aux[4:], 3) // IMAGE_WEAK_EXTERN_SEARCH_ALIAS
+			record(aux)
+		}
+		for j, on := range []bool{s.text, s.debug, s.pdata} {
+			if on {
+				r := make([]byte, coffRelocSize)
+				le.PutUint32(r, uint32(len(relocs[j])))
+				le.PutUint32(r[4:], uint32(index[s.name]))
+				le.PutUint16(r[8:], []uint16{4, 0xb, 3}[j])
+				relocs[j] = append(relocs[j], r...)
+			}
+		}
+		if s.addrsig {
+			addrsig = binary.AppendUvarint(addrsig, uint64(index[s.name]))
+		}
+	}
+	le.PutUint32(strtab, uint32(len(strtab)))
+	contents := [][]byte{make([]byte, 16), make([]byte, 16), make([]byte, 16), []byte(directives), addrsig, make([]byte, 16)}
+	out := make([]byte, coffFileHeader+len(names)*coffSectionHeader)
+	for i := range names {
+		h := out[coffFileHeader+i*coffSectionHeader:]
+		if len(names[i]) > 8 {
+			// Long section names refer to the string table as /OFFSET.
+			copy(h, "/"+strconv.Itoa(bytes.Index(strtab, append([]byte(names[i]), 0))))
+		} else {
+			copy(h, names[i])
+		}
+		le.PutUint32(h[16:], uint32(len(contents[i])))
+		le.PutUint32(h[20:], uint32(len(out)))
+		out = append(out, contents[i]...)
+		h = out[coffFileHeader+i*coffSectionHeader:]
+		if i < 3 {
+			le.PutUint32(h[24:], uint32(len(out)))
+			le.PutUint16(h[32:], uint16(len(relocs[i])/coffRelocSize))
+			out = append(out, relocs[i]...)
+			h = out[coffFileHeader+i*coffSectionHeader:]
+		}
+		le.PutUint32(h[36:], flags[i])
+	}
+	le.PutUint16(out, coffMachineAMD64)
+	le.PutUint16(out[2:], uint16(len(names)))
+	le.PutUint32(out[8:], uint32(len(out)))
+	le.PutUint32(out[12:], uint32(len(table)/coffSymbolSize))
+	return append(append(out, table...), strtab...)
+}
+
+const (
+	ext    = coffClassExternal
+	static = coffClassStatic
+	weak   = coffClassWeakExternal
+)
+
+func coffFixture(directives string) []byte {
+	return testCOFF([]testCOFFSymbol{
+		{name: "@feat.00", section: -1, class: static},
+		{name: "helper", section: coffText, class: static, text: true},
+		{name: "unused", section: coffText, class: static},
+		{name: "comdat_key", section: coffComdatS, class: ext},
+		{name: "PyList_New", section: coffText, class: ext, text: true, debug: true, pdata: true, addrsig: true},
+		{name: "XML_Parse", section: coffText, class: ext, text: true, addrsig: true},
+		{name: "__real_PyList_New", class: ext, text: true},
+		{name: "absent", class: ext},
+		{name: "malloc", class: ext, text: true},
+		{name: "__imp_free", class: ext, text: true},
+		{name: "__imp_dep", class: ext, text: true},
+		{name: "tentative", class: ext, value: 8},
+		{name: ".weak.opt.default", section: coffText, class: ext},
+		{name: "opt", class: weak, tag: ".weak.opt.default", text: true},
+		{name: "after_weak", section: coffText, class: ext, text: true, addrsig: true},
+	}, directives)
+}
+
+type coffView struct {
+	symbols []string // NAME:CLASS, with E external, S static, W weak external
+	relocs  map[string][]string
+	addrsig []string
+	tags    map[string]string
+}
+
+func readCOFF(t *testing.T, data []byte) coffView {
+	t.Helper()
+	f, err := pe.NewFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := coffView{relocs: map[string][]string{}, tags: map[string]string{}}
+	names := map[uint32]string{}
+	for i := 0; i < len(f.COFFSymbols); i++ {
+		s := f.COFFSymbols[i]
+		name, err := s.FullName(f.StringTable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names[uint32(i)] = name
+		i += int(s.NumberOfAuxSymbols)
+	}
+	for i := 0; i < len(f.COFFSymbols); i++ {
+		s := f.COFFSymbols[i]
+		if s.SectionNumber > 0 && int(s.SectionNumber) <= len(f.Sections) && f.Sections[s.SectionNumber-1].Name == names[uint32(i)] {
+			i += int(s.NumberOfAuxSymbols)
+			continue
+		}
+		v.symbols = append(v.symbols, names[uint32(i)]+":"+map[byte]string{ext: "E", static: "S", weak: "W"}[s.StorageClass])
+		if s.StorageClass == weak {
+			tag := binary.LittleEndian.Uint32(data[le.Uint32(data[8:])+uint32(i+1)*coffSymbolSize:])
+			v.tags[names[uint32(i)]] = names[tag]
+		}
+		i += int(s.NumberOfAuxSymbols)
+	}
+	for _, sec := range f.Sections {
+		for _, r := range sec.Relocs {
+			v.relocs[sec.Name] = append(v.relocs[sec.Name], names[r.SymbolTableIndex])
+		}
+		if sec.Name == ".llvm_addrsig" {
+			b, _ := sec.Data()
+			for len(b) > 0 {
+				x, n := binary.Uvarint(b)
+				b = b[n:]
+				v.addrsig = append(v.addrsig, names[uint32(x)])
+			}
+		}
+	}
+	return v
+}
+
+func TestCOFFWrapAndRename(t *testing.T) {
+	in := coffFixture("")
+	original := bytes.Clone(in)
+	out, n, err := Edit(in, Edits{Wrap: []string{"PyList_New", "malloc", "free"}, Rename: map[string]string{"XML_Parse": "ext_XML_Parse", "dep": "dep2", "helper": "helper2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(in, original) {
+		t.Fatal("input was modified")
+	}
+	v := readCOFF(t, out)
+	want := []string{"@feat.00:S", "helper2:S", "unused:S", "comdat_key:E", "PyList_New:E", "ext_XML_Parse:E", "absent:E", "__wrap_malloc:E", "__imp___wrap_free:E", "__imp_dep2:E", "tentative:E", ".weak.opt.default:E", "opt:W", "after_weak:E", "__wrap_PyList_New:E"}
+	if !reflect.DeepEqual(v.symbols, want) {
+		t.Fatalf("symbols = %q, want %q", v.symbols, want)
+	}
+	if want := []string{"helper2", "__wrap_PyList_New", "ext_XML_Parse", "PyList_New", "__wrap_malloc", "__imp___wrap_free", "__imp_dep2", "opt", "after_weak"}; !reflect.DeepEqual(v.relocs[".text"], want) {
+		t.Fatalf(".text relocs = %q, want %q", v.relocs[".text"], want)
+	}
+	if !reflect.DeepEqual(v.relocs[".debug$S"], []string{"PyList_New"}) || !reflect.DeepEqual(v.relocs[".pdata"], []string{"PyList_New"}) {
+		t.Fatalf("debug/pdata relocs = %q", v.relocs)
+	}
+	// Removing __real_PyList_New renumbered the records after it.
+	if !reflect.DeepEqual(v.addrsig, []string{"PyList_New", "ext_XML_Parse", "after_weak"}) || v.tags["opt"] != ".weak.opt.default" {
+		t.Fatalf("addrsig = %q, tags = %v", v.addrsig, v.tags)
+	}
+	// Five renames and the bound __real_, plus two moved relocations.
+	if n != 8 {
+		t.Fatalf("edited %d, want 8", n)
+	}
+}
+
+func TestCOFFVisibility(t *testing.T) {
+	in := coffFixture("")
+	out, _, err := Edit(in, Edits{Visibility: Visibility{
+		KeepGlobal:    matcher(t, true, "Py*", "after_*"),
+		Globalize:     matcher(t, false, "helper"),
+		StripUnneeded: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := readCOFF(t, out)
+	// Unreferenced statics and imports go; @feat.00, the COMDAT key, the
+	// weak default and the common symbol stay.
+	want := []string{"@feat.00:S", "helper:E", "comdat_key:S", "PyList_New:E", "XML_Parse:S", "__real_PyList_New:E", "malloc:E", "__imp_free:E", "__imp_dep:E", "tentative:E", ".weak.opt.default:E", "opt:W", "after_weak:E"}
+	if !reflect.DeepEqual(v.symbols, want) {
+		t.Fatalf("symbols = %q, want %q", v.symbols, want)
+	}
+	if v.tags["opt"] != ".weak.opt.default" || !reflect.DeepEqual(v.addrsig, []string{"PyList_New", "XML_Parse", "after_weak"}) {
+		t.Fatalf("tags = %v, addrsig = %q", v.tags, v.addrsig)
+	}
+	for _, name := range []string{"comdat_key", "helper", "malloc", ".weak.opt.default"} {
+		_, _, err := Edit(in, Edits{Visibility: Visibility{Strip: matcher(t, false, name)}})
+		if name == ".weak.opt.default" {
+			// Not a C name, so never edited.
+			if err != nil {
+				t.Errorf("strip %s: %v", name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), "not stripping symbol "+name) {
+			t.Errorf("strip %s: %v", name, err)
+		}
+	}
+	if _, _, err := Edit(in, Edits{Visibility: Visibility{Weaken: matcher(t, false, "PyList_New")}}); err == nil || !strings.Contains(err.Error(), "weakening is unsupported") {
+		t.Errorf("weaken: %v", err)
+	}
+	// COFF has no hidden visibility.
+	if _, n, err := Edit(in, Edits{Visibility: Visibility{LocalizeHidden: true}}); err != nil || n != 0 {
+		t.Errorf("localize-hidden = %d, %v", n, err)
+	}
+}
+
+func directives(t *testing.T, data []byte) string {
+	t.Helper()
+	f, err := pe.NewFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := f.Section(".drectve").Data()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestCOFFDirectives(t *testing.T) {
+	in := coffFixture(" /INCLUDE:PyList_New -exclude-symbols:XML_Parse /ALTERNATENAME:malloc=dlmalloc /DEFAULTLIB:msvcrt")
+	for _, tc := range []struct {
+		e    Edits
+		want string
+	}{
+		// Explicit renames follow into directives.
+		{Edits{Rename: map[string]string{"PyList_New": "p_PyList_New", "XML_Parse": "p_XML_Parse", "malloc": "my_malloc"}}, " /INCLUDE:p_PyList_New -exclude-symbols:p_XML_Parse /ALTERNATENAME:my_malloc=dlmalloc /DEFAULTLIB:msvcrt"},
+		// A wrapped name still means the real symbol.
+		{Edits{Wrap: []string{"malloc"}}, " /INCLUDE:PyList_New -exclude-symbols:XML_Parse /ALTERNATENAME:malloc=dlmalloc /DEFAULTLIB:msvcrt"},
+		// Nothing can export a localized symbol, so its exclusion goes.
+		{Edits{Visibility: Visibility{Localize: matcher(t, false, "XML_Parse")}}, " /INCLUDE:PyList_New /ALTERNATENAME:malloc=dlmalloc /DEFAULTLIB:msvcrt"},
+	} {
+		out, _, err := Edit(in, tc.e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := directives(t, out); got != tc.want {
+			t.Errorf("%+v: .drectve = %q, want %q", tc.e, got, tc.want)
+		}
+	}
+	for _, e := range []Edits{
+		{Visibility: Visibility{Localize: matcher(t, false, "PyList_New")}},
+		{Visibility: Visibility{Strip: matcher(t, false, "absent")}, Rename: map[string]string{}},
+	} {
+		in := coffFixture(" /INCLUDE:PyList_New /ALTERNATENAME:absent=XML_Parse")
+		if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), "no longer export") {
+			t.Errorf("%+v: %v", e, err)
+		}
+	}
+}
+
+func TestCOFFArchive(t *testing.T) {
+	user := testCOFF([]testCOFFSymbol{{name: "PyList_New", class: ext, text: true}, {name: "__imp_free", class: ext, text: true}}, "")
+	long := "a-member-name-longer-than-fifteen.obj"
+	in := testArchive(ar.Member{Name: "one.obj", Data: coffFixture("")}, ar.Member{Name: long, Data: user})
+	defined, err := Defined(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"PyList_New", "XML_Parse", "after_weak", "comdat_key", "tentative"}; !reflect.DeepEqual(defined, want) {
+		t.Fatalf("Defined = %q, want %q", defined, want)
+	}
+	out, _, err := Edit(in, Edits{Rename: Prefix(defined, "p_")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, err := ar.Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 5 || members[0].Name != "/" || members[1].Name != "/" || members[2].Name != "//" || members[3].Name != "one.obj" || members[4].Name != long {
+		t.Fatalf("members = %+v", members)
+	}
+	// The second linker member: member offsets, then name-sorted symbols
+	// with 1-based member numbers.
+	second := members[1].Data
+	nm := int(binary.LittleEndian.Uint32(second))
+	if nm != 2 || int(binary.LittleEndian.Uint32(second[4:])) != members[3].Offset || int(binary.LittleEndian.Uint32(second[8:])) != members[4].Offset {
+		t.Fatalf("second linker member offsets: %x", second[:12])
+	}
+	ns := int(binary.LittleEndian.Uint32(second[12:]))
+	strs := strings.Split(strings.TrimRight(string(second[16+2*ns:]), "\x00"), "\x00")
+	if !sort.StringsAreSorted(strs) || len(strs) != ns {
+		t.Fatalf("second linker member names = %q", strs)
+	}
+	got := map[string]uint16{}
+	for i, s := range strs {
+		got[s] = binary.LittleEndian.Uint16(second[16+2*i:])
+	}
+	want := map[string]uint16{"p_PyList_New": 1, "p_XML_Parse": 1, "p_after_weak": 1, "p_comdat_key": 1, "p_tentative": 1, ".weak.opt.default": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("index = %v, want %v", got, want)
+	}
+	v := readCOFF(t, members[4].Data)
+	if !reflect.DeepEqual(v.symbols, []string{"p_PyList_New:E", "__imp_free:E"}) {
+		t.Fatalf("second member symbols = %q", v.symbols)
+	}
+	// Bao's own COFF member selection reads the result.
+	objects, err := internalar.ParseCOFFForMachine(out, coffMachineAMD64)
+	if err != nil || len(objects) != 2 {
+		t.Fatalf("ParseCOFF = %d, %v", len(objects), err)
+	}
+	if _, _, err := Edit(in, Edits{Visibility: Visibility{Localize: matcher(t, false, "PyList_New")}}); err == nil || !strings.Contains(err.Error(), long+" refers to PyList_New") {
+		t.Fatalf("Edit = %v", err)
+	}
+}
+
+func TestCOFFRejects(t *testing.T) {
+	i386 := coffFixture("")
+	binary.LittleEndian.PutUint16(i386, 0x14c)
+	bigobj := []byte{0, 0, 0xff, 0xff, 2, 0, 0x64, 0x86}
+	short := []byte{0, 0, 0xff, 0xff, 0, 0, 0x64, 0x86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	for name, in := range map[string][]byte{"i386": i386, "bigobj": append(bigobj, make([]byte, 60)...), "import": short} {
+		if _, _, err := Edit(in, Edits{Wrap: []string{"malloc"}}); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
