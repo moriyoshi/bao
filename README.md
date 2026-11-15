@@ -1227,6 +1227,12 @@ sections at 4096 bytes, prints a notice and lists them under
 stronger alignment, such as libffi's static trampolines on kernels with pages
 larger than 4 KiB, is unverified under the cap.
 
+Common symbols, which a partial link leaves unallocated, get zero-filled space
+in one `.bss.bao.common` section, with each symbol's size, alignment, binding
+and visibility, as a final link allocates them. They come from assembler
+`.comm` directives, such as OpenSSL's hidden `OPENSSL_ia32cap_P`, or from C
+tentative definitions built with `-fcommon`.
+
 This path targets glibc/AArch64 and one combined native image. Other native TLS
 models, native IFUNC definitions, preinit arrays and static musl are not
 supported. A linked shared object is accepted as described in

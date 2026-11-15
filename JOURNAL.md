@@ -6189,3 +6189,41 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4 (the harness used Go
   step. There, memcpy and pthread_cond_init bind GLIBC_2.17, and the
   unversioned control also passes, as expected on arm64.
   - On linux/amd64 CI the step requires the unversioned control to fail.
+
+## 2026-11-15: Linux common symbols
+
+Problem. pythago reported that the Linux translator rejected SHN_COMMON
+symbols: "unsupported absolute/common/extended symbol OPENSSL_ia32cap_P".
+OpenSSL's x86_64cpuid.s declares `.hidden OPENSSL_ia32cap_P` and
+`.comm OPENSSL_ia32cap_P,40,16`, and the partial link (`ld -r`) leaves
+commons unallocated. lld has no `-d` for `-r`, so pythago defined the array
+in its glue as a workaround.
+
+Change (`linuxelf/translate.go`). `allocateCommons` runs before symbol
+normalization.
+- It lays out every common symbol in one SHT_NOBITS, SHF_ALLOC|SHF_WRITE
+  section, `.bss.bao.common`. Each offset is aligned to the symbol's value,
+  which must be a power of two no larger than 4096, and the section takes the
+  largest alignment.
+- Each symbol becomes an STT_OBJECT definition at its offset and keeps its
+  binding and visibility. This matches how a final link allocates commons in
+  .bss.
+- The rejection now names only absolute and extended-index symbols.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed. `TestCommonSymbolsAllocated`
+  checks the layout (offsets 0, 40 and 64 for alignments 16, 1 and 64; size
+  72; section alignment 64), the kept hidden visibility and binding, and
+  the refusal of a non-power-of-two alignment.
+- `.work/symcommon/run.sh` (log `run1.log`) used a hidden `.comm ...,40,16`
+  in assembly plus a C `-fcommon` tentative definition. readelf showed both
+  as COM.
+  - linux/amd64 used x86_64-linux-gnu-gcc 14.2.0 in bao-cpp-cross:20261108
+    and ran under emulated qemu-x86_64. linux/arm64 used gcc 13.3.0 and ran
+    natively.
+  - Two successive calls returned 173 and 246. That shows zero-initialized
+    storage, 16-byte alignment and persistent state.
+  - `main` refuses both builds with the old error.
+- `bao-verify -suite cpp -target linux/arm64 -cxx g++`, run natively here in
+  bao-cpp-cross:20261108 with Go 1.26.11, passed, including the new
+  `common_symbols` step on `testdata/linux_common.c`.

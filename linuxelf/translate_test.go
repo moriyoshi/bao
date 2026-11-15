@@ -409,3 +409,30 @@ func TestTextAlignmentBeyondGoLinkerLimit(t *testing.T) {
 		t.Fatalf("unsupported cap value accepted: %v", err)
 	}
 }
+
+// OpenSSL's x86_64cpuid.s: `.hidden OPENSSL_ia32cap_P` and
+// `.comm OPENSSL_ia32cap_P,40,16`, which a partial link leaves common.
+func TestCommonSymbolsAllocated(t *testing.T) {
+	text := section{name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 4, size: 8, data: make([]byte, 8), relocs: []reloc{{off: 0, sym: 1, typ: elf.R_AARCH64_ABS64}}}
+	common := func(name string, align, size uint64) symbol {
+		return symbol{name: name, info: byte(elf.STB_GLOBAL)<<4 | byte(elf.STT_OBJECT), other: byte(elf.STV_HIDDEN), sect: uint16(elf.SHN_COMMON), value: align, size: size}
+	}
+	m := &image{sections: []section{{}, text}, symbols: []symbol{{}, common("OPENSSL_ia32cap_P", 16, 40), common("tiny", 1, 3), common("wide", 64, 8)}}
+	if err := normalizeSymbols(m); err != nil {
+		t.Fatal(err)
+	}
+	bss := m.sections[len(m.sections)-1]
+	if bss.typ != elf.SHT_NOBITS || bss.flags != elf.SHF_ALLOC|elf.SHF_WRITE || bss.align != 64 || bss.size != 72 {
+		t.Fatalf("common section = %+v", bss)
+	}
+	for i, want := range []uint64{0, 40, 64} {
+		s := m.symbols[i+1]
+		if s.sect != uint16(len(m.sections)-1) || s.value != want || s.other != byte(elf.STV_HIDDEN) || elf.ST_BIND(s.info) != elf.STB_GLOBAL {
+			t.Errorf("%s = %+v, want offset %d", s.name, s, want)
+		}
+	}
+	m = &image{sections: []section{{}, text}, symbols: []symbol{{}, common("odd", 3, 8)}}
+	if err := normalizeSymbols(m); err == nil {
+		t.Error("common with a non-power-of-two alignment accepted")
+	}
+}
