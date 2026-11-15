@@ -14,26 +14,40 @@ var le = binary.LittleEndian
 const (
 	sectionHeaderSize = 64
 	symbolSize        = 24
-	// shtCREL is LLVM's compressed relocation section type.
-	shtCREL elf.SectionType = 0x40000014
+	// LLVM section types that refer to symbol table indices.
+	shtCREL        elf.SectionType = 0x40000014
+	shtLLVMAddrsig elf.SectionType = 0x6fff4c03
+	shtLLVMCGProf  elf.SectionType = 0x6fff4c09
 )
 
 type elfSection struct {
-	typ          elf.SectionType
-	flags        elf.SectionFlag
-	offset, size uint64
-	link, info   uint32
+	typ                   elf.SectionType
+	flags                 elf.SectionFlag
+	offset, size, entsize uint64
+	link, info            uint32
 }
 
 type elfSymbol struct {
 	name  string
 	info  byte
+	other byte
 	shndx uint16
 }
 
 func (s elfSymbol) global() bool { return elf.ST_BIND(s.info) != elf.STB_LOCAL }
 
 func (s elfSymbol) defined() bool { return elf.SectionIndex(s.shndx) != elf.SHN_UNDEF }
+
+func (s elfSymbol) common() bool { return elf.SectionIndex(s.shndx) == elf.SHN_COMMON }
+
+// mapping reports an ARM, AArch64 or RISC-V mapping symbol such as $x or
+// $d.42, which marks code and data within a section rather than naming it.
+func (s elfSymbol) mapping() bool {
+	if len(s.name) < 2 || s.name[0] != '$' || !strings.ContainsRune("xdat", rune(s.name[1])) {
+		return false
+	}
+	return len(s.name) == 2 || s.name[2] == '.'
+}
 
 // named excludes section and file symbols, whose names are not symbol names.
 func (s elfSymbol) named() bool {
@@ -82,7 +96,7 @@ func parseELF(data []byte) (*elfFile, error) {
 		h := data[f.shoff+uint64(i)*sectionHeaderSize:]
 		s := elfSection{
 			typ: elf.SectionType(le.Uint32(h[4:])), flags: elf.SectionFlag(le.Uint64(h[8:])),
-			offset: le.Uint64(h[24:]), size: le.Uint64(h[32:]),
+			offset: le.Uint64(h[24:]), size: le.Uint64(h[32:]), entsize: le.Uint64(h[56:]),
 			link: le.Uint32(h[40:]), info: le.Uint32(h[44:]),
 		}
 		if i > 0 && s.typ != elf.SHT_NOBITS && (s.offset > uint64(len(data)) || s.size > uint64(len(data))-s.offset) {
@@ -115,7 +129,7 @@ func parseELF(data []byte) (*elfFile, error) {
 		if end < 0 {
 			return nil, fmt.Errorf("ELF symbol %d name is unterminated", i)
 		}
-		f.symbols[i] = elfSymbol{name: string(strtab[name : int(name)+end]), info: e[4], shndx: le.Uint16(e[6:])}
+		f.symbols[i] = elfSymbol{name: string(strtab[name : int(name)+end]), info: e[4], other: e[5], shndx: le.Uint16(e[6:])}
 	}
 	return f, nil
 }
@@ -133,151 +147,4 @@ func (f *elfFile) defined() []string {
 		}
 	}
 	return out
-}
-
-func editELF(data []byte, e Edits) ([]byte, int, error) {
-	f, err := parseELF(data)
-	if err != nil {
-		return nil, 0, err
-	}
-	if e.empty() || f.symtab == 0 {
-		return data, 0, nil
-	}
-	wrapped := map[string]bool{}
-	for _, name := range e.Wrap {
-		wrapped[name] = true
-	}
-	renamed := map[int]string{}
-	// A defined wrapped symbol keeps its definition. References to it move to
-	// a __wrap_ symbol, which is reused when the object already has one.
-	retarget := map[uint32]uint32{}
-	var added []elfSymbol
-	existing := map[string]uint32{}
-	for i, s := range f.symbols {
-		if s.global() && s.named() {
-			if _, ok := existing[s.name]; !ok {
-				existing[s.name] = uint32(i)
-			}
-		}
-	}
-	for i, s := range f.symbols {
-		if i == 0 || !s.named() {
-			continue
-		}
-		switch real, isReal := strings.CutPrefix(s.name, "__real_"); {
-		case s.global() && wrapped[s.name] && !s.defined():
-			renamed[i] = "__wrap_" + s.name
-		case s.global() && wrapped[s.name]:
-			target, ok := existing["__wrap_"+s.name]
-			if !ok {
-				target = uint32(len(f.symbols) + len(added))
-				existing["__wrap_"+s.name] = target
-				// Keep the symbol type so a wrapped function stays a function.
-				added = append(added, elfSymbol{name: "__wrap_" + s.name, info: elf.ST_INFO(elf.STB_GLOBAL, elf.ST_TYPE(s.info))})
-			}
-			retarget[uint32(i)] = target
-		case s.global() && isReal && wrapped[real] && !s.defined():
-			// An undefined NAME beside a defined NAME binds to it when linked.
-			renamed[i] = real
-		default:
-			if to, ok := e.Rename[s.name]; ok && to != s.name {
-				renamed[i] = to
-			}
-		}
-	}
-	retargeted := 0
-	out := bytes.Clone(data)
-	if len(retarget) > 0 {
-		for i, s := range f.sections {
-			if s.typ == shtCREL && int(s.link) == f.symtab {
-				return nil, 0, errors.New("redirecting references in CREL relocations is unsupported; wrap a symbol defined in this object without -Wa,--crel")
-			}
-			if s.typ != elf.SHT_RELA && s.typ != elf.SHT_REL || int(s.link) != f.symtab {
-				continue
-			}
-			// Debug data describes the definition; only runtime references move.
-			if int(s.info) >= len(f.sections) || f.sections[s.info].flags&elf.SHF_ALLOC == 0 {
-				continue
-			}
-			size := uint64(16)
-			if s.typ == elf.SHT_RELA {
-				size = 24
-			}
-			if s.size%size != 0 {
-				return nil, 0, fmt.Errorf("malformed ELF relocation section %d", i)
-			}
-			for off := s.offset; off < s.offset+s.size; off += size {
-				info := le.Uint64(out[off+8:])
-				if target, ok := retarget[uint32(info>>32)]; ok {
-					le.PutUint64(out[off+8:], uint64(target)<<32|info&0xffffffff)
-					retargeted++
-				}
-			}
-		}
-	}
-	if len(renamed) == 0 && retargeted == 0 {
-		return data, 0, nil
-	}
-	if retargeted == 0 {
-		added = nil
-	}
-	// Append new names to a copy of the string table so that existing offsets,
-	// including shared suffixes and section names, keep their meaning.
-	symtab := f.sections[f.symtab]
-	strtab := bytes.Clone(f.section(int(symtab.link)))
-	offsets := map[string]uint32{}
-	intern := func(name string) (uint32, error) {
-		if off, ok := offsets[name]; ok {
-			return off, nil
-		}
-		if uint64(len(strtab))+uint64(len(name)) >= 1<<32 {
-			return 0, errors.New("ELF string table is too large")
-		}
-		off := uint32(len(strtab))
-		strtab = append(append(strtab, name...), 0)
-		offsets[name] = off
-		return off, nil
-	}
-	symbols := bytes.Clone(f.data[symtab.offset : symtab.offset+symtab.size])
-	for i, name := range renamed {
-		off, err := intern(name)
-		if err != nil {
-			return nil, 0, err
-		}
-		le.PutUint32(symbols[i*symbolSize:], off)
-	}
-	for _, s := range added {
-		off, err := intern(s.name)
-		if err != nil {
-			return nil, 0, err
-		}
-		entry := make([]byte, symbolSize)
-		le.PutUint32(entry, off)
-		entry[4] = s.info
-		symbols = append(symbols, entry...)
-	}
-	header := func(i int) []byte { return out[f.shoff+uint64(i)*sectionHeaderSize:] }
-	place := func(i int, content []byte, align int) {
-		for len(out)%align != 0 {
-			out = append(out, 0)
-		}
-		le.PutUint64(header(i)[24:], uint64(len(out)))
-		le.PutUint64(header(i)[32:], uint64(len(content)))
-		out = append(out, content...)
-	}
-	if len(added) == 0 {
-		copy(out[symtab.offset:], symbols)
-	} else {
-		place(f.symtab, symbols, 8)
-		for i, s := range f.sections {
-			if s.typ == elf.SHT_SYMTAB_SHNDX && int(s.link) == f.symtab {
-				// New symbols are undefined, so their extended index is zero.
-				place(i, append(bytes.Clone(f.section(i)), make([]byte, 4*len(added))...), 4)
-			}
-		}
-	}
-	if len(offsets) > 0 {
-		place(int(symtab.link), strtab, 1)
-	}
-	return out, len(renamed) + retargeted, nil
 }

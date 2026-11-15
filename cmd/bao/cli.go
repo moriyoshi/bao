@@ -75,7 +75,7 @@ Commands:
   translate   Translate one already-combined native object (auto-detect target)
   inspect     Inspect a raw Darwin object/archive or Linux ELF object
   bindings    Infer a function signature manifest from full native DWARF
-  objcopy     Rename, wrap or prefix symbols in an ELF object or archive
+  objcopy     Rename, wrap, localize or strip symbols in an ELF object or archive
   doctor      Check the producer toolchain for a target
   verify      Scan downloaded dependency sources without building
   verified-build  Authenticate signed native modules and build with private inputs/cache

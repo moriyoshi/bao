@@ -5468,3 +5468,102 @@ pinned 1.26.11). Bazel was not run.
 Remaining: localize/keep-global/strip (phase 2), Mach-O and COFF (phase 3),
 section edits. Edits apply only at ingest of relocatable inputs, not to a
 linked shared object.
+
+## 2026-11-15: Symbol bindings and stripping (phase 2 of the symbol edits)
+
+Problem: pythago's third request item asks to hide everything except the
+Python C API and its glue entry points, with llvm-objcopy's
+`--localize-symbol`, `--localize-hidden`, `--keep-global-symbol(s)`,
+`--strip-symbol` and `--strip-unneeded`. `--globalize-symbol` and
+`--weaken-symbol` are nice-to-have. The user asked for phase 2 after the
+phase 1 PR (#11) was opened.
+
+Decisions:
+- `symedit.Visibility` follows llvm-objcopy's updateSymbols order:
+  localize, keep-global, globalize, weaken, then removal. Matching uses
+  input names, as phase 1 does. Undefined and common symbols are never
+  localized.
+- Strip semantics:
+  - `-strip-symbol` on a symbol that a relocation or group signature names
+    is an error, as in llvm-objcopy.
+  - `-strip-unneeded` removes unreferenced local and undefined symbols,
+    except section and mapping symbols (`$x`, `$d.N`).
+  - Debug relocations count as references. Debug sections are not removed
+    here, unlike llvm-objcopy's `--strip-unneeded`, because Bao strips debug
+    data after binding inference.
+- `-wildcard` matches with path.Match patterns, and a leading `!` negates,
+  as llvm-objcopy's `--wildcard` does.
+- A binding change across the local/global boundary, or a removal, rebuilds
+  the symbol table, because ELF requires locals before `sh_info`. The rebuild
+  renumbers:
+  - every REL/RELA entry, including debug sections;
+  - SHT_GROUP signatures;
+  - SHT_SYMTAB_SHNDX;
+  - `.llvm_addrsig` ULEB lists (removed symbols are dropped).
+  It rejects CREL, the pre-LLVM-13 call-graph-profile layout that embeds
+  indices, and any other section type linked to the symbol table. Weakening
+  a global only patches the binding in place.
+- Per-member localization breaks archives whose members share hidden
+  symbols. GNU objcopy `--localize-hidden` on such an archive produced
+  ``undefined reference to `ext_hidden'`` at link time.
+  - `bao build` therefore partially links a primary archive on its own (`ld
+    -r --whole-archive`, recorded as `combined_first`) before changing its
+    bindings. Phase 1 edits then run on that object in the same pass; they
+    give the same result as per-member edits.
+  - A searched `-link-archive` cannot be combined without pulling every
+    member. Its members, and any archive given to `bao objcopy`, are edited
+    separately. A member that refers to a definition another member no
+    longer exports is then rejected.
+- In `bao build` the binding flags name their component (`PATH=SYMBOL`,
+  `PATH=FILE`, `PATH`), as `-prefix-symbols` does. Config files gain
+  `wildcard` and `symbol_visibility` (path to options).
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4 (host toolchain). Bazel
+was not run.
+- `go vet ./...` and `go test ./...` passed. New symedit tests use the
+  hand-built objects, now with visibility, unreferenced symbols, a COMDAT
+  group and `.llvm_addrsig`. They check that symbols stay on the correct
+  side of `sh_info` and that references are preserved by name after
+  renumbering. They cover:
+  - localize-hidden with a common symbol left global;
+  - keep-global wildcards with negation, plus globalize, weaken and
+    strip-unneeded;
+  - strip-symbol refusals;
+  - weaken in place;
+  - interplay with rename and wrap;
+  - the archive cross-member error and the index after localization;
+  - matchers and list files.
+  CLI tests cover scoped flag resolution, list files and config mapping.
+- End to end, driver `.work/symvis/e2e.sh` (fixtures in `.work/symvis/src`).
+  Native linux/arm64: GCC 13.3.0, GNU objcopy 2.42. linux/amd64:
+  x86_64-linux-gnu-gcc 14.2.0 and GNU objcopy 2.44 in bao-cpp-cross:20261108,
+  run under qemu-x86_64 10.0.13. The reference is llvm-objcopy as
+  rust-objcopy from Rust 1.98.0 (LLVM 22).
+  - Seven operations on a fixture object produced the same symbol tables as
+    llvm-objcopy on both architectures: localize-hidden; keep-global with
+    wildcards and `!`; strip-unneeded; localize-hidden plus strip-unneeded;
+    weaken plus globalize; strip-symbol; localize-symbol. Compared fields:
+    type, bind, visibility, defined, name. GNU objcopy agreed except that,
+    on arm64, it also drops unreferenced section symbols under
+    strip-unneeded. All three kept the `$x`/`$d` mapping symbols.
+  - Each edited object linked and printed the unedited `3 9 5 5`.
+  - `bao build` with `-wildcard -keep-global-symbol 'libcore.a=api_*'`
+    combined the primary archive first, then localized `vendored_fn` and
+    the hidden `shared_helper`. The result linked against a `-link-archive`
+    vendoring its own `vendored_fn`. A second build used `-localize-hidden`,
+    `-strip-unneeded` and `-localize-symbol` on the same primary.
+  - CGO_ENABLED=0 purego consumers of both packages read 120 and 34
+    natively on arm64 and under qemu on amd64.
+  - 50 checks passed in total, with none failing.
+- Negative controls, both architectures:
+  - A keep-global-localized definition no longer links from another object.
+  - Stripping a referenced symbol is refused.
+  - GNU objcopy's per-member localize-hidden breaks the archive, and
+    `bao objcopy` refuses the same edit.
+  - Without edits, `ld -r` fails with ``multiple definition of
+    `vendored_fn'``.
+  - `-localize-hidden` on the searched link archive is refused, naming
+    `ext.o` and `ext_hidden`.
+
+Remaining: Mach-O and COFF (phase 3) and section edits. `-strip-unneeded`
+keeps debug sections (see above).

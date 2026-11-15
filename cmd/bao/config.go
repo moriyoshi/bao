@@ -35,7 +35,19 @@ type buildConfig struct {
 	RedefineSymbols      []string          `json:"redefine_symbols"`
 	RedefineSymbolFiles  []string          `json:"redefine_symbol_files"`
 	PrefixSymbols        map[string]string `json:"prefix_symbols"`
-	Cargo                *struct {
+	SymbolVisibility     map[string]struct {
+		LocalizeSymbols       []string `json:"localize_symbols"`
+		LocalizeSymbolFiles   []string `json:"localize_symbol_files"`
+		LocalizeHidden        bool     `json:"localize_hidden"`
+		KeepGlobalSymbols     []string `json:"keep_global_symbols"`
+		KeepGlobalSymbolFiles []string `json:"keep_global_symbol_files"`
+		GlobalizeSymbols      []string `json:"globalize_symbols"`
+		WeakenSymbols         []string `json:"weaken_symbols"`
+		StripSymbols          []string `json:"strip_symbols"`
+		StripUnneeded         bool     `json:"strip_unneeded"`
+	} `json:"symbol_visibility"`
+	Wildcard *bool `json:"wildcard"`
+	Cargo    *struct {
 		ManifestPath string `json:"manifest_path"`
 		Package      string `json:"package"`
 		Offline      *bool  `json:"offline"`
@@ -228,6 +240,60 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 				specs = append(specs, resolved+"="+s.PrefixSymbols[p])
 			}
 			return set("prefix-symbols", specs...)
+		},
+		func() error { return setBool("wildcard", s.Wildcard) },
+		func() error {
+			// Each key is an input or link archive path, as for prefix_symbols.
+			paths := make([]string, 0, len(s.SymbolVisibility))
+			for p := range s.SymbolVisibility {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+			values := map[string][]string{}
+			var flags []string
+			add := func(flag, value string) {
+				if _, ok := values[flag]; !ok {
+					flags = append(flags, flag)
+				}
+				values[flag] = append(values[flag], value)
+			}
+			for _, p := range paths {
+				v := s.SymbolVisibility[p]
+				component, err := path(p)
+				if err != nil {
+					return err
+				}
+				for _, list := range []struct {
+					flag  string
+					names []string
+					files bool
+				}{
+					{"localize-symbol", v.LocalizeSymbols, false}, {"localize-symbols", v.LocalizeSymbolFiles, true},
+					{"keep-global-symbol", v.KeepGlobalSymbols, false}, {"keep-global-symbols", v.KeepGlobalSymbolFiles, true},
+					{"globalize-symbol", v.GlobalizeSymbols, false}, {"weaken-symbol", v.WeakenSymbols, false}, {"strip-symbol", v.StripSymbols, false},
+				} {
+					for _, name := range list.names {
+						if list.files {
+							if name, err = path(name); err != nil {
+								return err
+							}
+						}
+						add(list.flag, component+"="+name)
+					}
+				}
+				if v.LocalizeHidden {
+					add("localize-hidden", component)
+				}
+				if v.StripUnneeded {
+					add("strip-unneeded", component)
+				}
+			}
+			for _, flag := range flags {
+				if err := set(flag, values[flag]...); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 	// An explicit input means this run is not building the configured crate.

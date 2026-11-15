@@ -318,7 +318,7 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	fs.Var(&linkNotices, "link-notice", "license/notice file for linked native dependencies; repeatable, retained in the generated package")
 	requireStaticRuntime := fs.Bool("require-static-runtime", false, "reject generated imports of standard shared C++/Rust/unwind runtimes; OS libraries remain permitted")
 	var edits symbolEditFlags
-	edits.register(fs, "PATH=PREFIX: prefix the symbols that the input or -link-archive at PATH defines, and references to them from inputs sharing PREFIX; other references keep their names; repeatable")
+	edits.register(fs, true, "PATH=PREFIX: prefix the symbols that the input or -link-archive at PATH defines, and references to them from inputs sharing PREFIX; other references keep their names; repeatable")
 	if err := parseFlags(fs, args, stdout); err != nil {
 		return err
 	}
@@ -421,7 +421,31 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		components = append(components, editComponent{path, data})
 		linked = append(linked, linkedInput{Path: path, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))})
 	}
-	symbolEdits, err := edits.applyBuild(components, stderr)
+	resolved, err := edits.resolveBuild(components)
+	if err != nil {
+		return err
+	}
+	// A hidden symbol usually binds members of one archive together, so the
+	// primary archive is partially linked on its own before its bindings
+	// change. A -link-archive is searched, so its members are edited
+	// separately and must not lose a definition another member uses.
+	if archive && resolved.changesBindings(0) {
+		fmt.Fprintf(stderr, "Combining the input before changing its symbol bindings\n")
+		unedited := filepath.Join(work, "primary-unedited.a")
+		if err := writeNew(unedited, inputBytes); err != nil {
+			return err
+		}
+		precombined := filepath.Join(work, "primary-combined.o")
+		if err := toolchain.CombineWithArchives(ctx, executor.Run, target, *linker, o.sdk, *minOS, unedited, precombined, nil); err != nil {
+			return err
+		}
+		if components[0].data, err = os.ReadFile(precombined); err != nil {
+			return err
+		}
+		resolved.record.CombinedFirst = true
+		archive, nativeInput = false, filepath.Join(work, "primary.o")
+	}
+	symbolEdits, err := resolved.apply(components, stderr)
 	if err != nil {
 		return err
 	}

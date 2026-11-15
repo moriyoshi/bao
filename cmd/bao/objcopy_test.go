@@ -32,6 +32,28 @@ func TestConfigSymbolEdits(t *testing.T) {
 	}
 }
 
+func TestConfigSymbolVisibility(t *testing.T) {
+	body := `{"schema":1,"wildcard":true,"symbol_visibility":{"libpython.o":{"keep_global_symbols":["Py*"],"keep_global_symbol_files":["api.txt"],
+	"localize_hidden":true,"strip_unneeded":true,"weaken_symbols":["w"]}}}`
+	_, fs, _, err := configFlags(t, "build", body, "-target", "linux/arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := func(name string) string { return fs.Lookup(name).Value.String() }
+	keep := strings.Split(value("keep-global-symbol"), ",")
+	files := value("keep-global-symbols")
+	if value("wildcard") != "true" || len(keep) != 1 || !strings.HasSuffix(keep[0], string(filepath.Separator)+"libpython.o=Py*") || !filepath.IsAbs(keep[0]) {
+		t.Fatalf("wildcard=%q keep-global-symbol=%q", value("wildcard"), keep)
+	}
+	component, file, _ := strings.Cut(files, "=")
+	if filepath.Base(component) != "libpython.o" || !filepath.IsAbs(file) || filepath.Base(file) != "api.txt" {
+		t.Fatalf("keep-global-symbols=%q", files)
+	}
+	if filepath.Base(value("localize-hidden")) != "libpython.o" || filepath.Base(value("strip-unneeded")) != "libpython.o" || !strings.HasSuffix(value("weaken-symbol"), "libpython.o=w") {
+		t.Fatalf("localize-hidden=%q strip-unneeded=%q weaken-symbol=%q", value("localize-hidden"), value("strip-unneeded"), value("weaken-symbol"))
+	}
+}
+
 func TestSymbolEditFlags(t *testing.T) {
 	dir := t.TempDir()
 	renames := filepath.Join(dir, "renames.txt")
@@ -58,7 +80,7 @@ func TestSymbolEditFlags(t *testing.T) {
 	}
 }
 
-func TestPrefixSymbolsMustNameAComponent(t *testing.T) {
+func TestScopedFlagsMustNameAComponent(t *testing.T) {
 	dir := t.TempDir()
 	paths := []string{filepath.Join(dir, "a.a"), filepath.Join(dir, "b.a"), filepath.Join(dir, "other.a")}
 	for _, p := range paths {
@@ -66,26 +88,53 @@ func TestPrefixSymbolsMustNameAComponent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	alias := dir + string(filepath.Separator) + "." + string(filepath.Separator) + "a.a"
 	components := []editComponent{{paths[0], []byte("!<arch>\n")}, {paths[1], []byte("!<arch>\n")}}
 	for _, tc := range []struct {
-		prefixes []string
-		want     string
+		flags symbolEditFlags
+		want  string
 	}{
-		{[]string{paths[2] + "=x_"}, "names neither"},
-		{[]string{paths[0] + "=x_", paths[0] + "=y_"}, "both x_ and y_"},
-		{[]string{paths[0]}, "expected PATH=PREFIX"},
-		{[]string{paths[0] + "="}, "expected PATH=PREFIX"},
+		{symbolEditFlags{prefixes: symbolFlags{paths[2] + "=x_"}}, "names neither"},
+		{symbolEditFlags{prefixes: symbolFlags{paths[0] + "=x_", paths[0] + "=y_"}}, "both x_ and y_"},
+		{symbolEditFlags{prefixes: symbolFlags{paths[0]}}, "expected PATH=PREFIX"},
+		{symbolEditFlags{prefixes: symbolFlags{paths[0] + "="}}, "expected PATH=PREFIX"},
+		{symbolEditFlags{scoped: true, localize: symbolFlags{paths[2] + "=x"}}, "names neither"},
+		{symbolEditFlags{scoped: true, localize: symbolFlags{"x"}}, "expected PATH=VALUE"},
+		{symbolEditFlags{scoped: true, stripUnneeded: symbolFlags{paths[0]}, localize: symbolFlags{alias + "=x"}}, "name the same input"},
+		{symbolEditFlags{scoped: true, wildcard: true, keepGlobal: symbolFlags{paths[0] + "=[Py"}}, "invalid symbol pattern"},
 	} {
-		f := symbolEditFlags{prefixes: tc.prefixes}
-		if _, err := f.applyBuild(components, os.Stderr); err == nil || !strings.Contains(err.Error(), tc.want) || exitCode(err) != 2 {
-			t.Errorf("%q: %v", tc.prefixes, err)
+		if _, err := tc.flags.resolveBuild(components); err == nil || !strings.Contains(err.Error(), tc.want) || exitCode(err) != 2 {
+			t.Errorf("%+v: %v", tc.flags, err)
 		}
 	}
-	// The same file named through another path is the same component.
-	f := symbolEditFlags{prefixes: symbolFlags{filepath.Join(dir, ".", "a.a") + "=x_", paths[1] + "=x_"}}
-	record, err := f.applyBuild(components, os.Stderr)
-	if err != nil || len(record.Prefixes) != 2 {
-		t.Fatalf("%+v %v", record, err)
+	// The same file named through another path is the same component, and
+	// each component gets only its own binding edits.
+	f := symbolEditFlags{scoped: true, prefixes: symbolFlags{alias + "=x_", paths[1] + "=x_"}, localizeHidden: symbolFlags{paths[1]}, keepGlobal: symbolFlags{paths[1] + "=Py_Main"}}
+	b, err := f.resolveBuild(components)
+	if err != nil || len(b.record.Prefixes) != 2 || b.changesBindings(0) || !b.changesBindings(1) {
+		t.Fatalf("%+v %v", b, err)
+	}
+	if v := b.record.Visibility; len(v) != 1 || v[0].Path != paths[1] || !v[0].LocalizeHidden || len(v[0].KeepGlobal) != 1 {
+		t.Fatalf("visibility record %+v", v)
+	}
+}
+
+func TestVisibilitySpecsReadFiles(t *testing.T) {
+	list := filepath.Join(t.TempDir(), "api.txt")
+	if err := os.WriteFile(list, []byte("# exported\nPy_Initialize\nPyRun_SimpleString\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	f := symbolEditFlags{keepGlobalFiles: symbolFlags{list}, keepGlobal: symbolFlags{"pythago_*"}, stripUnneededAll: true, wildcard: true}
+	specs, err := f.visibilitySpecs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("%+v %v", specs, err)
+	}
+	if got := strings.Join(specs[0].KeepGlobal, ","); got != "pythago_*,Py_Initialize,PyRun_SimpleString" || !specs[0].StripUnneeded {
+		t.Fatalf("%+v", specs[0])
+	}
+	v, _ := specs[0].compile(true)
+	if !v.KeepGlobal.Match("pythago_thread_start") || v.KeepGlobal.Match("PyList_New") {
+		t.Fatal("compiled matcher")
 	}
 }
 
