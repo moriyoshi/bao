@@ -927,22 +927,35 @@ func sysrootLibrary(root, name string) string {
 }
 
 // wrapImports renames the shared object's imports of each wrapped symbol to
-// __wrap_SYMBOL, which the relocatable input must define, as ld.lld --wrap
-// redirects a shared object's references. Its GOT and PLT slots then bind
-// to the input's wrapper. The input's __real_SYMBOL, which the build's
-// -wrap renames to SYMBOL, imports the system symbol with the version this
-// shared object requires.
+// __wrap_SYMBOL, which the relocatable input must define. Its GOT and PLT
+// slots then bind to the input's wrapper. A dynamic link could not do
+// this: ld.so resolves a library's imports by name at run time, whatever
+// --wrap did; Bao can because it links the library's image into the
+// package. The input's __real_SYMBOL, which the build's -wrap renames to
+// SYMBOL, imports the system symbol with the version this shared object
+// requires. Only imports move: the library's calls to its own definitions
+// do not. An import of __wrap_SYMBOL that the library already has binds to
+// the same wrapper. A library that defines __wrap_SYMBOL itself is refused,
+// since the input's wrapper and its own would compete for the name.
 func (d *delinked) wrapImports(names []string, input *image) error {
 	if len(names) == 0 {
 		return nil
 	}
-	defined := map[string]bool{}
+	defined, own := map[string]bool{}, map[string]bool{}
 	for _, s := range input.symbols {
 		if s.sect != 0 && elf.ST_BIND(s.info) != elf.STB_LOCAL {
 			defined[s.name] = true
 		}
 	}
+	for _, s := range d.m.symbols {
+		if s.sect != 0 && elf.ST_BIND(s.info) != elf.STB_LOCAL {
+			own[s.name] = true
+		}
+	}
 	for _, name := range names {
+		if own["__wrap_"+name] {
+			return fmt.Errorf("-wrap %s: the shared object itself defines __wrap_%s", name, name)
+		}
 		for i := range d.m.symbols {
 			s := &d.m.symbols[i]
 			if s.sect != 0 || s.name != name || elf.ST_BIND(s.info) == elf.STB_LOCAL {

@@ -6859,3 +6859,27 @@ Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
     `pthread_join#GLIBC_2.34`, the library's requirements.
   - Controls: `main` builds with the same flags but prints `wrapped calls: 0`;
     without `-wrap` the glue's `__real_` references do not resolve.
+
+## 2026-11-16: Correction to -wrap for shared objects
+
+Correction to the entry "-wrap for a Linux shared object's imports". It said
+the behaviour matches "ld.lld --wrap ... for a shared object's references".
+That is wrong. In a dynamic link, `--wrap` cannot redirect a library's own
+calls: ld.so resolves them by name at run time. Bao can because it delinks
+the library and links its image into the package. The README and the code
+comment now say so.
+
+Review question: what if `__wrap_SYMBOL` already exists?
+- The input defines it: the intended case.
+- The library already imports `__wrap_SYMBOL`: after the rename, both imports
+  bind to the input's wrapper. A unit test covers this.
+- The library defines `__wrap_SYMBOL` itself. Before, this was caught only by
+  the merge's duplicate check, and only for a global definition in both. A
+  weak library definition, or none in the input, would have produced two
+  definitions or a misleading "input defines no __wrap_" error.
+  `wrapImports` now refuses it first: "the shared object itself defines
+  __wrap_SYMBOL". Global and weak definitions are both tested.
+
+Verification. `go vet ./linuxelf` and `go test ./linuxelf` passed with the
+extended `TestWrapSharedObjectImports`. The end-to-end run is unaffected,
+since its library defines no wrapper.

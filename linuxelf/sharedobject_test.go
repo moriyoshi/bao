@@ -457,4 +457,23 @@ func TestWrapSharedObjectImports(t *testing.T) {
 	if err := d.wrapImports([]string{"puts"}, empty); err == nil || !strings.Contains(err.Error(), "defines no __wrap_puts") {
 		t.Fatalf("missing wrapper: %v", err)
 	}
+	// An import of __wrap_puts the library already has binds to the same
+	// wrapper.
+	d, _ = delink(soFixture{}.build(), "t_")
+	d.m.symbols = append(d.m.symbols, symbol{name: "__wrap_puts", info: byte(elf.STB_GLOBAL) << 4})
+	if err := d.wrapImports([]string{"puts"}, glue); err != nil {
+		t.Fatal(err)
+	}
+	if got := imported(d); got["puts"] || !got["__wrap_puts"] {
+		t.Fatalf("imports after -wrap: %v", got)
+	}
+	// A library that defines its own __wrap_puts, weak or not, is refused
+	// rather than left to compete with the input's.
+	for _, bind := range []elf.SymBind{elf.STB_GLOBAL, elf.STB_WEAK} {
+		d, _ = delink(soFixture{}.build(), "t_")
+		d.m.symbols = append(d.m.symbols, symbol{name: "__wrap_puts", info: byte(bind)<<4 | byte(elf.STT_FUNC), sect: 1})
+		if err := d.wrapImports([]string{"puts"}, glue); err == nil || !strings.Contains(err.Error(), "the shared object itself defines __wrap_puts") {
+			t.Fatalf("library's own %v wrapper: %v", bind, err)
+		}
+	}
 }
