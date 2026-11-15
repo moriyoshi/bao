@@ -818,7 +818,10 @@ Removing symbols renumbers relocations, weak-external tags and
 - A wrap does not redirect debug sections, `.pdata` or `.xdata`.
 - Calls within one section usually carry no relocation, so a wrap cannot
   redirect them, as with lld-link. Compile with `-ffunction-sections` or
-  `/Gy` to keep them redirectable.
+  `/Gy` to keep them redirectable. GNU as for PE (MinGW GCC) refers to a
+  function defined in the same object through its section even then. Such
+  objects therefore get GNU ld's wrap semantics: only references through
+  the symbol move.
 - `.drectve` directives follow renames from `-redefine-sym` and
   `-prefix-symbols`; a wrap leaves them alone. An `-exclude-symbols` entry
   for a symbol that is no longer exported is dropped. An `/INCLUDE` or

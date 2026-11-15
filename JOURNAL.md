@@ -5798,3 +5798,16 @@ and windows-amd64. The MinGW GCC leg (amd64 only) failed with `wrapped:
 result for those objects. The fixture now marks its wrapped functions
 `__attribute__((noipa))` for GCC only; MSVC rejects the syntax, and clang
 keeps the calls.
+
+CI on c663b37 (#14). The MinGW GCC leg still read `wrapped: 2021003`, so
+the noipa change above was not the cause. A local check found the real one:
+x86_64-w64-mingw32-gcc 14 (Debian `gcc-mingw-w64-x86-64` in a throwaway
+bao-cpp-cross container), with CI's flags plus `-ffunction-sections`, emits
+`IMAGE_REL_AMD64_REL32 .text$target` for calls to `target` from the same
+object (objdump -dr). The calls go through the section symbol, not
+`target`, so neither Bao nor lld-link `-wrap` can redirect them. The step
+now expects `wrapped: 2021003 components: 11012` for the mingw driver: the
+in-object calls stay unwrapped, while strlen and cross-object references are
+wrapped. The other drivers keep 103021003, and the README notes the
+binutils behaviour. The noipa attribute stays, since it keeps GCC from
+folding the calls whatever the relocations are.

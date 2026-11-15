@@ -125,11 +125,19 @@ func (h *harness) windowsSymbolEdits(arch string) {
 	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(windowsSymbolEditsConsumer), 0o644))
 	exe := filepath.Join(h.dst, "symedit.exe")
 	h.run("symedit-build.log", app, h.consumerEnv(map[string]string{"GOOS": "windows", "GOARCH": arch}), h.goTool, "build", "-o", exe, ".")
+	// GNU as for PE emits calls to a function defined in the same object
+	// against its section rather than its symbol, so no symbol edit can
+	// redirect them, as with lld-link -wrap: only the strlen import and
+	// references between objects are wrapped.
+	want := "wrapped: 103021003 components: 11012"
+	if h.windowsDriver == "mingw" {
+		want = "wrapped: 2021003 components: 11012"
+	}
 	out, err := h.command("symedit-run.log", h.root, nil, h.windowsExecute(exe)...)
-	check(err == nil && strings.Contains(string(out), "PASS: symbol edits"), "Windows symbol edit consumer failed: %v\n%s", err, out)
+	check(err == nil && strings.Contains(string(out), want+"\n"), "Windows symbol edit consumer did not print %q: %v\n%s", want, err, out)
 	out, err = h.command("symedit-negative-producer.log", h.root, nil, append(build, "-o", filepath.Join(h.dst, "symedit-negative"), core)...)
 	check(err != nil && strings.Contains(string(out), "duplicate"), "building without prefixes did not fail on duplicate definitions: %v\n%s", err, out)
-	h.results["windows_symbol_edits"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "checks": "lld-style wrap including a call inside the defining object and __real_ bound to it, wrapped UCRT strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard per member; negative control without prefixes fails on duplicate definitions"}
+	h.results["windows_symbol_edits"] = map[string]any{"status": "PASS", "driver": h.windowsDriver, "checks": "lld-style wrap including a call inside the defining object (except with MinGW GCC, whose assembler calls same-object functions through their section) and __real_ bound to it, wrapped UCRT strlen, private prefixes for two archives vendoring the same symbols with identity-renamed entry points, keep-global wildcard per member; negative control without prefixes fails on duplicate definitions"}
 }
 
 const symbolEditsSignatures = `{"schema":1,"abi":"c","functions":[
@@ -141,7 +149,6 @@ const windowsSymbolEditsConsumer = `package main
 
 import (
 	"fmt"
-	"os"
 	"runtime"
 
 	native "bao-windows-symedit/native"
@@ -152,10 +159,5 @@ func main() {
 	wrapped, components := native.Wrapped(), native.Components()
 	native.Shutdown()
 	fmt.Println("wrapped:", wrapped, "components:", components)
-	// 102/1020/1003 once wrapped; each vendored strlen call is wrapped too.
-	if wrapped != 103021003 || components != 11012 {
-		os.Exit(1)
-	}
-	fmt.Println("PASS: symbol edits")
 }
 `
