@@ -147,6 +147,57 @@ func (h *harness) cppLinux() {
 	}
 	h.results["cpp_runtime_libraries"] = string(h.run("cpp-linux-runtime-libraries.log", h.root, nil, container(true, "set -eu\n"+diagnostic)...))
 	h.cppLinuxScalars(arch, compiler, compilerFlags, archiveTool, container)
+	h.cppLinuxSymbolVersions(arch, compiler, compilerFlags, archiveTool, container)
+}
+
+// cppLinuxSymbolVersions checks that imports bind versioned glibc symbols:
+// testdata/linux_symbol_versions.c needs pthread_cond_init's default version,
+// since x86_64's GLIBC_2.2.5 compatibility one, which an unversioned
+// reference binds, rejects a CLOCK_MONOTONIC condattr. The negative control
+// removes the versions from the generated directives; on amd64 it must fail.
+func (h *harness) cppLinuxSymbolVersions(arch, compiler, compilerFlags, archiveTool string, container func(bool, ...string) []string) {
+	flags := strings.Replace(compilerFlags, "-std=c++20", "-std=gnu11 -x c", 1)
+	h.run("symbol-versions-compile.log", h.root, nil, container(false, "set -eu\n"+compiler+" "+flags+" -c /testdata/linux_symbol_versions.c -o /work/symbol-versions.o\n"+archiveTool+" rcs /work/symbol-versions.a /work/symbol-versions.o")...)
+	app := filepath.Join(h.dst, "symbol-versions")
+	require(os.Mkdir(app, 0755))
+	h.run("symbol-versions-producer.log", h.root, nil, container(false, "/work/bao-linux build -target "+h.target+" -sysroot "+cppLinuxSysroot(arch)+" -bindings dwarf -symbol bao_condtest -o /work/symbol-versions/native /work/symbol-versions.a")...)
+	source := filepath.Join(app, "native/symbols_linux_"+arch+".go")
+	directives := map[string]string{}
+	for _, line := range strings.Split(string(read(source)), "\n") {
+		if f := strings.Fields(line); len(f) == 4 && f[0] == "//go:cgo_import_dynamic" {
+			name, version, _ := strings.Cut(f[2], "#")
+			directives[name] = version
+		}
+	}
+	check(directives["pthread_cond_init"] != "" && directives["memcpy"] != "", "imports are not versioned: %v", directives)
+	require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-symbol-versions\ngo 1.26.0\n"), 0644))
+	main := "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\n\t\"bao-symbol-versions/native\"\n)\n\nfunc main() {\n\tr := native.BaoCondtest()\n\tfmt.Println(\"condtest:\", r)\n\tif r != 1 {\n\t\tos.Exit(1)\n\t}\n}\n"
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(main), 0644))
+	cross := h.consumerEnv(map[string]string{"GOOS": "linux", "GOARCH": arch})
+	h.run("symbol-versions-build.log", app, cross, h.goTool, "build", "-o", filepath.Join(h.dst, "symbol-versions-executable"), ".")
+	out := string(h.run("symbol-versions-run.log", h.root, nil, h.cppLinuxExec(arch, "symbol-versions-executable", "1", nil)...))
+	check(strings.Contains(out, "condtest: 1\n"), "versioned imports failed: %s", out)
+	negative := filepath.Join(h.dst, "symbol-versions-negative")
+	copyTree(app, negative)
+	path := filepath.Join(negative, "native/symbols_linux_"+arch+".go")
+	var lines []string
+	for _, line := range strings.Split(string(read(path)), "\n") {
+		if f := strings.Fields(line); len(f) == 4 && f[0] == "//go:cgo_import_dynamic" {
+			line = strings.Join([]string{f[0], f[1], strings.SplitN(f[2], "#", 2)[0], f[3]}, " ")
+		}
+		lines = append(lines, line)
+	}
+	require(os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644))
+	h.run("symbol-versions-negative-build.log", negative, cross, h.goTool, "build", "-o", filepath.Join(h.dst, "symbol-versions-negative-executable"), ".")
+	negOut, negErr := h.command("symbol-versions-negative-run.log", h.root, nil, h.cppLinuxExec(arch, "symbol-versions-negative-executable", "1", nil)...)
+	unversioned := "passes"
+	if negErr != nil || !strings.Contains(string(negOut), "condtest: 1\n") {
+		unversioned = "fails: " + strings.TrimSpace(string(negOut))
+	}
+	if arch == "amd64" {
+		check(strings.HasPrefix(unversioned, "fails"), "unversioned imports unexpectedly passed on amd64: %s", negOut)
+	}
+	h.results["symbol_versions"] = map[string]any{"status": "PASS", "pthread_cond_init": directives["pthread_cond_init"], "memcpy": directives["memcpy"], "imports": len(directives), "unversioned_control": unversioned}
 }
 
 func (h *harness) cppLinuxExec(arch, executable, procs string, extra map[string]string, args ...string) []string {

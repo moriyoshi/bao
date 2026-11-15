@@ -28,8 +28,10 @@ type Import struct {
 	Local   string `json:"go_symbol"`
 	Remote  string `json:"dynamic_symbol"`
 	Library string `json:"library"`
-	// Version is the symbol version a shared-object input requires; fixups
-	// then bind it with dlvsym rather than by name.
+	// Version is the symbol version the import binds: the one a
+	// shared-object input requires, or else its sysroot library's default
+	// one, capped by Options.MaxSymbolVersions. The generated package
+	// records it for the dynamic linker, and fixups bind it with dlvsym.
 	Version string `json:"version,omitempty"`
 }
 
@@ -88,6 +90,9 @@ type Plan struct {
 	Fixups               []Fixup           `json:"pointer_fixups"`
 	WeakZero             []string          `json:"unavailable_weak_symbols"`
 	CappedTextAlignments []CappedAlignment `json:"linux_capped_text_alignments,omitempty"`
+	// ImportsAboveVersionCap lists, as NAME@OLDEST, the imports with no version
+	// at or below their -linux-max-symbol-version cap; they stay unversioned.
+	ImportsAboveVersionCap []string `json:"linux_imports_above_version_cap,omitempty"`
 	SharedObject         *SharedObject     `json:"shared_object,omitempty"`
 	Artifacts            map[string]string `json:"artifact_sha256"`
 	Objects              [][]byte          `json:"-"`
@@ -328,6 +333,10 @@ type Options struct {
 	// relocatable input that may reference its exports. A shared object can
 	// also be the input itself.
 	SharedObject []byte
+	// MaxSymbolVersions caps the symbol version an import binds, one name
+	// per namespace, such as GLIBC_2.17: the glibc the inputs were built
+	// for. Without a cap an import binds its library's default version.
+	MaxSymbolVersions []string
 }
 
 func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
@@ -337,6 +346,10 @@ func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
 func TranslateWithOptions(input []byte, sysroot string, exports []string, opts Options) (*Plan, error) {
 	if opts.MaxTextAlignment != 0 && opts.MaxTextAlignment != MaxSafeTextAlignment {
 		return nil, fmt.Errorf("unsupported Linux maximum text alignment %d; only %d is supported", opts.MaxTextAlignment, MaxSafeTextAlignment)
+	}
+	versionCaps, err := ParseMaxSymbolVersions(opts.MaxSymbolVersions)
+	if err != nil {
+		return nil, err
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256(input))
 	namespace := digest
@@ -349,7 +362,6 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 	ns := "bao_elf_" + namespace[:12] + "_"
 	var main *image
 	var so *delinked
-	var err error
 	switch {
 	case IsSharedObject(input):
 		if opts.SharedObject != nil {
@@ -545,6 +557,9 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 	if err := p.bind(images, index); err != nil {
 		return nil, err
 	}
+	if p.ImportsAboveVersionCap, err = bindVersions(sysroot, p.Imports, versionCaps); err != nil {
+		return nil, err
+	}
 	if so != nil {
 		if err := checkVersions(sysroot, p.Imports, so.info.Versions); err != nil {
 			return nil, err
@@ -554,7 +569,9 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 			versions[v.Name] = v.Version
 		}
 		for i := range p.Imports {
-			p.Imports[i].Version = versions[p.Imports[i].Remote]
+			if v, ok := versions[p.Imports[i].Remote]; ok {
+				p.Imports[i].Version = v
+			}
 		}
 	}
 	for i, m := range images {

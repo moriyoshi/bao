@@ -6129,3 +6129,63 @@ import library.
     the prefix (`p_vendored_alloc` unresolved).
   - Bao binds DLL functions only, so the data-import archive is not used
     here.
+
+## 2026-11-15: Versioned Linux imports
+
+Problem. pythago reported this from a linux/amd64 CPython build.
+- Bao emitted `//go:cgo_import_dynamic LOCAL NAME "libc.so.6"` without a
+  symbol version for imports of relocatable inputs. ld.so binds an
+  unversioned reference to the oldest version, here
+  `pthread_cond_init@GLIBC_2.2.5`, the x86_64 compatibility ABI. That version
+  rejects a CLOCK_MONOTONIC condattr, so CPython aborted in `create_gil`.
+- Init-time pointer fixups bound the same names with `dlsym`, which returns
+  the newest default, so calls and pointers could disagree.
+- arm64 has no compatibility versions and did not show it.
+- Only shared-object inputs recorded versions, from their own verneed.
+
+Decision and change (`linuxelf/versions.go`):
+- After binding, each import gets the default (`@@`) version that its sysroot
+  library defines, as a static linker records one. A shared-object input's own
+  requirements still take precedence.
+- The directive is `NAME#VERSION`. Go's linker splits that at `#` and adds a
+  Vernaux, and fixups use `dlvsym` with the same version.
+- `-linux-max-symbol-version NAME` caps the choice per namespace, for
+  example `GLIBC_2.17` or `GLIBCXX_3.4.19`. It is repeatable and is also
+  `linux.max_symbol_versions` in the config. Under a cap, an import binds the
+  newest version at or below it.
+  - pythago's floor rule, at PBS's `glibc-max-symbol-version` 2.17, ran
+    CPython 3.13 and 3.14t on both architectures.
+- An import with no version at or below the cap stays unversioned. A version
+  requirement would stop the image loading on that glibc even if the import
+  is never used.
+  - A first version recorded the oldest version instead. With the cap at
+    2.17, that made bao's own `__cxa_thread_atexit_impl@GLIBC_2.18` a load
+    requirement.
+  - Such imports are printed and listed under
+    `linux_imports_above_version_cap`.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4 (the harness used Go
+1.26.11). Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestBindVersions` builds an x86_64 shared object with `.gnu.version` and
+    `.gnu.version_d`, and checks defaults, caps of 2.17 and 2.3, an
+    unrelated namespace, unversioned symbols, cap parsing and release order.
+- `.work/symver/run.sh` (log `run4.log`) used `testdata/linux_symbol_versions.c`,
+  which creates a CLOCK_MONOTONIC condition variable and calls memcpy and
+  returns 1 on success.
+  - linux/amd64: gcc 14.2.0 and the glibc 2.41 sysroot of
+    bao-cpp-cross:20261108. The consumer ran under emulated qemu-x86_64
+    10.0.13.
+    - `main`'s unversioned package returned 221: `pthread_cond_init` gave
+      EINVAL (22).
+    - This branch returned 1 with the defaults (`pthread_cond_init#GLIBC_2.3.2`,
+      `memcpy#GLIBC_2.14`, `pthread_condattr_setclock#GLIBC_2.34`). It also
+      returned 1 capped at GLIBC_2.17 (setclock `GLIBC_2.3.3`), where the
+      verneed is GLIBC_2.14, 2.2.5, 2.3.2 and 2.3.3.
+  - Native linux/arm64 (gcc 13.3.0, host glibc 2.39): every variant returned 1.
+    The capped verneed is only GLIBC_2.17.
+- `bao-verify -suite cpp -target linux/arm64 -cxx g++` ran natively here in
+  bao-cpp-cross:20261108 and passed, including the new `symbol_versions`
+  step. There, memcpy and pthread_cond_init bind GLIBC_2.17, and the
+  unversioned control also passes, as expected on arm64.
+  - On linux/amd64 CI the step requires the unversioned control to fail.

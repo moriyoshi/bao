@@ -28,6 +28,8 @@ func translateELF(args []string, stderr io.Writer) error {
 	var systemLibraries symbolFlags
 	fs.Var(&systemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
 	maxTextAlignment := fs.Uint64("linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported")
+	var maxSymbolVersions symbolFlags
+	fs.Var(&maxSymbolVersions, "linux-max-symbol-version", "newest symbol version an import may bind in its namespace, such as GLIBC_2.17; repeatable")
 	sharedObject := fs.String("linux-shared-object", "", "linked PIC shared object to translate with the relocatable input, which may reference its exports")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
@@ -47,7 +49,7 @@ func translateELF(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	opts := linuxelf.Options{SystemLibraries: systemLibraries, MaxTextAlignment: *maxTextAlignment}
+	opts := linuxelf.Options{SystemLibraries: systemLibraries, MaxTextAlignment: *maxTextAlignment, MaxSymbolVersions: maxSymbolVersions}
 	if *sharedObject != "" {
 		if opts.SharedObject, err = os.ReadFile(*sharedObject); err != nil {
 			return err
@@ -85,6 +87,9 @@ func translateELF(args []string, stderr io.Writer) error {
 		}
 	}
 	complete = true
+	if len(p.ImportsAboveVersionCap) != 0 {
+		fmt.Fprintf(stderr, "%d imports have no symbol version at or below -linux-max-symbol-version and stay unversioned, so the target glibc must provide them: %s\n", len(p.ImportsAboveVersionCap), strings.Join(p.ImportsAboveVersionCap, ", "))
+	}
 	if len(p.CappedTextAlignments) != 0 {
 		fmt.Fprintf(stderr, "linked %d executable sections below their requested alignment; see linux_capped_text_alignments in bao-manifest.json\n", len(p.CappedTextAlignments))
 	}
@@ -142,7 +147,12 @@ func linuxSource(p *linuxelf.Plan, pkg string, symbols []string) ([]byte, []byte
 		accessor(fmt.Sprintf("SymbolAddr%d", i), s)
 	}
 	for _, b := range p.Imports {
-		fmt.Fprintf(&goSrc, "\n//go:cgo_import_dynamic %s %s %q\n", b.Local, b.Remote, b.Library)
+		// Go's linker records REMOTE#VERSION as a version requirement.
+		remote := b.Remote
+		if b.Version != "" {
+			remote += "#" + b.Version
+		}
+		fmt.Fprintf(&goSrc, "\n//go:cgo_import_dynamic %s %s %q\n", b.Local, remote, b.Library)
 	}
 	// Go's linker records a library as needed only when code references one
 	// of its symbols. Imports reached only through init-time pointer fixups,
