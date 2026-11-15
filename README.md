@@ -1194,6 +1194,25 @@ sysroot libraries with `-linux-system-library libxcb.so.1` (repeatable). Each
 must exist in the sysroot, and it cannot replace a symbol the standard set
 already exports. The consumer machine must provide the same library.
 
+Each import binds a symbol version, as a static linker records one: the
+default (`@@`) version that the sysroot library defines, such as
+`pthread_cond_init@GLIBC_2.3.2` on x86_64. The generated directive is
+`pthread_cond_init#GLIBC_2.3.2`, which Go's linker records as a version
+requirement. An unversioned reference would bind the oldest version instead.
+On x86_64 that is `GLIBC_2.2.5`, the compatibility ABI, whose
+`pthread_cond_init` rejects a `CLOCK_MONOTONIC` condition attribute.
+
+The default versions set the oldest glibc that can load the result. That is
+the sysroot's own release for symbols whose default changed recently, such as
+`pthread_condattr_setclock@GLIBC_2.34`. To keep the floor that the inputs
+were built for, pass `-linux-max-symbol-version GLIBC_2.17` (repeatable, one
+per namespace such as `GLIBCXX_3.4.19`, or `"max_symbol_versions"` in the
+`linux` config section). Imports then bind the newest version at or below the
+cap. An import with no such version stays unversioned and is printed, and
+`linux_imports_above_version_cap` in bao-manifest.json lists it. The result
+loads on an older glibc, but fails if that import is bound there. bao's own
+TLS runtime needs `__cxa_thread_atexit_impl`, from glibc 2.18.
+
 On every Linux target, an executable section aligned beyond 4096 bytes fails
 translation by default. Stock Go's linker starts `runtime.text` at its 4 KiB
 text address and then rounds the `.text` section up to the larger alignment,
@@ -1757,7 +1776,7 @@ keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `li
 `remove_sections`, `only_sections` and `add_symbols`),
 and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
-`sysroot`, `ld`, `system_libraries`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
+`sysroot`, `ld`, `system_libraries`, `max_symbol_versions`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
 section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.

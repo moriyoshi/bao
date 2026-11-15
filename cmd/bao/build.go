@@ -32,6 +32,7 @@ type nativeFlags struct {
 	windowsImportLibraries            symbolFlags
 	windowsMaxDataAlignment           uint
 	linuxSystemLibraries              symbolFlags
+	linuxMaxSymbolVersions            symbolFlags
 	linuxMaxTextAlignment             uint
 	linuxSharedObject                 string
 	config                            string
@@ -55,6 +56,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.Var(&o.windowsImportLibraries, "windows-import-library", "short-import library naming system DLL functions, such as libuser32.a; repeatable, first match wins, never overrides -windows-import or built-in bindings")
 	fs.UintVar(&o.windowsMaxDataAlignment, "windows-max-data-alignment", 0, "link read-only data requesting more alignment at this value; only 32 is supported, and capped sections are recorded in the manifest")
 	fs.Var(&o.linuxSystemLibraries, "linux-system-library", "additional target shared object in -sysroot, such as libxcb.so.1; repeatable")
+	fs.Var(&o.linuxMaxSymbolVersions, "linux-max-symbol-version", "newest symbol version an import may bind in its namespace, such as GLIBC_2.17 for the glibc the inputs were built for; repeatable, one per namespace; without it, imports bind the sysroot's default versions")
 	fs.UintVar(&o.linuxMaxTextAlignment, "linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported, and capped sections are recorded in the manifest")
 	fs.StringVar(&o.linuxSharedObject, "linux-shared-object", "", "linked PIC shared object to translate with the input, which may reference its exports; a shared object can also be the input itself")
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
@@ -117,6 +119,12 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 	}
 	if len(o.linuxSystemLibraries) > 0 && !strings.HasPrefix(target.Name, "linux/") {
 		return usage("-linux-system-library requires a Linux target")
+	}
+	if len(o.linuxMaxSymbolVersions) > 0 && !strings.HasPrefix(target.Name, "linux/") {
+		return usage("-linux-max-symbol-version requires a Linux target")
+	}
+	if _, err := linuxelf.ParseMaxSymbolVersions(o.linuxMaxSymbolVersions); err != nil {
+		return usage("%v", err)
 	}
 	if o.linuxMaxTextAlignment != 0 && o.linuxMaxTextAlignment != linuxelf.MaxSafeTextAlignment {
 		return usage("-linux-max-text-alignment supports only 4096")
@@ -191,6 +199,9 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 	if strings.HasPrefix(target.Name, "linux/") {
 		for _, name := range o.linuxSystemLibraries {
 			args = append(args, "-linux-system-library", name)
+		}
+		for _, name := range o.linuxMaxSymbolVersions {
+			args = append(args, "-linux-max-symbol-version", name)
 		}
 		if o.linuxMaxTextAlignment != 0 {
 			args = append(args, "-linux-max-text-alignment", strconv.FormatUint(uint64(o.linuxMaxTextAlignment), 10))
