@@ -51,6 +51,10 @@ type machoSection struct {
 	addr, size        uint64
 	flags             uint32
 	reloff, nreloc    uint32
+	// reserved1 is the first indirect symbol entry of a pointer or stub
+	// section and reserved2 a stub's size; header is the header's offset.
+	reserved1, reserved2 uint32
+	header               int
 }
 
 func (s machoSection) name() string { return s.segname + "," + s.sectname }
@@ -63,6 +67,22 @@ func (s machoSection) indirect() bool {
 		return true
 	}
 	return false
+}
+
+// indirectEntries returns how many indirect symbol entries the section
+// owns, from reserved1: one per 8-byte pointer or per reserved2-byte stub.
+func (s machoSection) indirectEntries() (uint64, error) {
+	if !s.indirect() {
+		return 0, nil
+	}
+	width := uint64(8)
+	if s.flags&0xff == 0x8 {
+		width = uint64(s.reserved2)
+	}
+	if width == 0 || s.size%width != 0 {
+		return 0, fmt.Errorf("Mach-O section %s does not divide into indirect entries", s.name())
+	}
+	return s.size / width, nil
 }
 
 type machoSymbol struct {
@@ -142,6 +162,9 @@ type machoFile struct {
 	// ordinals maps a section's input ordinal to its output one, or to 0
 	// for a removed section. It is nil when no section is removed.
 	ordinals []int
+	// droppedIndirect marks the indirect symbol entries of removed
+	// sections; it is nil when none goes.
+	droppedIndirect []bool
 }
 
 func isMachO(data []byte) bool {
@@ -185,6 +208,7 @@ func parseMachO(data []byte) (*machoFile, error) {
 				s := machoSection{
 					sectname: strings.TrimRight(string(h[:16]), "\x00"), segname: strings.TrimRight(string(h[16:32]), "\x00"),
 					addr: le.Uint64(h[32:]), size: le.Uint64(h[40:]), reloff: le.Uint32(h[56:]), nreloc: le.Uint32(h[60:]), flags: le.Uint32(h[64:]),
+					reserved1: le.Uint32(h[68:]), reserved2: le.Uint32(h[72:]), header: off + 72 + 80*j,
 				}
 				if uint64(s.reloff)+8*uint64(s.nreloc) > uint64(len(data)) {
 					return nil, fmt.Errorf("Mach-O section %s,%s relocations are out of range", s.segname, s.sectname)
@@ -329,8 +353,21 @@ func (f *machoFile) sectionOrdinals(e Edits) (int, error) {
 	next, dropped := 1, 0
 	for k, s := range f.sections {
 		if e.RemoveSection.Match(s.name()) || !e.OnlySection.empty() && !e.OnlySection.Match(s.name()) {
-			if s.indirect() && len(f.indirect(f.data)) > 0 {
-				return 0, fmt.Errorf("cannot remove Mach-O section %s, whose entries the indirect symbol table lists", s.name())
+			count, err := s.indirectEntries()
+			if err != nil {
+				return 0, err
+			}
+			if count > 0 {
+				table := uint64(len(f.indirect(f.data)) / 4)
+				if uint64(s.reserved1)+count > table {
+					return 0, fmt.Errorf("Mach-O section %s indirect entries are out of range", s.name())
+				}
+				if f.droppedIndirect == nil {
+					f.droppedIndirect = make([]bool, table)
+				}
+				for i := uint64(0); i < count; i++ {
+					f.droppedIndirect[uint64(s.reserved1)+i] = true
+				}
 			}
 			dropped++
 			continue
@@ -494,6 +531,9 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 	}
 	indirect := f.indirect(out)
 	for i := 0; i+4 <= len(indirect); i += 4 {
+		if f.droppedIndirect != nil && f.droppedIndirect[i/4] {
+			continue
+		}
 		if sym := le.Uint32(indirect[i:]); sym&(indirectLocal|indirectAbs) == 0 {
 			if int(sym) >= n {
 				return objectResult{}, fmt.Errorf("Mach-O indirect symbol %d is out of range", sym)
@@ -547,6 +587,7 @@ func editMachO(data []byte, e Edits) (objectResult, error) {
 	if err := f.dropHints(&out); err != nil {
 		return objectResult{}, err
 	}
+	f.compactIndirect(out)
 	if err := f.rewrite(&out, symbols, removed); err != nil {
 		return objectResult{}, err
 	}
@@ -729,6 +770,32 @@ func (f *machoFile) dropHints(out *[]byte) error {
 		}
 	}
 	return nil
+}
+
+// compactIndirect removes the indirect symbol entries of removed sections
+// in place and moves each kept section's reserved1 down past them. The bytes
+// freed at the end of the table stay unreferenced.
+func (f *machoFile) compactIndirect(out []byte) {
+	if f.droppedIndirect == nil {
+		return
+	}
+	table := f.indirect(out)
+	before := make([]uint32, len(f.droppedIndirect)+1)
+	kept := 0
+	for i, gone := range f.droppedIndirect {
+		before[i] = uint32(i - kept)
+		if !gone {
+			copy(table[4*kept:], table[4*i:4*i+4])
+			kept++
+		}
+	}
+	before[len(f.droppedIndirect)] = uint32(len(f.droppedIndirect) - kept)
+	le.PutUint32(out[f.dysymtab+60:], uint32(kept))
+	for k, s := range f.sections {
+		if f.ordinals[k+1] != 0 && s.indirect() && int(s.reserved1) <= len(f.droppedIndirect) {
+			le.PutUint32(out[s.header+68:], s.reserved1-before[s.reserved1])
+		}
+	}
 }
 
 // compactSections rewrites the segment commands without the headers of

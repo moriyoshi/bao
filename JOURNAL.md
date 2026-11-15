@@ -6428,3 +6428,47 @@ function definition auxiliary record. The default keeps the record and its
 section, code relocations name the weak external, and an undefined symbol
 with an auxiliary record is still refused. Native MinGW GCC results come
 from CI.
+
+## 2026-11-15: Removing Mach-O pointer and stub sections
+
+Problem. Mach-O section removal refused symbol pointer and stub sections
+(types 0x6, 0x7, 0x8, 0x10 and 0x14) whenever the object had indirect
+symbol entries (2026-11-15 Mach-O and COFF section edits entry).
+
+Change (`symedit/macho.go`).
+- Each such section owns `reserved1`'s run of the indirect symbol table:
+  size/8 entries for pointers, or size/`reserved2` for stubs. A stub section
+  without a stub size, or a run past the table, is refused as malformed.
+- Removing the section drops its run in place and updates `nindirectsyms`.
+  Each kept section's `reserved1` moves down by the entries dropped before
+  it.
+- The dropped entries no longer make their symbols referenced, so
+  `-strip-unneeded` can remove those symbols.
+
+Verification. Host: Linux 7.0.0 aarch64, Go 1.27.4. Bazel was not run.
+- `go vet ./...` and `go test ./...` passed.
+  - `TestMachORemoveIndirectSections` uses a pointer run of `_a`, `_b` and a
+    stub run of `_c`, LOCAL.
+    - Removing the pointers leaves `[_c, LOCAL]` with the stubs'
+      `reserved1` at 0, and `-strip-unneeded` drops `_a` and `_b`.
+    - Removing the stubs leaves `[_a, _b]`.
+  - The malformed-stub refusal is tested too.
+- `.work/symind` used a hand-written object (top-level asm in `ptrs.c`) on
+  macOS 26.6.2 x86_64 with Apple clang 17.0.0 and ld-1230.1. It has an
+  unused `__DATA,__unused_ptrs` (`_abort`) before a `__DATA,__kept_ptrs`
+  (`_strlen`) that the code loads through.
+  - Removing `__unused_ptrs` changed the indirect table from `_abort _strlen`
+    to `_strlen`, and `__kept_ptrs` reserved1 from 1 to 0, as read by
+    `otool -Iv` and `otool -l` on both architectures.
+  - Removing `__kept_ptrs` is refused, because the code's section-relative
+    relocation names it.
+  - Linking was not possible for either object, edited or not: ld-1230.1
+    rejects "non-lazy pointers sections no longer supported for 64-bit
+    architectures". Nothing ran.
+- Against llvm-objcopy (rust-objcopy, LLVM 22), log `.work/symind/parity.log`:
+  - Sections and symbols match.
+  - llvm-objcopy keeps the removed section's `_abort` entry and leaves
+    `__kept_ptrs` reserved1 at 1, while Bao compacts the table. Both are
+    valid, because no kept section covers the dropped entries.
+- The practical use is 32-bit Mach-O (a later item), where such sections are
+  normal.

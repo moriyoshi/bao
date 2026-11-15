@@ -503,10 +503,10 @@ func TestMachORemoveSection(t *testing.T) {
 	if _, _, err := Edit(text, Edits{RemoveSection: matcher(t, false, "__TEXT,__text")}); err == nil || !strings.Contains(err.Error(), "names _f, defined in it") {
 		t.Errorf("remove a referenced definition: %v", err)
 	}
-	// Indirect symbol entries belong to their section.
+	// A stub section without a stub size is malformed.
 	stubs := testMachO(nil)
 	binary.LittleEndian.PutUint32(stubs[machoHeader64+72+64:], 0x80000408)
-	if _, _, err := Edit(stubs, Edits{RemoveSection: matcher(t, false, "__TEXT,__text")}); err == nil || !strings.Contains(err.Error(), "indirect symbol table") {
+	if _, _, err := Edit(stubs, Edits{RemoveSection: matcher(t, false, "__TEXT,__text")}); err == nil || !strings.Contains(err.Error(), "does not divide into indirect entries") {
 		t.Errorf("remove stubs: %v", err)
 	}
 }
@@ -581,5 +581,49 @@ func TestMachOAddSymbolAtSymbol(t *testing.T) {
 	}
 	if _, _, err := Edit(in, Edits{AddSymbols: addSymbols(t, "x=@ext:0")}); err == nil || !strings.Contains(err.Error(), "does not define") {
 		t.Errorf("undefined target: %v", err)
+	}
+}
+
+// Pointer and stub sections own runs of the indirect symbol table, from
+// reserved1. Removing one drops its run and moves later runs down.
+func TestMachORemoveIndirectSections(t *testing.T) {
+	in := testMachO([]testNlist{
+		{name: "_a", typ: undef, indirect: true},
+		{name: "_b", typ: undef, indirect: true},
+		{name: "_c", typ: undef, indirect: true},
+	})
+	le := binary.LittleEndian
+	header := func(data []byte, k int) []byte { return data[machoHeader64+72+80*k:] }
+	// __compact_unwind: non-lazy pointers to _a and _b; __debug_info: stubs
+	// of 8 bytes for _c and the local entry.
+	le.PutUint64(header(in, 2)[40:], 16)
+	le.PutUint32(header(in, 2)[64:], 0x6)
+	le.PutUint32(header(in, 2)[68:], 0)
+	le.PutUint64(header(in, 1)[40:], 16)
+	le.PutUint32(header(in, 1)[64:], 0x80000408)
+	le.PutUint32(header(in, 1)[68:], 2)
+	le.PutUint32(header(in, 1)[72:], 8)
+	out, _, err := Edit(in, Edits{RemoveSection: matcher(t, false, "__LD,__compact_unwind"), Visibility: Visibility{StripUnneeded: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := readMachO(t, out)
+	// _a and _b lose their only references and go with -strip-unneeded.
+	if !reflect.DeepEqual(v.ind, []string{"_c", "LOCAL"}) || !reflect.DeepEqual(v.symbols, []string{"_c:G"}) {
+		t.Fatalf("indirect = %q, symbols = %q", v.ind, v.symbols)
+	}
+	if got := le.Uint32(header(out, 1)[68:]); got != 0 {
+		t.Fatalf("stub reserved1 = %d, want 0", got)
+	}
+	// Removing the stubs keeps the pointers' run where it was.
+	out, _, err = Edit(in, Edits{RemoveSection: matcher(t, false, "__DWARF,__debug_info")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := readMachO(t, out); !reflect.DeepEqual(v.ind, []string{"_a", "_b"}) {
+		t.Fatalf("indirect = %q", v.ind)
+	}
+	if got := le.Uint32(header(out, 1)[68:]); got != 0 {
+		t.Fatalf("pointer reserved1 = %d, want 0", got)
 	}
 }
