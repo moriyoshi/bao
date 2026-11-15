@@ -36,12 +36,12 @@ type Edits struct {
 	Visibility
 	// RemoveSection removes matching sections, with their relocations and
 	// the symbols defined in them, as llvm-objcopy --remove-section does.
-	// OnlySection keeps only matching sections, besides the symbol, string
-	// and section name tables. A kept reference to something removed is an
-	// error. Only ELF supports these.
+	// OnlySection keeps only matching sections, besides the ELF symbol,
+	// string and section name tables. A kept reference to something removed
+	// is an error. Mach-O sections are named SEGMENT,SECTION.
 	RemoveSection, OnlySection Matcher
-	// AddSymbols adds symbols, as llvm-objcopy --add-symbol does. Only ELF
-	// supports it.
+	// AddSymbols adds symbols, as llvm-objcopy --add-symbol does. On Mach-O
+	// and COFF an undefined symbol of the name becomes the definition.
 	AddSymbols []AddedSymbol
 }
 
@@ -64,14 +64,16 @@ func ParseAddSymbol(spec string) (AddedSymbol, error) {
 	if !ok || name == "" || strings.IndexByte(name, 0) >= 0 {
 		return a, fmt.Errorf("--add-symbol %q: expected NAME=[SECTION:]VALUE[,FLAGS]", spec)
 	}
-	fields := strings.Split(rest, ",")
-	place := fields[0]
-	if i := strings.LastIndexByte(place, ':'); i >= 0 {
-		a.Section, place = place[:i], place[i+1:]
+	// Neither the value nor the flags contain a colon, while a Mach-O
+	// section name, SEGMENT,SECTION, contains a comma.
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 {
+		a.Section, rest = rest[:i], rest[i+1:]
 		if a.Section == "" {
 			return a, fmt.Errorf("--add-symbol %q: empty section name", spec)
 		}
 	}
+	fields := strings.Split(rest, ",")
+	place := fields[0]
 	value, err := strconv.ParseUint(place, 0, 64)
 	if err != nil {
 		return a, fmt.Errorf("--add-symbol %q: invalid value %q", spec, place)

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -17,6 +18,8 @@ type testNlist struct {
 	typ   byte
 	desc  uint16
 	value uint64
+	// sect is the section of an N_SECT symbol, by default machoText.
+	sect byte
 	// text, debug and unwind list the sections whose relocations name it.
 	text, debug, unwind bool
 	indirect            bool
@@ -33,7 +36,17 @@ const (
 // locals first, as given. Each section's extern ARM64_RELOC_UNSIGNED
 // relocations name the symbols that list it, and the indirect symbol table
 // lists the indirect ones followed by an INDIRECT_SYMBOL_LOCAL entry.
-func testMachO(symbols []testNlist) []byte {
+func testMachO(symbols []testNlist) []byte { return buildMachO(symbols, machoExtra{}) }
+
+// machoExtra adds to a testMachO object: section-relative relocations, by
+// the ordinal of the section they name, and linker optimization hints of
+// one address each.
+type machoExtra struct {
+	local [3][]uint32
+	hints []uint64
+}
+
+func buildMachO(symbols []testNlist, extra machoExtra) []byte {
 	le := binary.LittleEndian
 	strtab := []byte{' ', 0}
 	var table []byte
@@ -49,6 +62,9 @@ func testMachO(symbols []testNlist) []byte {
 		e[4] = s.typ
 		if s.typ&nType == nSect {
 			e[5] = machoText
+			if s.sect != 0 {
+				e[5] = s.sect
+			}
 		}
 		le.PutUint16(e[6:], s.desc)
 		le.PutUint64(e[8:], s.value)
@@ -72,12 +88,32 @@ func testMachO(symbols []testNlist) []byte {
 		}
 	}
 	indirect = le.AppendUint32(indirect, indirectLocal)
+	for j, targets := range extra.local {
+		for _, k := range targets {
+			r := make([]byte, 8)
+			le.PutUint32(r, uint32(len(relocs[j])))
+			le.PutUint32(r[4:], k|3<<25)
+			relocs[j] = append(relocs[j], r...)
+		}
+	}
+	var hints []byte
+	for _, addr := range extra.hints {
+		hints = binary.AppendUvarint(append(hints, 1, 1), addr)
+	}
+	for len(hints)%8 != 0 {
+		hints = append(hints, 0)
+	}
+	ncmds := 3
 	for len(strtab)%8 != 0 {
 		strtab = append(strtab, 0)
 	}
 	names := [3][2]string{{"__text", "__TEXT"}, {"__debug_info", "__DWARF"}, {"__compact_unwind", "__LD"}}
 	flags := [3]uint32{0x80000400, sAttrDebug, 0x02000000 &^ sAttrDebug}
 	sizeofcmds := 72 + 3*80 + 24 + 80
+	if len(hints) > 0 {
+		ncmds++
+		sizeofcmds += 16
+	}
 	contents := machoHeader64 + sizeofcmds
 	data := make([]byte, contents)
 	// 64 bytes of section contents, then relocations, symbols and strings.
@@ -94,10 +130,12 @@ func testMachO(symbols []testNlist) []byte {
 	data = append(data, table...)
 	stroff := len(data)
 	data = append(data, strtab...)
+	hintoff := len(data)
+	data = append(data, hints...)
 	le.PutUint32(data, machoMagic64)
 	le.PutUint32(data[4:], 0x0100000c) // CPU_TYPE_ARM64
 	le.PutUint32(data[12:], mhObject)
-	le.PutUint32(data[16:], 3)
+	le.PutUint32(data[16:], uint32(ncmds))
 	le.PutUint32(data[20:], uint32(sizeofcmds))
 	le.PutUint32(data[24:], 0x2000) // MH_SUBSECTIONS_VIA_SYMBOLS
 	c := data[machoHeader64:]
@@ -137,6 +175,13 @@ func testMachO(symbols []testNlist) []byte {
 	le.PutUint32(c[28:], uint32(len(symbols)-locals-defs))
 	le.PutUint32(c[56:], uint32(indoff))
 	le.PutUint32(c[60:], uint32(len(indirect)/4))
+	if len(hints) > 0 {
+		c = c[80:]
+		le.PutUint32(c, lcLinkerHints)
+		le.PutUint32(c[4:], 16)
+		le.PutUint32(c[8:], uint32(hintoff))
+		le.PutUint32(c[12:], uint32(len(hints)))
+	}
 	return data
 }
 
@@ -349,5 +394,166 @@ func TestMachORejects(t *testing.T) {
 	}
 	if _, _, err := Edit(testArchive(ar.Member{Name: "a.o", Data: machoFixture()}, ar.Member{Name: "b.o", Data: fixture()}), Edits{Wrap: []string{"malloc"}}); err == nil || !strings.Contains(err.Error(), "mixes") {
 		t.Errorf("mixed archive: %v", err)
+	}
+}
+
+// machoSectionFixture has a symbol in each section, section-relative
+// relocations from __text to __compact_unwind and back, and an optimization
+// hint in each section.
+func machoSectionFixture() []byte {
+	return buildMachO([]testNlist{
+		{name: "ltmp0", typ: local, text: true},
+		{name: "ltmp1", typ: local, sect: machoDebug},
+		{name: "ltmp2", typ: local, sect: machoUnwind},
+		{name: "_f", typ: global, text: true, unwind: true},
+		{name: "_g", typ: global, debug: true},
+		{name: "_absent", typ: undef},
+		{name: "_ext", typ: undef, text: true},
+	}, machoExtra{local: [3][]uint32{{machoUnwind}, nil, {machoText}}, hints: []uint64{0x10, 0x50, 0x90}})
+}
+
+type machoLayout struct {
+	sections []string
+	symbols  []string // NAME:SECTION:VALUE, with ABS and UNDEF for others
+	local    map[string][]uint32
+	hints    []uint64
+}
+
+func readMachOLayout(t *testing.T, data []byte) machoLayout {
+	t.Helper()
+	readMachO(t, data)
+	f, err := macho.NewFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := machoLayout{local: map[string][]uint32{}}
+	for _, s := range f.Sections {
+		l.sections = append(l.sections, s.Seg+","+s.Name)
+		for _, r := range s.Relocs {
+			if !r.Extern {
+				l.local[s.Name] = append(l.local[s.Name], r.Value)
+			}
+		}
+	}
+	for _, s := range f.Symtab.Syms {
+		where := "UNDEF"
+		switch s.Type & nType {
+		case nAbs:
+			where = "ABS"
+		case nSect:
+			where = f.Sections[s.Sect-1].Name
+		}
+		l.symbols = append(l.symbols, s.Name+":"+where+":"+strconv.FormatUint(s.Value, 10))
+	}
+	for _, c := range f.Loads {
+		raw := c.Raw()
+		if binary.LittleEndian.Uint32(raw) != lcLinkerHints {
+			continue
+		}
+		off, size := binary.LittleEndian.Uint32(raw[8:]), binary.LittleEndian.Uint32(raw[12:])
+		for b := data[off : off+size]; len(b) > 0 && b[0] != 0; {
+			b = b[2:]
+			addr, n := binary.Uvarint(b)
+			l.hints = append(l.hints, addr)
+			b = b[n:]
+		}
+	}
+	return l
+}
+
+func TestMachORemoveSection(t *testing.T) {
+	in := machoSectionFixture()
+	out, n, err := Edit(in, Edits{RemoveSection: matcher(t, true, "__DWARF,*")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := readMachOLayout(t, out)
+	if want := []string{"__TEXT,__text", "__LD,__compact_unwind"}; !reflect.DeepEqual(l.sections, want) {
+		t.Fatalf("sections = %q, want %q", l.sections, want)
+	}
+	// The symbol in the removed section goes; the one after it is renumbered.
+	want := []string{"ltmp0:__text:0", "ltmp2:__compact_unwind:0", "_f:__text:0", "_g:__text:0", "_absent:UNDEF:0", "_ext:UNDEF:0"}
+	if !reflect.DeepEqual(l.symbols, want) {
+		t.Fatalf("symbols = %q, want %q", l.symbols, want)
+	}
+	if want := map[string][]uint32{"__text": {2}, "__compact_unwind": {1}}; !reflect.DeepEqual(l.local, want) {
+		t.Fatalf("section relocations = %v, want %v", l.local, want)
+	}
+	if want := []uint64{0x10, 0x90}; !reflect.DeepEqual(l.hints, want) {
+		t.Fatalf("hints = %#x, want %#x", l.hints, want)
+	}
+	// One section and the symbol defined in it.
+	if n != 2 {
+		t.Fatalf("edited %d, want 2", n)
+	}
+	only, _, err := Edit(in, Edits{OnlySection: matcher(t, false, "__TEXT,__text", "__LD,__compact_unwind")})
+	if err != nil || !bytes.Equal(only, out) {
+		t.Fatalf("-only-section differs from removing the rest: %v", err)
+	}
+	for name, want := range map[string]string{
+		"__TEXT,__text":         "cannot remove Mach-O section __TEXT,__text: a kept relocation in __LD,__compact_unwind refers to it",
+		"__LD,__compact_unwind": "cannot remove Mach-O section __LD,__compact_unwind: a kept relocation in __TEXT,__text refers to it",
+	} {
+		if _, _, err := Edit(in, Edits{RemoveSection: matcher(t, false, name)}); err == nil || err.Error() != want {
+			t.Errorf("remove %s: %v", name, err)
+		}
+	}
+	// A symbol a kept relocation names cannot go with its section.
+	text := testMachO([]testNlist{{name: "_f", typ: global, debug: true}})
+	if _, _, err := Edit(text, Edits{RemoveSection: matcher(t, false, "__TEXT,__text")}); err == nil || !strings.Contains(err.Error(), "names _f, defined in it") {
+		t.Errorf("remove a referenced definition: %v", err)
+	}
+	// Indirect symbol entries belong to their section.
+	stubs := testMachO(nil)
+	binary.LittleEndian.PutUint32(stubs[machoHeader64+72+64:], 0x80000408)
+	if _, _, err := Edit(stubs, Edits{RemoveSection: matcher(t, false, "__TEXT,__text")}); err == nil || !strings.Contains(err.Error(), "indirect symbol table") {
+		t.Errorf("remove stubs: %v", err)
+	}
+}
+
+func TestMachOAddSymbol(t *testing.T) {
+	in := machoSectionFixture()
+	add := func(specs ...string) Edits {
+		var e Edits
+		for _, spec := range specs {
+			a, err := ParseAddSymbol(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.AddSymbols = append(e.AddSymbols, a)
+		}
+		return e
+	}
+	out, n, err := Edit(in, add("alias=__LD,__compact_unwind:8,function", "absent=__TEXT,__text:4,hidden", "abs=0x40,local", "soft=__TEXT,__text:0,weak"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Values are section offsets, so the alias is at __compact_unwind's
+	// address plus 8. The undefined _absent becomes the definition.
+	l := readMachOLayout(t, out)
+	want := []string{"ltmp0:__text:0", "ltmp1:__debug_info:0", "ltmp2:__compact_unwind:0", "_abs:ABS:64", "_absent:__text:4", "_alias:__compact_unwind:136", "_f:__text:0", "_g:__text:0", "_soft:__text:0", "_ext:UNDEF:0"}
+	if !reflect.DeepEqual(l.symbols, want) || n != 4 {
+		t.Fatalf("symbols = %q (%d edits), want %q", l.symbols, n, want)
+	}
+	v := readMachO(t, out)
+	if want := []string{"ltmp0:L", "ltmp1:L", "ltmp2:L", "_abs:L", "_absent:H", "_alias:G", "_f:G", "_g:G", "_soft:W", "_ext:G"}; !reflect.DeepEqual(v.symbols, want) {
+		t.Fatalf("bindings = %q, want %q", v.symbols, want)
+	}
+	for spec, want := range map[string]string{
+		"f=__TEXT,__text:0":              "already defined",
+		"x=__text:0":                     "missing Mach-O section __text",
+		"x=__TEXT,__text:0,protected":    "no protected visibility",
+		"x=__DWARF,__debug_info:0,local": "missing Mach-O section",
+	} {
+		e := add(spec)
+		e.RemoveSection = matcher(t, false, "__DWARF,__debug_info")
+		if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", spec, err)
+		}
+	}
+	// Each archive member has the section, so each would define the symbol.
+	archive := testArchive(ar.Member{Name: "a.o", Data: in}, ar.Member{Name: "b.o", Data: testMachO(nil)})
+	if _, _, err := Edit(archive, add("alias=__TEXT,__text:0")); err == nil || !strings.Contains(err.Error(), "both archive member a.o and b.o") {
+		t.Errorf("archive: %v", err)
 	}
 }

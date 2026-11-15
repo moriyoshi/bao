@@ -181,18 +181,12 @@ func TestParseAddSymbol(t *testing.T) {
 	if err != nil || a != (AddedSymbol{Name: "x", Section: ".data.rel.ro", Value: 16, Bind: elf.STB_GLOBAL, Type: elf.STT_NOTYPE}) {
 		t.Fatalf("%+v %v", a, err)
 	}
+	if a, err := ParseAddSymbol("y=__DATA,__data:8,weak"); err != nil || a.Section != "__DATA,__data" || a.Value != 8 || a.Bind != elf.STB_WEAK {
+		t.Fatalf("%+v %v", a, err)
+	}
 	for _, bad := range []string{"x", "=1", "x=.text:", "x=:1", "x=1,bogus", "x=.text:zz"} {
 		if _, err := ParseAddSymbol(bad); err == nil {
 			t.Errorf("ParseAddSymbol(%q) succeeded", bad)
-		}
-	}
-}
-
-func TestSectionEditsOnlyELF(t *testing.T) {
-	e := Edits{RemoveSection: matcher(t, false, ".comment")}
-	for name, in := range map[string][]byte{"Mach-O": machoFixture(), "COFF": coffFixture("")} {
-		if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), "supported only for ELF") {
-			t.Errorf("%s: %v", name, err)
 		}
 	}
 }

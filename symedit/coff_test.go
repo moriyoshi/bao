@@ -35,15 +35,16 @@ const (
 	coffDrectve = 4
 	coffAddrsig = 5
 	coffComdatS = 6
+	coffAssocS  = 7
 )
 
 // testCOFF builds an amd64 COFF object: a section definition symbol with one
 // auxiliary record for each section, then the given symbols. .text$c is a
-// COMDAT section.
+// COMDAT section, and .pdata$c is associated with it.
 func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 	le := binary.LittleEndian
-	names := []string{".text", ".debug$S", ".pdata", ".drectve", ".llvm_addrsig", ".text$c"}
-	flags := []uint32{0x60000020, 0x42100040, 0x40300040, 0x00100a00, 0x00100800, 0x60001020}
+	names := []string{".text", ".debug$S", ".pdata", ".drectve", ".llvm_addrsig", ".text$c", ".pdata$c"}
+	flags := []uint32{0x60000020, 0x42100040, 0x40300040, 0x00100a00, 0x00100800, 0x60001020, 0x40301040}
 	strtab := []byte{0, 0, 0, 0}
 	name := func(entry []byte, s string) {
 		if len(s) <= 8 {
@@ -74,8 +75,12 @@ func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 		e[16], e[17] = coffClassStatic, 1
 		record(e)
 		aux := make([]byte, coffSymbolSize)
-		if i+1 == coffComdatS {
+		switch i + 1 {
+		case coffComdatS:
 			aux[14] = 2 // IMAGE_COMDAT_SELECT_ANY
+		case coffAssocS:
+			le.PutUint16(aux[12:], coffComdatS)
+			aux[14] = coffSelectAssociative
 		}
 		record(aux)
 	}
@@ -109,7 +114,7 @@ func testCOFF(symbols []testCOFFSymbol, directives string) []byte {
 		}
 	}
 	le.PutUint32(strtab, uint32(len(strtab)))
-	contents := [][]byte{make([]byte, 16), make([]byte, 16), make([]byte, 16), []byte(directives), addrsig, make([]byte, 16)}
+	contents := [][]byte{make([]byte, 16), make([]byte, 16), make([]byte, 16), []byte(directives), addrsig, make([]byte, 16), make([]byte, 16)}
 	out := make([]byte, coffFileHeader+len(names)*coffSectionHeader)
 	for i := range names {
 		h := out[coffFileHeader+i*coffSectionHeader:]
@@ -399,6 +404,144 @@ func TestCOFFRejects(t *testing.T) {
 	for name, in := range map[string][]byte{"i386": i386, "bigobj": append(bigobj, make([]byte, 60)...), "import": short} {
 		if _, _, err := Edit(in, Edits{Wrap: []string{"malloc"}}); err == nil {
 			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+type coffLayout struct {
+	sections []string
+	symbols  []string // NAME:SECTION:VALUE:TYPE, with ABS and UNDEF for others
+	assoc    string   // the section .pdata$c is associated with
+}
+
+func readCOFFLayout(t *testing.T, data []byte) coffLayout {
+	t.Helper()
+	readCOFF(t, data)
+	f, err := pe.NewFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var l coffLayout
+	for _, s := range f.Sections {
+		l.sections = append(l.sections, s.Name)
+	}
+	symoff := binary.LittleEndian.Uint32(data[8:])
+	for i := 0; i < len(f.COFFSymbols); i++ {
+		s := f.COFFSymbols[i]
+		name, _ := s.FullName(f.StringTable)
+		where := "UNDEF"
+		switch {
+		case s.SectionNumber == -1:
+			where = "ABS"
+		case s.SectionNumber > 0:
+			where = f.Sections[s.SectionNumber-1].Name
+		}
+		if where == name {
+			if name == ".pdata$c" {
+				aux := data[symoff+uint32(i+1)*coffSymbolSize:]
+				l.assoc = f.Sections[binary.LittleEndian.Uint16(aux[12:])-1].Name
+			}
+		} else {
+			l.symbols = append(l.symbols, name+":"+where+":"+strconv.Itoa(int(s.Value))+":"+strconv.Itoa(int(s.Type)))
+		}
+		i += int(s.NumberOfAuxSymbols)
+	}
+	return l
+}
+
+func TestCOFFRemoveSection(t *testing.T) {
+	in := coffFixture("")
+	before := readCOFFLayout(t, in)
+	out, n, err := Edit(in, Edits{RemoveSection: matcher(t, true, ".debug$*")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := readCOFFLayout(t, out)
+	if want := []string{".text", ".pdata", ".drectve", ".llvm_addrsig", ".text$c", ".pdata$c"}; !reflect.DeepEqual(l.sections, want) {
+		t.Fatalf("sections = %q, want %q", l.sections, want)
+	}
+	// Symbols keep their sections, now renumbered, and the associative
+	// section still follows .text$c. The section and its definition symbol
+	// count as edits.
+	if !reflect.DeepEqual(l.symbols, before.symbols) || l.assoc != ".text$c" || n != 2 {
+		t.Fatalf("symbols = %q, associated with %s, %d edits; want %q", l.symbols, l.assoc, n, before.symbols)
+	}
+	if v := readCOFF(t, out); len(v.relocs[".text"]) != len(readCOFF(t, in).relocs[".text"]) {
+		t.Fatalf("relocations = %v", v.relocs)
+	}
+	// An associative section goes with its COMDAT section.
+	out, _, err = Edit(in, Edits{RemoveSection: matcher(t, false, ".text$c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l = readCOFFLayout(t, out)
+	if want := []string{".text", ".debug$S", ".pdata", ".drectve", ".llvm_addrsig"}; !reflect.DeepEqual(l.sections, want) {
+		t.Fatalf("sections = %q, want %q", l.sections, want)
+	}
+	for _, s := range l.symbols {
+		if strings.HasPrefix(s, "comdat_key:") {
+			t.Fatalf("comdat_key was kept: %q", l.symbols)
+		}
+	}
+	only, _, err := Edit(in, Edits{OnlySection: matcher(t, false, ".text", ".pdata")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := readCOFFLayout(t, only); !reflect.DeepEqual(l.sections, []string{".text", ".pdata"}) || len(l.symbols) != len(before.symbols)-1 {
+		t.Fatalf("-only-section: %q %q", l.sections, l.symbols)
+	}
+	// .pdata names PyList_New, which is defined in .text.
+	if _, _, err := Edit(in, Edits{RemoveSection: matcher(t, false, ".text")}); err == nil || !strings.Contains(err.Error(), "cannot remove COFF section .text: a kept relocation, COMDAT section or weak external names PyList_New, defined in it") {
+		t.Errorf("remove .text: %v", err)
+	}
+}
+
+func TestCOFFAddSymbol(t *testing.T) {
+	in := coffFixture("")
+	add := func(specs ...string) Edits {
+		var e Edits
+		for _, spec := range specs {
+			a, err := ParseAddSymbol(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.AddSymbols = append(e.AddSymbols, a)
+		}
+		return e
+	}
+	before := readCOFFLayout(t, in)
+	out, n, err := Edit(in, add("alias=.text:4,function", "absent=.text$c:0", "abs=0x40,local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := readCOFFLayout(t, out)
+	// The undefined absent becomes the definition; the others follow.
+	var want []string
+	for _, s := range before.symbols {
+		if strings.HasPrefix(s, "absent:") {
+			s = "absent:.text$c:0:0"
+		}
+		want = append(want, s)
+	}
+	want = append(want, "alias:.text:4:32", "abs:ABS:64:0")
+	if !reflect.DeepEqual(l.symbols, want) || n != 3 {
+		t.Fatalf("symbols = %q (%d edits), want %q", l.symbols, n, want)
+	}
+	if v := readCOFF(t, out); v.symbols[len(v.symbols)-1] != "abs:S" || v.symbols[len(v.symbols)-2] != "alias:E" {
+		t.Fatalf("classes = %q", v.symbols)
+	}
+	for spec, want := range map[string]string{
+		"PyList_New=.text:0":  "already defined",
+		"x=.nosuch:0":         "missing COFF section .nosuch",
+		"x=.text:0,weak":      "need a default definition",
+		"x=.text:0,hidden":    "COFF has none",
+		"x=.debug$S:0":        "missing COFF section .debug$S",
+		"x=0x100000000,local": "32 bits",
+	} {
+		e := add(spec)
+		e.RemoveSection = matcher(t, false, ".debug$S")
+		if _, _, err := Edit(in, e); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", spec, err)
 		}
 	}
 }

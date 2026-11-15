@@ -63,6 +63,7 @@ func editArchive(data []byte, e Edits) ([]byte, int, error) {
 	}
 	total := 0
 	hiddenBy := map[string]int{}
+	addedBy := map[string]int{}
 	for i, m := range members {
 		r, err := editObject(m.Data, e)
 		if err != nil {
@@ -72,6 +73,13 @@ func editArchive(data []byte, e Edits) ([]byte, int, error) {
 		total += r.edited
 		for _, name := range r.hidden {
 			hiddenBy[name] = i
+		}
+		// An added symbol goes into each member that has its section.
+		for _, name := range r.added {
+			if j, ok := addedBy[name]; ok {
+				return nil, 0, fmt.Errorf("-add-symbol %s would be defined by both archive member %s and %s; partially link the archive into one object first", name, members[j].Name, m.Name)
+			}
+			addedBy[name] = i
 		}
 	}
 	if total == 0 {

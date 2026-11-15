@@ -16,6 +16,8 @@ type objectResult struct {
 	// hidden lists the global definitions, by output name, that the edit made
 	// local or removed. Other objects can no longer bind to them.
 	hidden []string
+	// added lists the global and weak symbols that -add-symbol defined.
+	added []string
 }
 
 const removedIndex = ^uint32(0)
@@ -96,6 +98,7 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 	}
 	// Symbols that -add-symbol adds follow those a wrap adds.
 	var userAdded []elfSymbol
+	var addedNames []string
 	for _, a := range e.AddSymbols {
 		if at, ok := existing[a.Name]; ok && f.symbols[at].defined() {
 			return objectResult{}, fmt.Errorf("cannot add symbol %s, which is already defined", a.Name)
@@ -118,6 +121,9 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 			shndx = uint16(found)
 		}
 		userAdded = append(userAdded, elfSymbol{name: a.Name, info: elf.ST_INFO(a.Bind, a.Type), other: byte(a.Visibility), shndx: shndx, value: a.Value})
+		if a.Bind != elf.STB_LOCAL {
+			addedNames = append(addedNames, a.Name)
+		}
 	}
 	var crel bool
 	for i, s := range f.sections {
@@ -317,7 +323,7 @@ func editELF(data []byte, e Edits) (objectResult, error) {
 			return objectResult{}, err
 		}
 	}
-	return objectResult{data: out, edited: edited, hidden: hidden}, nil
+	return objectResult{data: out, edited: edited, hidden: hidden, added: addedNames}, nil
 }
 
 // reorder writes a symbol table whose local symbols precede the others, as
