@@ -1233,6 +1233,12 @@ and visibility, as a final link allocates them. They come from assembler
 `.comm` directives, such as OpenSSL's hidden `OPENSSL_ia32cap_P`, or from C
 tentative definitions built with `-fcommon`.
 
+A weak reference that no library defines reads as NULL. On amd64 that covers
+loads, calls and comparisons through its GOT slot, including
+`cmpq $0, sym@GOTPCREL(%rip)`, whose immediate after the displacement biases
+the relocation by -5, as in zstd's optional trace hooks. Other uses are
+refused with the symbol, section and offset.
+
 This path targets glibc/AArch64 and one combined native image. Other native TLS
 models, native IFUNC definitions, preinit arrays and static musl are not
 supported. A linked shared object is accepted as described in

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"debug/elf"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -218,8 +219,27 @@ func TestAMD64StrongImportOverridesOtherImageWeak(t *testing.T) {
 	for _, add := range []int64{0, 1, -3} {
 		m := &image{machine: elf.EM_X86_64, sections: []section{{}, {name: ".text", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 16, size: 7, data: []byte{0x48, 0x8b, 0x05, 0, 0, 0, 0}, relocs: []reloc{{off: 3, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_GOTPCREL), add: add}}}}, symbols: []symbol{{}, {name: "optional", info: byte(elf.STB_WEAK) << 4}}}
 		if err := (&Plan{}).bindAMD64([]*image{m}, nil); err == nil {
-			t.Fatalf("missing weak GOT addend %d accepted; only the -4 RIP bias is modeled", add)
+			t.Fatalf("missing weak GOT addend %d accepted; only RIP biases of -4 to -8 are modeled", add)
 		}
+	}
+	// zstd's `if (ZSTD_trace_compress_begin)`: cmpq $0, sym@GOTPCREL(%rip),
+	// whose imm8 follows the displacement. It reads the NULL cell, with the
+	// same bias.
+	for _, add := range []int64{-5, -8} {
+		m := &image{machine: elf.EM_X86_64, sections: []section{{}, {name: ".text.f", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 16, size: 8, data: []byte{0x48, 0x83, 0x3d, 0, 0, 0, 0, 0}, relocs: []reloc{{off: 3, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_GOTPCREL), add: add}}}}, symbols: []symbol{{}, {name: "ZSTD_trace_compress_begin", info: byte(elf.STB_WEAK) << 4}}}
+		p := &Plan{Namespace: "amd_"}
+		if err := p.bindAMD64([]*image{m}, nil); err != nil {
+			t.Fatalf("addend %d: %v", add, err)
+		}
+		r := m.sections[1].relocs[0]
+		cell := m.symbols[r.sym]
+		if elf.R_X86_64(r.typ) != elf.R_X86_64_PC32 || r.add != add || m.sections[cell.sect].name != ".bao.weak_zero" || m.sections[1].data[1] != 0x83 {
+			t.Fatalf("addend %d: reloc %+v to %+v", add, r, cell)
+		}
+	}
+	m := &image{machine: elf.EM_X86_64, sections: []section{{}, {name: ".text.g", typ: elf.SHT_PROGBITS, flags: elf.SHF_ALLOC | elf.SHF_EXECINSTR, align: 16, size: 7, data: []byte{0x48, 0x8b, 0x05, 0, 0, 0, 0}, relocs: []reloc{{off: 3, sym: 1, typ: elf.R_AARCH64(elf.R_X86_64_GOTPCREL), add: 12}}}}, symbols: []symbol{{}, {name: "sem_clockwait", info: byte(elf.STB_WEAK) << 4}}}
+	if err := (&Plan{}).bindAMD64([]*image{m}, nil); err == nil || !strings.Contains(err.Error(), "missing weak symbol sem_clockwait at .text.g+0x3") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
