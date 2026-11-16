@@ -7028,3 +7028,189 @@ outside the documented toolchain.
   All passed (167 PASS records under `.work/tlsfast/ci-evidence`). The
   linux-amd64 CI job, run natively on a hosted amd64 runner, was not run
   here; amd64 has run only under QEMU.
+
+## 2026-11-16: glibc static TLS for Linux images (-linux-static-tls)
+
+Problem. Even with the per-thread cache from the previous entry, pythago's
+callgrind profile of CPython on arm64 put the TLSDESC thunk at 9.4% of
+instructions, about 32 instructions per access. A library that glibc loads
+at startup gets static TLS: a constant offset from the thread pointer and a
+two-instruction descriptor resolver. Go's internal linker cannot give a host
+object PT_TLS, so this is step (a) of the plan: obtain static TLS at run time
+from a dlopened module.
+
+Change.
+- `linuxelf.StaticTLSStub(arch, size, alignment)` builds the start of a
+  sectionless ET_DYN for arm64, amd64, loong64 and ppc64le (e_flags 0x43
+  LP64D for loong64, 2 ELFv2 for ppc64le). It contains:
+  - one RW PT_LOAD (p_align 0x10000);
+  - PT_DYNAMIC;
+  - PT_TLS covering the template, which the caller appends at the
+    template's alignment;
+  - PT_GNU_STACK RW, since without it current glibc refuses the dlopen
+    because the module would seem to need an executable stack;
+  - a dynamic table with a null-only symtab, an empty strtab,
+    `DT_FLAGS=DF_STATIC_TLS` and one RELA: R_AARCH64_TLS_TPREL64,
+    R_X86_64_TPOFF64, R_LARCH_TLS_TPREL64 or R_PPC64_TPREL64 against
+    symbol 0, at an 8-byte word.
+
+  glibc resolves that relocation through `CHECK_STATIC_TLS`. It either
+  places the module in static TLS, copying its PT_TLS image into every
+  existing thread (`_dl_init_static_tls`) and every later one
+  (`_dl_allocate_tls_init`), or dlopen fails with "cannot allocate memory in
+  static TLS block". The relocated word is the block's offset from the
+  thread pointer, in each target's own convention (`tpidr_el0`, `%fs:0`,
+  r13, `$tp`).
+- `Options.StaticTLS` / `-linux-static-tls` (config `linux.static_tls`, and
+  `build.LinuxOptions.StaticTLS`) records the stub in
+  `Plan.StaticTLS` (manifest `static_tls.offset_word`).
+- `Plan.TLSDescriptorSymbols` names every descriptor whose first word is
+  Bao's thunk:
+  - arm64 archive descriptors (`tls_desc_N`);
+  - amd64 GNU2 descriptors;
+  - shared-object TLSDESC slots, which get new `tls_slot_N` symbols in
+    `lowerImageTLS`.
+- Generated Go: `useStaticTLS()` runs in init after the import and local
+  pointer fixups, which reach the template, and before shared-object RELRO
+  protection, which can cover descriptor slots. It:
+  1. copies the prefix plus the live template;
+  2. writes it to `memfd_create("bao-tls", MFD_CLOEXEC)` (raw syscall:
+     279 arm64/loong64, 319 amd64, 360 ppc64le);
+  3. dlopens `/proc/self/fd/N` with `RTLD_NOW|RTLD_NODELETE`, through
+     `dlsym`'s `lookup`, so libdl provides dlopen on glibc older than 2.34;
+  4. reads `l_addr` via `dlinfo(RTLD_DI_LINKMAP)` and then the word;
+  5. calls the runtime's `bao_tls_use_static`.
+
+  Any failure returns false and leaves Bao's blocks in use. `TLSStatic()`
+  reports the mode and is always generated for Linux packages. The typed
+  bindings rewrite handles the new `purego.RegisterFunc` calls.
+- Runtime (`tls.c`, both `thunk.S`, all four blobs regenerated):
+  - `bao_tls_use_static(offset, descriptors, count)` checks every
+    descriptor (thunk first word, offset inside the template) before
+    changing any. It then adds the offset to each argument word and
+    repoints it at `bao_tls_static_resolver`: `ldr x0, [x0, #8]; ret` or
+    `movq 8(%rax), %rax; ret`.
+  - loong64 and ppc64le have no descriptors and accept only count 0.
+  - `bao_tls_lookup` returns `tp + offset + argument` in static mode, which
+    covers `__tls_get_addr` on all four targets.
+  - `current_thread` still creates records, now only for threads that
+    register thread-exit destructors (`bao_tls_atexit`), pointing at the
+    static block.
+  - Finalization restores the template in place instead of freeing, so
+    later accesses see initial values as from a new block. The live and
+    destroyed counters then count only threads with native destructors.
+- README: static TLS paragraphs in "Linux TLS lookup" and the config key.
+
+Limitations.
+- glibc 2.41's spare static TLS: on arm64 and amd64 a 1664-byte template
+  loads by default and 1728 bytes does not (prototype loader, 64-byte
+  steps). It is shared with libraries dlopened later that need static TLS,
+  which is why the flag is opt-in. `GLIBC_TUNABLES=glibc.rtld.
+  optional_static_tls=N` raises it.
+- glibc refuses a module whose TLS alignment exceeds its static TLS
+  alignment, 64 bytes on arm64: a 128-byte-aligned 384-byte stub failed and
+  a 64-byte-aligned one loaded. The Rust std runtime example's template is
+  384 bytes aligned to 128, so it falls back.
+- Requires memfd_create (Linux 3.17) and a mounted /proc; a seccomp policy
+  denying either means fallback.
+
+Verification. Host: Linux 7.0.0 aarch64 (Cortex-X925/A725), Docker 29.6.2.
+Runtime blobs and fixtures: Debian GCC 14.2.0-19 in `bao-cpp-cross:20261108`
+(glibc 2.41, QEMU 10.0.13). Consumers: Go 1.26.11, CGO_ENABLED=0.
+`go vet` and `go test ./...` passed. New tests:
+- `TestStaticTLSStub` checks the headers, segments, dynamic table and
+  relocation per target, plus the rejected arguments.
+- `TestSharedObjectTLSAndImportLowering` checks the slot symbol.
+- `linuxstatic` and `linuxsostatic` generated packages: code shape, and
+  compilation with 1000+ descriptors.
+- A typed-bindings rewrite case with static TLS.
+
+Prototype (`.work/statictls/proto`): a C loader dlopened the stub from a
+memfd. A thread created before the dlopen, the main thread and a new thread
+all saw the template:
+- arm64 native: offset 256;
+- amd64, loong64 and ppc64le under QEMU: offsets -240, 160 and -28480.
+
+Fixture (`.work/tlsfast`; `matrix.sh` and `matrix.log`, one bao binary): the
+previous entry's fixture plus a `__cxa_thread_atexit_impl` destructor in
+every thread. The destructor adds the thread's final TLS counter to a sum
+that must be exact, and the explicit finalization checks above apply too.
+Each configuration ran at GOMAXPROCS=1 and 4, both passing:
+- arm64 native and amd64/loong64/ppc64le under QEMU, with and without
+  `-linux-static-tls`: static=true and false respectively.
+- The fixture linked into a shared object (`-shared`, signature manifest),
+  on arm64 and amd64, both modes.
+- A 16 KiB TLS array: static=false (fallback), all checks pass. The same
+  binary with `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=32768` ran
+  with static TLS.
+- Built against Debian buster's root filesystem (glibc 2.28) as the
+  sysroot: static=true on glibc 2.41 and, in `debian:buster` (arm64,
+  native), at both GOMAXPROCS values.
+- A purego-mode package (no `-bindings`): 16 threads, static=true, native
+  arm64.
+- The Rust std runtime example (purego mode, its own checks: panic, 8
+  threads, 9 TLS destructors, live=0 after finalization) passed with the
+  flag but fell back: alignment 128.
+
+callgrind (arm64, `bench`): with static TLS, the archive and shared-object
+images ran only `tls_static_resolver`, 404,000 instructions for 202,000
+accesses, and never the thunk. The per-thread cache spent 20 instructions
+per access in the thunk. Whole-access cost, including the `noipa` call and
+the increment:
+
+| Runtime | Instructions per access | ns per access (native) |
+| --- | --- | --- |
+| main (345ad90) | 141 | 7.92 |
+| per-thread cache (#32) | 36.8 | 1.46 |
+| static TLS | 18.9 | 1.45 |
+
+The main row was measured earlier with the same benchmark functions; main's
+generated package lacks `TLSStatic()`, so the final consumer does not build
+against it. On the X925 the call and the increment's dependency chain hide
+the remaining difference in time.
+
+The local equivalent of `ci/check.sh linux-arm64` (`.work/tlsfast/ci.sh`,
+Bao without the flag) passed (167 PASS records, `.work/statictls/
+ci-evidence`). Hosted CI does not exercise `-linux-static-tls`.
+
+Other findings.
+- ppc64le: with GCC 14.2 `-O2`, a destructor that read a GD TLS variable and
+  updated an atomic interleaved a TOC load between the
+  `GOT_TLSGD16_HA/LO` pair and the call marker, and translation failed with
+  "unsupported PowerPC GD/LD TLS relocation sequence". This is unchanged
+  from main and outside this change; the fixture reads the variable through
+  a `noipa` helper.
+- arm64: GCC's default outline atomics need libgcc's `__aarch64_ldadd8_*`,
+  which the fixture archive does not link; it is built with
+  `-mno-outline-atomics`.
+
+## 2026-11-16: Finding: the version cap binds glibc 2.34 library moves to libc.so.6
+
+While testing static TLS on an older glibc, an image built against the
+glibc 2.41 sysroot with `-linux-max-symbol-version GLIBC_2.17` did not start
+on Debian buster (glibc 2.28, arm64):
+
+    /work/exe: relocation error: /work/exe: symbol pthread_key_create version GLIBC_2.17 not defined in file libc.so.6 with link time reference
+
+The cap chose the right version, but the import names the library where
+the sysroot defines the symbol. glibc 2.34 moved libpthread, libdl, librt,
+libutil and libanl symbols into libc.so.6 and kept their old versions there
+as compat symbols. bao-manifest.json for the capped fixture
+(`.work/tlsfast/arm64-capped`) binds `pthread_key_create`,
+`pthread_getspecific`, `pthread_setspecific`, `pthread_create`,
+`pthread_join` and `pthread_barrier_*` `@GLIBC_2.17` to libc.so.6. Before
+2.34 they are defined only in libpthread.so.0, which the executable does not
+request, so the lookup fails. Some, such as `pthread_mutex_lock`, also had
+forwarders in the old libc.so.6. The cap's README text, "the result loads
+on an older glibc", is therefore wrong for any image importing a moved
+symbol, and Bao's own TLS runtime imports `pthread_key_create`.
+
+A possible fix: for a capped import whose chosen version is older than
+GLIBC_2.34 and whose library is libc.so.6, name the pre-2.34 library. On
+2.34 and later those libraries still exist as stubs defining the old version
+nodes, and the global-scope lookup finds the symbol in libc.so.6. The
+sysroot cannot say which library a symbol came from, so this needs a table
+from glibc's history. Not fixed here.
+
+Static TLS itself was verified on 2.28 by building against buster's own
+root filesystem as the sysroot; see the static TLS entry's verification.

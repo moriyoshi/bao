@@ -82,7 +82,7 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 			thunk = m.addSymbol(p.Runtime("tls_thunk"), 0, 0, 0)
 		}
 		return thunk
-	})
+	}, p.addTLSDescriptor)
 	if err != nil {
 		return err
 	}
@@ -119,6 +119,9 @@ func (p *Plan) lowerDynamicTLS(m *image) error {
 		}
 		d.size = uint64(len(d.data))
 		idx := m.addSymbol(fmt.Sprintf("%stls_desc_%d", p.Namespace, len(descriptors)), desc, off, 16)
+		if gnu2 {
+			p.TLSDescriptorSymbols = append(p.TLSDescriptorSymbols, m.symbols[idx].name)
+		}
 		descriptors[k] = idx
 		return idx, nil
 	}

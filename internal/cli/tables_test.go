@@ -64,6 +64,19 @@ func syntheticLinuxPlan(n int) *linuxelf.Plan {
 	return p
 }
 
+// withStaticTLS requests -linux-static-tls with n TLS descriptors to repoint.
+func withStaticTLS(p *linuxelf.Plan, n int) *linuxelf.Plan {
+	module, err := linuxelf.StaticTLSStub(p.Arch, p.TLSTemplateSize, p.TLSTemplateAlignment)
+	if err != nil {
+		panic(err)
+	}
+	p.StaticTLS = &module
+	for i := 0; i < n; i++ {
+		p.TLSDescriptorSymbols = append(p.TLSDescriptorSymbols, fmt.Sprintf("bao_test_tls_desc_%d", i))
+	}
+	return p
+}
+
 // syntheticSharedObjectPlan adds a shared-object image whose import fixups
 // are image offsets, some of them versioned, and an export table.
 func syntheticSharedObjectPlan(n int) *linuxelf.Plan {
@@ -132,6 +145,12 @@ func generatedPackages() []generatedPackage {
 	}})
 	packages = append(packages, generatedPackage{"linuxso", "linux", "arm64", "symbols_linux_arm64", func(n int) ([]byte, []byte, error) {
 		return linuxSource(syntheticSharedObjectPlan(n), "linuxso", []string{"answer"})
+	}})
+	packages = append(packages, generatedPackage{"linuxstatic", "linux", "amd64", "symbols_linux_amd64", func(n int) ([]byte, []byte, error) {
+		return linuxSource(withStaticTLS(syntheticLinuxPlan(n), n), "linuxstatic", []string{"answer"})
+	}})
+	packages = append(packages, generatedPackage{"linuxsostatic", "linux", "arm64", "symbols_linux_arm64", func(n int) ([]byte, []byte, error) {
+		return linuxSource(withStaticTLS(syntheticSharedObjectPlan(n), n), "linuxsostatic", []string{"answer"})
 	}})
 	packages = append(packages, generatedPackage{"darwindylib", "darwin", "arm64", "symbols_darwin_arm64", func(n int) ([]byte, []byte, error) {
 		return darwinSource(syntheticDylibPlan(n), "darwindylib", []string{"answer"}, nil, true)
@@ -303,7 +322,7 @@ func TestLargeGeneratedPackagesCompile(t *testing.T) {
 // Typed bindings replace every PureGo use in a generated Linux package; a
 // helper they cannot rewrite fails generation for every Linux consumer.
 func TestLinuxSourcesAcceptTypedBindings(t *testing.T) {
-	for name, plan := range map[string]*linuxelf.Plan{"archive": syntheticLinuxPlan(3), "shared object": syntheticSharedObjectPlan(3)} {
+	for name, plan := range map[string]*linuxelf.Plan{"archive": syntheticLinuxPlan(3), "shared object": syntheticSharedObjectPlan(3), "static TLS": withStaticTLS(syntheticSharedObjectPlan(3), 3)} {
 		t.Run(name, func(t *testing.T) {
 			plan.Arch = "arm64"
 			source, asm, err := linuxSource(plan, "native", []string{"answer"})

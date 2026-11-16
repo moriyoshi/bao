@@ -136,6 +136,10 @@ static const void *initial;
 static size_t initial_size;
 static size_t initial_alignment;
 static _Atomic int ready;
+// Set by bao_tls_use_static before translated code first runs: every
+// thread's block is then glibc static TLS at this thread-pointer offset.
+static int static_tls;
+static intptr_t static_offset;
 static _Atomic uint64_t live_blocks;
 static _Atomic uint64_t destroyed_blocks;
 
@@ -185,7 +189,12 @@ static void finalize_thread(BaoThread *thread, int explicit_finalization) {
     }
     void *data = thread->data;
     release(thread);
-    free(data);
+    // A static block lives as long as its thread. Restore the template so
+    // that, as with a new block, later accesses see initial values.
+    if (static_tls)
+        memcpy(data, initial, initial_size);
+    else
+        free(data);
     atomic_fetch_sub_explicit(&live_blocks, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&destroyed_blocks, 1, memory_order_relaxed);
 }
@@ -221,9 +230,13 @@ static BaoThread *current_thread(void) {
     BaoThread *thread = pthread_getspecific(key);
     if (thread == NULL) {
         thread = new_record();
-        if (posix_memalign(&thread->data, initial_alignment, initial_size) != 0)
-            abort();
-        memcpy(thread->data, initial, initial_size);
+        if (static_tls) {
+            thread->data = (char *)thread_pointer() + static_offset;
+        } else {
+            if (posix_memalign(&thread->data, initial_alignment, initial_size) != 0)
+                abort();
+            memcpy(thread->data, initial, initial_size);
+        }
         if (pthread_setspecific(key, thread) != 0)
             abort();
         thread->hook = malloc(sizeof(*thread->hook));
@@ -243,12 +256,45 @@ static BaoThread *current_thread(void) {
 
 void *bao_tls_lookup(const uintptr_t *descriptor) {
     uintptr_t offset = descriptor[1];
+    if (offset >= initial_size)
+        abort();
+    if (static_tls)
+        return (char *)thread_pointer() + static_offset + offset;
     BaoThread *thread = cached_thread();
     if (thread == NULL)
         thread = current_thread();
-    if (offset >= initial_size)
-        abort();
     return (char *)thread->data + offset;
+}
+
+#if defined(__aarch64__) || defined(__x86_64__)
+extern void bao_tls_thunk(void);
+extern void bao_tls_static_resolver(void);
+#endif
+
+// Called once by the generated package after it has dlopened a module whose
+// PT_TLS image is this image's fixed-up template and that glibc placed in
+// static TLS at offset from every thread pointer, and before translated code
+// first runs. Descriptors then resolve with a single load; no Bao block is
+// allocated. Nothing changes unless every descriptor checks out.
+int bao_tls_use_static(intptr_t offset, uintptr_t *const *descriptors, size_t count) {
+    if (atomic_load_explicit(&ready, memory_order_acquire) == 0 || static_tls)
+        return -1;
+#if defined(__aarch64__) || defined(__x86_64__)
+    for (size_t i = 0; i < count; i++) {
+        if (descriptors[i][0] != (uintptr_t)bao_tls_thunk || descriptors[i][1] >= initial_size)
+            return -2;
+    }
+    for (size_t i = 0; i < count; i++) {
+        descriptors[i][1] += (uintptr_t)offset;
+        descriptors[i][0] = (uintptr_t)bao_tls_static_resolver;
+    }
+#else
+    if (count != 0)
+        return -3;
+#endif
+    static_offset = offset;
+    static_tls = 1;
+    return 0;
 }
 
 // Replacement for __cxa_thread_atexit_impl in this translated image.

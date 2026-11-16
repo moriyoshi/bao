@@ -761,7 +761,7 @@ func delink(data []byte, ns string) (*delinked, error) {
 // lowerImageTLS fills a shared-object image's TLS slots once the template
 // layout is known: offset words for Bao's __tls_get_addr resolver, and
 // descriptors whose first word calls Bao's thunk. It counts both.
-func lowerImageTLS(m *image, offsets map[uint16]uint64, size uint64, thunk func() uint32) (int, error) {
+func lowerImageTLS(m *image, offsets map[uint16]uint64, size uint64, thunk func() uint32, descriptor func(m *image, sect uint16, off uint64)) (int, error) {
 	descriptors := 0
 	for si := range m.sections {
 		s := &m.sections[si]
@@ -786,6 +786,7 @@ func lowerImageTLS(m *image, offsets map[uint16]uint64, size uint64, thunk func(
 			binary.LittleEndian.PutUint64(s.data[word:], base+sym.value+uint64(r.add))
 			if r.typ == relocImageTLSDescriptor {
 				out = append(out, reloc{off: r.off, sym: thunk(), typ: soArches[m.effectiveMachine()].abs})
+				descriptor(m, uint16(si), r.off)
 			}
 			descriptors++
 		}

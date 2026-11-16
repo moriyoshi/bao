@@ -76,6 +76,9 @@ type LinuxOptions struct {
 	// MaxTextAlignment links executable sections that request more at this
 	// alignment; only 4096 is supported (-linux-max-text-alignment).
 	MaxTextAlignment uint
+	// StaticTLS places the image's TLS in glibc static TLS at startup when
+	// glibc allows it (-linux-static-tls).
+	StaticTLS bool
 }
 
 // WindowsOptions are the Windows target's flags.
@@ -148,6 +151,9 @@ func (o Options) CommandLine() []string {
 	each("linux-system-library", o.Linux.SystemLibraries)
 	each("linux-max-symbol-version", o.Linux.MaxSymbolVersions)
 	number("linux-max-text-alignment", o.Linux.MaxTextAlignment)
+	if o.Linux.StaticTLS {
+		args = append(args, "-linux-static-tls")
+	}
 	pairs("windows-import", o.Windows.Imports)
 	each("windows-import-library", o.Windows.ImportLibraries)
 	flag("windows-crt", o.Windows.CRT)

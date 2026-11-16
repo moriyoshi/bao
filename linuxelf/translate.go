@@ -73,15 +73,21 @@ type CappedAlignment struct {
 const MaxSafeTextAlignment = 4096
 
 type Plan struct {
-	Arch                 string            `json:"goarch"`
-	LocalFixups          []LocalFixup      `json:"local_pointer_fixups,omitempty"`
-	Status               string            `json:"status"`
-	Namespace            string            `json:"namespace"`
-	InputSHA256          string            `json:"input_sha256"`
-	TLSDescriptors       int               `json:"tls_descriptors"`
-	TLSTemplateSize      uint64            `json:"tls_template_size"`
-	TLSTemplateAlignment uint64            `json:"tls_template_alignment"`
-	TLSTemplateSymbol    string            `json:"tls_template_symbol"`
+	Arch                 string       `json:"goarch"`
+	LocalFixups          []LocalFixup `json:"local_pointer_fixups,omitempty"`
+	Status               string       `json:"status"`
+	Namespace            string       `json:"namespace"`
+	InputSHA256          string       `json:"input_sha256"`
+	TLSDescriptors       int          `json:"tls_descriptors"`
+	TLSTemplateSize      uint64       `json:"tls_template_size"`
+	TLSTemplateAlignment uint64       `json:"tls_template_alignment"`
+	TLSTemplateSymbol    string       `json:"tls_template_symbol"`
+	// TLSDescriptorSymbols name every TLS descriptor whose first word is
+	// Bao's thunk, for static TLS to repoint at its constant resolver.
+	TLSDescriptorSymbols []string `json:"-"`
+	// StaticTLS, from Options.StaticTLS, is the module the generated
+	// package dlopens to obtain glibc static TLS.
+	StaticTLS            *StaticTLSModule  `json:"static_tls,omitempty"`
 	Unwind               []string          `json:"unwind_sections"`
 	Constructors         []Table           `json:"constructor_tables"`
 	Finalizers           []Table           `json:"finalizer_tables,omitempty"`
@@ -99,6 +105,13 @@ type Plan struct {
 }
 
 func (p *Plan) Runtime(name string) string { return p.Namespace + name }
+
+// addTLSDescriptor names the descriptor at off in m's section sect.
+func (p *Plan) addTLSDescriptor(m *image, sect uint16, off uint64) {
+	name := fmt.Sprintf("%stls_slot_%d", p.Namespace, len(p.TLSDescriptorSymbols))
+	m.addSymbol(name, sect, off, 16)
+	p.TLSDescriptorSymbols = append(p.TLSDescriptorSymbols, name)
+}
 
 // An undefined weak reference does not request a shared library in an ELF
 // native link. Bind it only when a strong import already needs that provider.
@@ -343,6 +356,10 @@ type Options struct {
 	// per namespace, such as GLIBC_2.17: the glibc the inputs were built
 	// for. Without a cap an import binds its library's default version.
 	MaxSymbolVersions []string
+	// StaticTLS asks the generated package to place the image's TLS in
+	// glibc's static TLS at startup, through a dlopened module, falling
+	// back to Bao's per-thread blocks when glibc cannot.
+	StaticTLS bool
 }
 
 func Translate(input []byte, sysroot string, exports []string) (*Plan, error) {
@@ -583,6 +600,13 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 			}
 		}
 	}
+	if opts.StaticTLS {
+		module, err := StaticTLSStub(p.Arch, p.TLSTemplateSize, p.TLSTemplateAlignment)
+		if err != nil {
+			return nil, err
+		}
+		p.StaticTLS = &module
+	}
 	for i, m := range images {
 		b, err := m.encode()
 		if err != nil {
@@ -770,7 +794,7 @@ func (p *Plan) lowerTLS(m *image) error {
 		add int64
 	}
 	descriptors := map[target]uint32{}
-	slots, err := lowerImageTLS(m, offsets, uint64(len(template)), func() uint32 { return thunk })
+	slots, err := lowerImageTLS(m, offsets, uint64(len(template)), func() uint32 { return thunk }, p.addTLSDescriptor)
 	if err != nil {
 		return err
 	}
@@ -820,6 +844,7 @@ func (p *Plan) lowerTLS(m *image) error {
 					d.relocs = append(d.relocs, reloc{off: off, sym: thunk, typ: elf.R_AARCH64_ABS64})
 					d.size = uint64(len(d.data))
 					idx = m.addSymbol(fmt.Sprintf("%stls_desc_%d", p.Namespace, len(descriptors)), descSection, off, 16)
+					p.TLSDescriptorSymbols = append(p.TLSDescriptorSymbols, m.symbols[idx].name)
 					descriptors[key] = idx
 					s = &m.sections[si]
 				}

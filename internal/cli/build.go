@@ -35,6 +35,7 @@ type nativeFlags struct {
 	linuxMaxSymbolVersions            symbolFlags
 	linuxMaxTextAlignment             uint
 	linuxSharedObject                 string
+	linuxStaticTLS                    bool
 	// linuxSharedObjectWrap lists the -wrap symbols, which also apply to
 	// the shared object's imports.
 	linuxSharedObjectWrap []string
@@ -62,6 +63,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.Var(&o.linuxMaxSymbolVersions, "linux-max-symbol-version", "newest symbol version an import may bind in its namespace, such as GLIBC_2.17 for the glibc the inputs were built for; repeatable, one per namespace; without it, imports bind the sysroot's default versions")
 	fs.UintVar(&o.linuxMaxTextAlignment, "linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported, and capped sections are recorded in the manifest")
 	fs.StringVar(&o.linuxSharedObject, "linux-shared-object", "", "linked PIC shared object to translate with the input, which may reference its exports; a shared object can also be the input itself")
+	fs.BoolVar(&o.linuxStaticTLS, "linux-static-tls", false, staticTLSUsage)
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
 	fs.StringVar(&o.windowsCRT, "windows-crt", "ucrt", "Windows system C runtime: ucrt or msvcrt; match the producer toolchain")
 	o.diagnostics.register(fs)
@@ -138,6 +140,9 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 	if o.linuxSharedObject != "" && !strings.HasPrefix(target.Name, "linux/") {
 		return usage("-linux-shared-object requires a Linux target")
 	}
+	if o.linuxStaticTLS && !strings.HasPrefix(target.Name, "linux/") {
+		return usage("-linux-static-tls requires a Linux target")
+	}
 	if strings.HasPrefix(target.Name, "windows/") {
 		if !o.stripBitcode {
 			return usage("Windows COFF always drops linker-remove LLVM bitcode; -strip-bitcode=false is unsupported")
@@ -208,6 +213,9 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 		}
 		if o.linuxMaxTextAlignment != 0 {
 			args = append(args, "-linux-max-text-alignment", strconv.FormatUint(uint64(o.linuxMaxTextAlignment), 10))
+		}
+		if o.linuxStaticTLS {
+			args = append(args, "-linux-static-tls")
 		}
 		if o.linuxSharedObject != "" {
 			args = append(args, "-linux-shared-object", o.linuxSharedObject)
