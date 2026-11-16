@@ -14,7 +14,7 @@ import (
 )
 
 func signatureCommand(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error {
-	fs := newFlags(command, command+" [options]", "Consumer-controlled module signatures and isolated verified builds. Read README.md#consumer-controlled-signature-verification for the trust boundary.")
+	fs := newFlags(command, command+" [options]", "Consumer-controlled module signatures and isolated verified builds. Read docs/signature-verification.md for the trust boundary.")
 	if command == "keygen" {
 		private := fs.String("private", "", "new PKCS8 Ed25519 private PEM file")
 		public := fs.String("public", "", "new public PEM file")

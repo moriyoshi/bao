@@ -22,7 +22,7 @@ there is no runtime extraction, application dylib loader, executable-memory
 allocation, custom Go toolchain or consumer C/Rust compiler. System libraries
 remain dynamically linked through the target OS loader. Separate Linux ELF
 profiles cover arm64, amd64, loong64 and ppc64le; see
-[Linux arm64 / ELF](#linux-arm64--elf) and [Linux amd64 / ELF](#linux-amd64--elf).
+[platform support](#platform-support) and the [Linux reference](docs/linux.md).
 
 - [Library consumers](#library-consumers): use a Bao-built library in a Go
   application and optionally verify its signed release.
@@ -128,13 +128,13 @@ a C compiler.
 
 | Target | Profile | Native input | Runtime checks ran on | cgo-enabled consumer builds |
 | --- | --- | --- | --- | --- |
-| darwin/arm64 | Maintained | Objects, archives, Cargo staticlibs; [dylibs](#macos-dylibs) | Native macOS | Executed |
+| darwin/arm64 | Maintained | Objects, archives, Cargo staticlibs; [dylibs](docs/darwin.md#dylib-input) | Native macOS | Executed |
 | darwin/amd64 | Maintained | Same | Rosetta 2 on macOS arm64 | Executed under Rosetta 2 |
-| linux/arm64 | Maintained | Objects, archives, Cargo staticlibs; [shared objects](#linux-shared-objects) | Native Docker | Executed in native Docker |
+| linux/arm64 | Maintained | Objects, archives, Cargo staticlibs; [shared objects](docs/linux.md#shared-objects) | Native Docker | Executed in native Docker |
 | linux/amd64 | Maintained | Same | QEMU in Docker locally; a native runner in hosted CI | Bootstrap alone under emulation, not with a translated library |
 | linux/loong64 | Experimental | Same | QEMU | Executed under QEMU |
 | linux/ppc64le | Experimental | Same | QEMU | Executed under QEMU |
-| windows/amd64 | [Producer profiles](#windows-producer-reference) | COFF objects, archives, Cargo staticlibs; [DLLs](#windows-dlls) | Wine | Executed under Wine with LLVM-MinGW |
+| windows/amd64 | [Producer profiles](docs/windows.md#producer-reference) | COFF objects, archives, Cargo staticlibs; [DLLs](docs/windows.md#dll-input) | Wine | Executed under Wine with LLVM-MinGW |
 | windows/arm64 | Same | Same | Wine (arm64) | Cross-linked, not executed |
 
 Consumers build with stock Go 1.26.11 on every target. The cgo column covers
@@ -257,8 +257,8 @@ Linux arm64:
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build
 ```
 
-See the library developer's [supported boundaries](#supported-boundaries)
-and [Linux profile](#linux-arm64--elf) for platform limitations.
+See [platform support](#platform-support) and the
+[platform reference](#platform-reference) for platform limitations.
 
 ### Runtime caveats
 
@@ -401,7 +401,7 @@ runtime image per executable; exceptions must remain within native frames.
 
 Use the supplied Go package with stock Go 1.26.11 and either generated typed
 bindings or PureGo registration. C/C++ and GNU Rust std libraries are supported
-within the [documented producer profiles](#windows-producer-reference).
+within the [documented producer profiles](docs/windows.md#producer-reference).
 Applications need no Rust/C++ compiler, SDK or native linker.
 
 ```sh
@@ -420,9 +420,10 @@ unlocking it. Keep image-owned FLS keys inside the library, and do not resume
 native work after shutdown.
 
 Exceptions and Rust panics must be caught within native code. MSVC Rust std,
-Windows/386 and ARM64EC are unsupported. See [platform support](#platform-support)
-for where this has run and [per-platform details](#per-platform-details) for
-implementation notes.
+Windows/386 and ARM64EC are unsupported. See
+[platform support](#platform-support) for where this has run and the
+[Windows reference](docs/windows.md#implementation-notes) for implementation
+notes.
 
 ### Consumer-controlled signature verification
 
@@ -440,168 +441,13 @@ Normal `go build`, imports and `go get` do not automatically invoke it.
 
 `version` and `verify` support `-json`.
 
-#### Release metadata and policy
-
-The library developer supplies a signed release envelope covering the complete
-module, as described in [signing library releases](#signing-library-releases).
-To use these optional verification commands, obtain a trusted Bao CLI from
-[CLI releases](#cli-releases). Ordinary application builds do not require it.
-
-A consumer pins the **key and exact payload digest**, module, release and target
-in a policy received and approved through their independent trusted channel:
-
-```json
-{
-  "schema": 1,
-  "keys": {"PUBLIC_KEY_SHA256": "BASE64_RAW_ED25519_PUBLIC_KEY"},
-  "approvals": [{
-    "module": "example.org/native",
-    "target": "darwin/arm64",
-    "release": "v1.2.3",
-    "key_id": "PUBLIC_KEY_SHA256",
-    "payload_sha256": "EXACT_APPROVED_PAYLOAD_SHA256"
-  }]
-}
-```
-
-Placeholders are deliberately unusable; Bao ships no publisher key or release
-authority. Fetching a replacement policy/key or blindly approving the latest
-digest from a compromised publisher defeats this trust model. Exact approvals
-prevent automatic acceptance of newer or older releases, including another
-release signed by the same key. Policy rotation/revocation, freshness and
-rollback decisions remain with the consumer. There is no TUF update service,
-transparency-log integration, threshold policy or automatic key discovery.
-
-#### Scan downloaded dependencies
-
-```sh
-bao verify -go /trusted/go1.26.11/bin/go -json
-bao verify -C ./consumer -go /trusted/go1.26.11/bin/go \
-  -policy /trusted/native-policy.json \
-  -manifest /release/native-darwin-arm64.json -target darwin/arm64 -json
-```
-
-The default scope is the current module's dependencies, including downloaded
-dependencies it does not import. Bao resolves the module build list offline,
-runs `go mod verify`, and scans downloaded source trees for `.syso` files across
-all targets and subdirectories. It checks complete trees against independently
-approved signatures and rejects unsigned native dependencies. Ordinary Go
-dependencies without native inputs need no Bao policy. Repeat `-manifest` for
-multiple approved modules; supply policy and manifests together.
-
-The main application module and unrelated entries in the global module cache
-are excluded. Local replacements are scanned too, but Go's module-cache
-integrity check does not cover them. Missing source downloads are reported as
-`not-downloaded`, not fetched or authenticated; an approved native module that
-is missing fails. Missing module metadata may prevent offline resolution, so
-download dependencies beforehand. Source trees containing symlinks are refused.
-
-Scanning compiles and runs no application code. It authenticates downloaded
-sources at scan time and does not certify a later build or shared build cache.
-Use `verified-build` to check actual linker inputs. JSON reports are also
-printed on scan rejection, with a nonzero exit status.
-
-#### Go build flow and cache boundary
-
-Download ordinary Go dependencies before verification, then invoke:
-
-```sh
-bao verified-build -policy /trusted/native-policy.json \
-  -manifest /release/native-darwin-arm64.json \
-  -go /trusted/go1.26.11/bin/go -target darwin/arm64 -o ./app ./cmd/app
-```
-
-Repeat `-manifest` for independently approved native modules. The command:
-
-1. Checks signatures and exact policy approvals on every request.
-2. Resolves one executable's dependency closure using stock Go, with cgo,
-   workspaces, module networking, toolchain downloads and Go environment files
-   disabled. Dependencies must already be available. It never runs `generate`,
-   consumer `init`, `main`, or functions inside untrusted native objects.
-3. Copies selected module trees into a private temporary directory and checks
-   the copied bytes against each approved manifest. It binds every selected
-   `.syso` to an approved complete module; unsigned native inputs fail closed.
-   Ordinary Go dependencies and consumer application code remain consumer
-   trusted unless their modules are also explicitly approved. This does not
-   authenticate the entire Go supply chain.
-4. Rewrites only dependency resolution in the private main `go.mod` to those
-   snapshots, resolves again and rejects packages escaping them. Read-only
-   snapshots, scrubbed build environment, internal linking, and a **new empty
-   private `GOCACHE` per invocation** prevent reuse of unverified shared build
-   results. The initial profile has no verified-cache reuse optimization.
-5. Uses a private `-toolexec` hook that keeps Go tool version probes working.
-   Immediately before linking it parses the actual input package archives,
-   checks native member digests and multiplicities, rejects unknown/substituted
-   members, and gives the linker read-only private copies of those exact bytes
-   through a rewritten `importcfg` and main archive path. It requires a linker
-   verification report before publishing a new executable and reports archive
-   and final-executable SHA-256 values. Existing output files are refused.
-
-#### Bazel consumer builds
-
-For a local rules_go consumer, select the separate Bazel backend:
-
-```sh
-bao verified-build -backend bazel -bazel /trusted/bin/bazel \
-  -C ./consumer -module example.org/native=native \
-  -policy /trusted/native-policy.json \
-  -manifest /release/native-darwin-arm64.json \
-  -target darwin/arm64 -o ./app //cmd/app:app
-```
-
-Each `-module importpath=relative/root` binds one approved complete native module
-to a directory inside the consumer workspace, containing the library developer's
-[prepared and signed package](#distributing-a-generated-package). Configure
-the application's `go_binary` with `pure = "on"` and the requested
-`goos`/`goarch`. Pin Bazel 8.4.2
-(set the consumer's `.bazelversion` when using Bazelisk),
-rules_go 0.65.0 and the downloaded Go 1.26.11 SDK, and generate the consumer's
-`MODULE.bazel.lock` before verification. Consumer Bazel/Starlark definitions and
-these tools are trusted; native repositories must be local signed roots.
-
-Bao authenticates copied native source trees before Bazel loads their build
-definitions, then analyzes a restricted action graph with rc files disabled.
-It compiles into new private Bazel/Go caches with disk/remote action-result reuse
-disabled, checks the actual link `.a` members, and replays the selected GoLink
-action with private copies of those archives, standard-library archives, builder
-and linker. rules_go's split export/archive format is checked separately from
-stock Go's format. The consumer executable is published only after this checked
-link completes; consumer `init` and `main` are never run by verification.
-
-This initial backend accepts one local `//package:target` executable with pure
-internal linking. External native repositories, custom build actions, cgo,
-plugins, coverage/race modes, arbitrary compiler/linker flags and alternate
-rules_go/SDK versions are refused. Repository/SDK downloads may occur in the
-fresh private repository cache. This is a bounded rules_go profile, not a
-general Bazel action sandbox or a `-toolexec` wrapper for Bazel.
-
-#### Limitations
-
-The consumer-controlled host, Bao executable, Go SDK/tools, main application,
-unapproved Go dependencies and policy files are trusted. This does not defend
-against root, a hostile process with the same user's privileges, memory or
-toolchain compromise, or a signer approving malicious code. Private directories
-and read-only copies reduce incidental mutation; they are not an OS security
-sandbox against that user. The implementation does not claim race-proof checks
-against a hostile same-user process. Archive copies bind the checked bytes to
-the paths provided to the trusted linker within this host trust assumption.
-
-The stock Go profile builds a single main package without custom flags, overlays,
-workspace mode, external linking or shared-library inputs. It rejects native
-objects in the standard library, and assembly includes escaping a selected
-package. Native target support is inherited from the stock toolchain and Bao's
-translator profiles. Verification itself requires no Rust compiler, Apple
-linker, native extraction, cgo or execution of the consumer. Mac app codesigning
-is a separate later step and does not prove prelink artifact identity.
-
-Input source provenance, reproducibility, builder authorization and code review
-are separate from authenticating bytes. Signed Bao provenance files are useful
-records, not independent proof of how a producer built its artifacts. Module
-checksums and `go mod verify` serve their documented module-cache roles; they
-do not establish an independently approved native release signing authority.
-See [Go build/tool execution](https://pkg.go.dev/cmd/go@go1.26.11),
-[Go module verification](https://go.dev/ref/mod#go-mod-verify) and
-[SLSA verification expectations](https://slsa.dev/spec/v1.2/verifying-artifacts).
+A consumer pins each approved release's key and exact payload digest in a
+policy obtained independently of the publisher. `bao verify` then scans the
+module's downloaded dependencies, and `bao verified-build` builds an executable
+from authenticated private snapshots with a fresh build cache, through stock Go
+or a bounded rules_go (Bazel) backend. See
+[signature verification](docs/signature-verification.md) for the policy format,
+both build flows and the trust limits.
 
 ## Library developers
 
@@ -742,7 +588,7 @@ for consumer calls and build commands.
 
 Darwin/Linux archives are partially linked using the producer's native `ld`.
 Windows COFF member selection happens inside Bao; see the
-[Windows producer reference](#windows-producer-reference). macOS SDK discovery uses `xcrun`, or pass
+[Windows producer reference](docs/windows.md#producer-reference). macOS SDK discovery uses `xcrun`, or pass
 `-sdk`. Linux defaults to `/` only when the producer matches the target; cross translation needs
 `-sysroot`. `-ld` selects a compatible cross linker. Combining Darwin archives
 on another host requires a compatible Apple partial linker; precombined-object
@@ -750,312 +596,17 @@ translation itself needs no native compiler/linker.
 
 ### Symbol edits
 
-`bao build` can rename symbols in its Linux ELF, macOS Mach-O and Windows COFF
-inputs before they are combined, so a producer needs neither `objcopy` nor a
-second relinking step. The same edits are available on single files as
-`bao objcopy`. Supported inputs are ELF relocatable objects of either class
-and byte order,
-64- and 32-bit little-endian Mach-O objects and universal (fat) files of them,
-amd64/arm64 COFF relocatable objects (regular or bigobj), and archives of all
-of these. Import library members pass through unchanged (see the COFF notes).
-
-`bao objcopy` also handles formats that `bao build` does not translate:
-
-- ELF32 and big-endian ELF objects, such as i386, armv7, powerpc, mips,
-  s390x and aarch64_be. They are edited through an equivalent little-endian
-  ELF64 copy, and every byte the edit does not change keeps its offset.
-  MIPS64, whose relocations pack several types into `r_info`, and CREL
-  relocations in ELF32 objects are refused.
-- COFF bigobj, which `cl /bigobj` and `-Wa,-mbig-obj` write, and which LLVM
-  writes for more than 65279 sections. `bao build` says so when given one.
-- Universal Mach-O files, objects or archives. Each slice is edited as if it
-  were alone, and the result keeps the architectures, their order and their
-  alignments, in FAT_MAGIC or FAT_MAGIC_64.
-- 32-bit Mach-O objects (i386, armv7). Their scattered relocations name an
-  address. A symbol at such an address counts as referenced, and its section
-  cannot be removed.
-  - A 32-bit ARM alias made with `@SYMBOL:0` keeps a Thumb function's
-    `N_ARM_THUMB_DEF`.
-  - 32-bit code also reaches local functions through section-relative
-    relocations, and each defined symbol starts an atom. So
-    `-strip-unneeded` keeps 32-bit section symbols, because `ld -r` fails on
-    an atom left without one.
-
-Names are C names on both formats, as for `-symbol`. On Mach-O, Bao matches and
-writes them with the leading underscore that C symbols carry, so
-`-wrap pthread_create` edits `_pthread_create`. Mach-O symbols without that
-underscore, such as assembler labels, are never edited.
-
-| Flag | Effect |
-| --- | --- |
-| `-wrap SYM` | References to `SYM` go to `__wrap_SYM`, and undefined `__real_SYM` becomes `SYM`, with `ld.lld --wrap` semantics |
-| `-redefine-sym OLD=NEW` | Rename every `OLD` symbol, defined or undefined, as `llvm-objcopy --redefine-sym` |
-| `-redefine-syms FILE` | Rename from `OLD NEW` lines; `#` starts a comment, as `llvm-objcopy --redefine-syms` |
-| `-prefix-symbols PATH=PREFIX` | Prefix the symbols that the input or `-link-archive` at `PATH` defines (build only) |
-
-All flags are repeatable. `-wrap` and `-redefine-sym(s)` apply to the input and
-every `-link-archive`, so wrapper glue can live in any of them. Each edit applies
-to input names; a renamed symbol is not edited again.
-
-`-wrap` follows lld rather than GNU ld: when an object both defines and calls
-`SYM`, that call also goes to `__wrap_SYM`. Bao adds an undefined `__wrap_SYM`
-to that object and redirects its runtime relocations. Relocations in debug
-sections keep describing the definition. Relocations in LLVM's CREL format
-(`-Wa,--crel`) are decoded, edited like RELA ones, and encoded again as LLVM
-encodes them when they change.
-
-`-prefix-symbols` makes a component's definitions private. Only symbols
-defined in that component, and that component's references to them, gain the
-prefix. Other undefined references, such as `malloc` or a `Py*` function from
-another input, keep their names. Inputs that share a prefix form one component,
-so a vendored library and the extension that calls it can share one prefix. A
-wrapped or explicitly renamed symbol is not prefixed. An identity rename such as
-`-redefine-sym PyInit_mod=PyInit_mod` keeps an entry point's name.
-`PATH` must name the same file as the input or a `-link-archive`.
-
-```sh
-# libext1.a calls its vendored libssl.a. Both share one prefix, and the
-# identity rename keeps the entry point that libapp.a calls.
-bao build -target linux/arm64 -symbol app_main \
-  -wrap pthread_create -wrap recv \
-  -link-archive ext1/libext1.a -link-archive ext1/libssl.a \
-  -prefix-symbols ext1/libext1.a=ext1_ -prefix-symbols ext1/libssl.a=ext1_ \
-  -redefine-sym PyInit_ext1=PyInit_ext1 \
-  -o ./native libapp.a
-```
-
-Edits apply to Bao's private copies of the inputs. Symbol and section bytes
-other than the edited names, symbols and relocations are preserved. An edited
-archive is rewritten with a new symbol index, because a searched archive's index
-must name the renamed definitions. ELF archives use GNU format. Mach-O archives
-use the BSD format of Apple's `ar`, with a `__.SYMDEF` index and 8-byte-aligned
-members. `bao-build.json` records the
-edits under `symbol_edits`. Its source and link-archive digests stay those of
-the unedited files. `-bindings dwarf` reads the unedited input, so name renamed
-exports with a signature manifest instead.
-
-```sh
-bao objcopy -wrap pthread_create -redefine-syms renames.txt libpython.o libpython-edited.o
-bao objcopy -prefix-symbols ext1_ libvendor.a libvendor-private.a
-```
-
-`bao objcopy` takes one input and a new output, which must not exist.
-`-prefix-symbols PREFIX` there prefixes the input's own definitions.
-
-#### Symbol bindings and stripping
-
-These flags hide or remove symbols, as the llvm-objcopy flags of the same
-names do. In `bao build` each one names its component first, as `PATH=SYMBOL`,
-`PATH=FILE` or `PATH`. In `bao objcopy` it applies to the one input, so it
-takes only `SYMBOL` or `FILE`, or nothing.
-
-| Flag | Effect |
-| --- | --- |
-| `-localize-symbol SYM` | Make that definition local |
-| `-localize-symbols FILE` | `-localize-symbol` for each line of `FILE` |
-| `-localize-hidden` | Make hidden and internal definitions local |
-| `-keep-global-symbol SYM` | Keep `SYM` global and make every other definition local |
-| `-keep-global-symbols FILE` | `-keep-global-symbol` for each line of `FILE` |
-| `-globalize-symbol SYM` | Make that definition global |
-| `-weaken-symbol SYM` | Make that global symbol weak, defined or undefined |
-| `-strip-symbol SYM` | Remove that symbol; it is an error if a relocation or section group names it |
-| `-strip-unneeded` | Remove local and undefined symbols that no relocation or section group names |
-| `-wildcard` | Treat the names above as shell patterns; a pattern starting with `!` excludes names |
-
-Bindings change in llvm-objcopy's order: localize, then keep-global, then
-globalize, then weaken. Removal comes after that. Names match input names, as
-for the renames. Undefined and common symbols are never made local.
-`-strip-unneeded` keeps section symbols and ARM/AArch64/RISC-V mapping symbols
-such as `$x`. Unlike llvm-objcopy, it does not remove debug sections;
-`-strip-debug` does that after binding inference.
-Local symbols must precede the others in ELF. Bao therefore rewrites the symbol
-table and renumbers every relocation, section group, extended section index
-and LLVM address-significance entry, in REL, RELA and CREL relocation
-sections. It rejects any other section that refers to symbol indices.
-
-`-wrap` applies to every input of the link. `-keep-global-symbol` and
-`-localize-hidden` therefore leave a wrapped symbol's definition and its
-`__wrap_` wrapper global, so the other inputs' wrapped references still
-resolve. Naming one with `-localize-symbol` still hides it.
-
-On Mach-O, a private extern (`N_PEXT`, from hidden visibility) counts as
-hidden. Localizing clears its external bits. Weakening sets `N_WEAK_DEF` on a
-definition or `N_WEAK_REF` on an import. Symbols marked no-dead-strip (from
-`__attribute__((used))`) or `REFERENCED_DYNAMICALLY` count as needed:
-`-strip-unneeded` keeps them, and `-strip-symbol` refuses them. Every Mach-O
-edit rewrites the symbol table in the order ld64 expects: locals in input
-order, then external definitions and imports, each sorted by name. It then
-renumbers extern relocations and the indirect symbol table. A wrapped
-definition's references in debug sections, `__LD,__compact_unwind` and
-`__eh_frame` keep naming the definition. An undefined `__real_SYM` beside a
-defined `SYM` in one object is bound directly to it and removed.
-
-On COFF, names need no underscore on amd64 and arm64. A `dllimport` caller's
-`__imp_SYM` follows its function: `-wrap SYM` turns it into
-`__imp___wrap_SYM`, and a rename renames it. COFF has no ordering between
-local and global symbols, so binding changes edit the storage class in place.
-Removing symbols renumbers relocations, weak-external tags and
-`.llvm_addrsig`. Rules specific to COFF:
-
-- COFF has no hidden visibility, so `-localize-hidden` matches nothing.
-- `-weaken-symbol` writes clang's weak encoding. Each symbol becomes a weak
-  external with `IMAGE_WEAK_EXTERN_SEARCH_ALIAS` and a default named
-  `.weak.NAME.default.SUFFIX`. SUFFIX is the object's first strong external
-  definition, as in LLVM.
-  - A weakened definition is renamed to its default in place, so a `/Gy`
-    COMDAT key stays its section's key.
-  - Code refers to the weak external, so a strong definition elsewhere wins
-    for the object's own calls too. Unwind and debug data keep naming the
-    default.
-  - A weakened reference gets an absolute zero default.
-  - The archive index lists a weakened definition under its name, but not a
-    weakened reference. Indexing that would let the linker pull its member
-    instead of the one with the strong definition.
-  - A COMDAT key whose selection already merges copies is left as it is.
-    Weakening a common symbol is refused.
-  - As with `-wrap`, a call that the assembler resolved inside one section
-    has no relocation and keeps the default. Compile with
-    `-ffunction-sections` or `/Gy`. MinGW GCC calls same-object functions
-    through their section even then.
-- A COMDAT section's key symbol is never stripped, even by `-strip-unneeded`.
-  Neither are section definitions or `@feat.00`.
-- A wrap does not redirect debug sections, `.pdata` or `.xdata`.
-- Calls within one section usually carry no relocation, so a wrap cannot
-  redirect them, as with lld-link. Compile with `-ffunction-sections` or
-  `/Gy` to keep them redirectable. GNU as for PE (MinGW GCC) refers to a
-  function defined in the same object through its section even then. Such
-  objects therefore get GNU ld's wrap semantics: only references through
-  the symbol move.
-- `.drectve` directives follow renames from `-redefine-sym` and
-  `-prefix-symbols`; a wrap leaves them alone. An `-exclude-symbols` entry
-  for a symbol that is no longer exported is dropped. An `/INCLUDE` or
-  `/ALTERNATENAME` of one is an error.
-- Bao selects Windows archive members itself, without a partial linker. A
-  Windows primary archive's binding edits are therefore applied member by
-  member, like a `-link-archive`.
-- Import library members, both short import declarations and the descriptor
-  and thunk objects with `.idata` sections, pass through unchanged and stay in
-  the archive index. A DLL import's name is also the export it binds to, so
-  `-prefix-symbols` leaves imports alone; references to them keep their names.
-  A wrap applies to the references in other members, and `-keep-global-symbol`
-  and the other flags that act on every definition skip imports. A flag that
-  names an import, such as `-redefine-sym malloc=my_malloc` or
-  `-localize-symbol __imp_malloc`, is an error.
-- Edited COFF archives use the Microsoft library format: two linker members
-  and NUL-terminated long names.
-
-A hidden symbol usually links the members of one archive together, so
-localizing it in each member separately breaks the archive. When the build's
-input is an archive with binding or strip flags, Bao first partially links it
-on its own with the native `ld -r`. It then edits the single object, and
-`bao-build.json` records `combined_first`. A `-link-archive` is searched, so its
-members are edited separately. So is any archive given to `bao objcopy`. That is
-an error when one member refers to a definition that another member no longer
-exports; use `-prefix-symbols` for such an archive.
-
-```sh
-# Keep only the Python C API and pythago's glue global in libpython.a. Its
-# vendored expat and HACL* symbols then cannot collide with a wheel's copies.
-bao build -target linux/arm64 -symbol pythago_main -wildcard \
-  -keep-global-symbol 'libpython.a=Py*' -keep-global-symbol 'libpython.a=_Py*' \
-  -keep-global-symbol 'libpython.a=pythago_*' -strip-unneeded libpython.a \
-  -link-archive wheels/libext1.a -o ./native libpython.a
-
-bao objcopy -localize-hidden -strip-unneeded libpython.o libpython-private.o
-```
-
-#### Section edits
-
-These flags remove sections or add symbols, as the llvm-objcopy flags of the
-same names do, in ELF, Mach-O and COFF objects. In `bao build` each names its
-component first, as for the binding flags.
-
-| Flag | Effect |
-| --- | --- |
-| `-remove-section SECTION` | Remove the section, its relocations and the symbols defined in it |
-| `-only-section SECTION` | Keep only matching sections, with their relocations; ELF also keeps groups and the symbol, string and section name tables |
-| `-add-symbol NAME=[SECTION:]VALUE[,FLAGS]` | Add a symbol at an offset in a section, or an absolute one without a section |
-| `-add-symbol NAME=@SYMBOL:OFFSET[,FLAGS]` | Add a symbol OFFSET bytes past a definition, in its section (a Bao extension) |
-
-Mach-O sections are named `SEGMENT,SECTION`, such as `__TEXT,__text`, as
-llvm-objcopy names them. `-wildcard` makes section names shell patterns too.
-`-add-symbol` flags are `global` (the default), `local`, `weak`, `default`,
-`hidden`, `protected`, `object`, `function` and `notype`. Adding a name the
-object already defines is an error. In an archive, a symbol is added to each
-member that has its section, and two members defining it is an error.
-
-`@SYMBOL` names the definition by its input C name: the only global one, or
-else the only local one. More than one is an error. The alias takes the
-target's section, or is absolute when the target is, so no section name is
-needed. That covers COFF objects whose COMDAT sections share a name. It also
-covers a Darwin primary archive that `ld -r` merges into one `__TEXT,__text`.
-
-On ELF, removal renumbers every section index: symbol sections, the extended
-index table, links, relocation targets, group members and the section name
-table index. A section group goes when its last member does. On Mach-O and
-COFF, the removed sections' headers leave the segment command or section
-table, and symbol and relocation section numbers are renumbered. Their
-contents stay in the file, unreferenced, so no other offset moves. The edit
-is refused in these cases:
-
-- A kept relocation or section group names a symbol defined in a removed
-  section. That includes an ELF or COFF section symbol, which unwind and
-  debug data usually name, as llvm-objcopy also refuses.
-- A kept Mach-O section-relative relocation names a removed section.
-  `__compact_unwind` and DWARF use these for `__text`. llvm-objcopy drops such
-  relocations instead, which leaves those entries unrelocated.
-- A kept ELF section links to a removed one.
-- A removal targets the ELF symbol, string or section name table.
-
-Unlike llvm-objcopy, `-only-section` keeps the relocations of the ELF sections
-it keeps, so the result still links.
-
-Format notes:
-
-- Mach-O data-in-code entries and linker optimization hints for addresses in
-  removed sections are dropped.
-- A removed Mach-O symbol pointer or stub section takes its run of the
-  indirect symbol table with it. The later sections' `reserved1` moves down,
-  and the run's symbols no longer count as referenced. llvm-objcopy leaves the
-  entries in the table, unreferenced. Apple's current `ld` rejects such
-  sections in 64-bit objects anyway ("non-lazy pointers sections no longer
-  supported"), so this matters for 32-bit objects.
-- A COFF associative COMDAT section, such as the `.pdata` and `.xdata` of an
-  MSVC-environment function section, goes with the section it is associated
-  with, as in llvm-objcopy. MinGW function sections such as `.text$f` keep
-  their unwind data in COMDAT sections of their own, `.xdata$f` and
-  `.pdata$f`; remove them together with `-wildcard -remove-section '*$f'`.
-- A COFF `.llvm_addrsig` entry for a removed symbol is dropped. llvm-objcopy
-  keeps it, with an index past the new symbol table.
-- A Mach-O `-add-symbol` value is an offset in its section, as in ELF objects.
-  `hidden` makes a private extern; Mach-O has no `protected` visibility and no
-  symbol types.
-- A COFF `-add-symbol` section name must be unique in the object. Several
-  COMDAT sections often share one, such as `.text` with clang-cl (`/Gy-`
-  avoids that) and `.text$mn` with `/Gy`; name a symbol with `@SYMBOL`
-  instead. COFF has no symbol visibility, and
-  its weak externals need a default definition, so `hidden`, `protected` and
-  `weak` are refused. `function` sets the function type.
-- On Mach-O and COFF, an undefined symbol of the added name becomes the
-  definition, so the object's references bind to it. ELF adds a separate
-  symbol, as llvm-objcopy does.
-- `ld -r` merges a Darwin primary archive's sections when `bao build` combines
-  it first, so section names then cover every member, and `ld -r` itself
-  drops `__DWARF` sections.
-
-```sh
-# Export an alias at the start of a function's section, and drop .comment.
-bao build -target linux/arm64 -symbol app_main -symbol app_entry_alias \
-  -add-symbol 'libapp.a=app_entry_alias=.text.app_main:0,function' \
-  -remove-section libapp.a=.comment -o ./native libapp.a
-
-# Drop Mach-O debug data and alias the function at the start of __text.
-bao objcopy -wildcard -remove-section '__DWARF,*' \
-  -add-symbol 'app_alias=__TEXT,__text:0,function' app.o app-nodebug.o
-
-# Alias a function wherever it is, in any format.
-bao objcopy -add-symbol 'app_entry_alias=@app_main:0,function' app.obj app-alias.obj
-```
+`bao build` can rename, wrap, prefix, localize, weaken or strip symbols, remove
+sections and add symbols in its ELF, Mach-O and COFF inputs before combining
+them, so a producer needs neither `objcopy` nor a second relinking step.
+`bao objcopy` applies the same edits to one object or archive, including ELF32,
+big-endian ELF, 32-bit and universal Mach-O, and COFF bigobj files. The flags
+follow ld.lld and llvm-objcopy: `-wrap`, `-redefine-sym(s)`, `-prefix-symbols`,
+`-localize-symbol(s)`, `-localize-hidden`, `-keep-global-symbol(s)`,
+`-globalize-symbol`, `-weaken-symbol`, `-strip-symbol`, `-strip-unneeded`,
+`-remove-section`, `-only-section`, `-add-symbol` and `-wildcard`. See
+[symbol edits](docs/symbol-edits.md) for their semantics, the rules for each
+format and examples.
 
 ### Function bindings and native debug stripping
 
@@ -1301,568 +852,19 @@ handling. MinGW GCC static archives requesting 64-byte code alignment also
 remain outside the checked stock-Go profile. Dynamic runtime profiles remain
 available for those compilers.
 
-### macOS dylibs
-
-A linked arm64 or x86_64 dylib can be the input instead of objects or an
-archive:
-
-```sh
-bao build -target darwin/arm64 -symbol python_entry -o ./py libpython3.13.dylib
-```
-
-A linked dylib reaches its data through PC-relative instructions without
-relocations, so Bao keeps its image together and lets it run where Go links it:
-- **Placement:** the image is one 16 KiB-aligned read-only section. Go's Darwin
-  linker places such host sections in `__TEXT,__rodata`, inside the
-  executable's `__TEXT` segment, so the dylib's code runs from signed pages of
-  the executable. The image needs no link-time relocations.
-- **Data pages:** the dylib's data segments are 16 KiB-aligned within the image,
-  so they never share a page with its code. At initialization they are made
-  read-write, fixed up, and `__DATA_CONST` is made read-only again. Code pages
-  are never written.
-- **Fixups:** chained fixups (`DYLD_CHAINED_PTR_64` and `_64_OFFSET`) or
-  `LC_DYLD_INFO` rebase and bind opcodes; lazy binds are bound eagerly. Each
-  bind resolves in the library its two-level namespace names, opened with
-  `dlopen` by its install name. A missing weak import is null.
-- **Library paths:** the dylib's code is part of the executable, so
-  `@executable_path` and `@loader_path` both name the executable's directory,
-  as dyld treats the main executable. `@rpath` tries the dylib's `LC_RPATH`
-  entries in order, each expanded the same way. The libraries must exist there
-  at run time, for example shipped next to the executable.
-- **TLS:** thread-local variables use Bao's Darwin TLS runtime. The template is
-  copied from the fixed-up image, so initializers may hold addresses, and each
-  TLV descriptor's thunk is replaced.
-- **Unwinding:** libunwind finds no compact unwind information for this code,
-  so `__unwind_info` is converted to DWARF FDEs. That covers arm64
-  `FRAME`/`FRAMELESS` and x86_64 `RBP_FRAME`/`STACK_IMMD`/`STACK_IND`,
-  including personality and LSDA. The FDEs are registered with
-  `__register_frame`, together with the dylib's own `__eh_frame` records.
-- **Initializers:** `__mod_init_func` or `__init_offsets` run in order, after
-  TLS is configured.
-- **Objective-C:** libobjc learns about images from dyld, so the loader
-  registers the dylib's metadata through libobjc's public API. It uniques
-  selector references (`sel_registerName`), registers protocols (or uses an
-  existing one of the same name), reads classes superclass-first with
-  `objc_readClassPair`, attaches categories' methods and protocols
-  (`class_replaceMethod`, `class_addProtocol`), and runs `+load` before the
-  initializers. Categories on other images' classes work, and their instance
-  and class properties are attached with `class_replaceProperty`.
-- **Swift:** the loader passes the image's protocol, conformance and type
-  records (`__swift5_protos`, `__swift5_proto`, `__swift5_types`) to
-  libswiftCore's `swift_registerProtocols`,
-  `swift_registerProtocolConformances` and `swift_registerTypeMetadataRecords`,
-  after the Objective-C step (Swift classes are Objective-C classes there).
-  Dynamic casts to protocols, generics, enums, errors, actors, NSObject
-  subclasses with `@objc` members, and subclasses of classes from resilient
-  frameworks (Objective-C class stubs) work. Automatic dynamic replacements
-  (`@_dynamicReplacement`, `__swift5_replace`) are enabled with
-  `swift_enableDynamicReplacementScope`, including replacements of functions in
-  other images. Replacements of functions with opaque result types
-  (`__swift5_replac2`) and distributed actors' accessible functions
-  (`__swift5_acfuncs`) are rejected: libswiftCore registers them only from
-  dyld's image callback. Runtime lookups that scan every image's reflection
-  sections by name do not see this one.
-- **Exports:** `SharedObjectExport(name)`, `SharedObjectExports()` and
-  `-symbol` accessors return the image's addresses.
-
-Not supported:
-- arm64e dylibs, and tagged or multi-start chained fixups.
-- Relocatable code combined with a dylib.
-
-`dladdr` reports the executable for the dylib's code, `__mod_term_func` does not
-run, and weak definitions are not coalesced across images. Making the
-`__TEXT` data pages writable has run only without the hardened runtime.
-
-### Linux arm64 / ELF
-
-`translate -target linux/arm64` handles native Linux AArch64 ELF64 relocatable code, independently
-of the Darwin container workaround. It reads system exports from actual target
-glibc/libgcc shared libraries in a producer sysroot. The final executable is
-Linux ELF and uses the stock Go internal linker.
-
-On a Linux arm64 producer, build from a Rust archive:
-
-```sh
-bao build -target linux/arm64 -sysroot / \
-  -symbol bao_example_run -o ./native /path/to/libnative.a
-```
-
-The consumer needs Go, optional PureGo for runtime binding mode, and compatible target system libraries; it needs
-neither the producer sysroot nor a native compiler. See
-[using generated Go packages](#using-generated-go-packages) for consumer builds.
-
-Imports normally resolve against the glibc and C++ runtime libraries. Name other
-sysroot libraries with `-linux-system-library libxcb.so.1` (repeatable). Each
-must exist in the sysroot, and it cannot replace a symbol the standard set
-already exports. The consumer machine must provide the same library.
-
-Each import binds a symbol version, as a static linker records one: the
-default (`@@`) version that the sysroot library defines, such as
-`pthread_cond_init@GLIBC_2.3.2` on x86_64. The generated directive is
-`pthread_cond_init#GLIBC_2.3.2`, which Go's linker records as a version
-requirement. An unversioned reference would bind the oldest version instead.
-On x86_64 that is `GLIBC_2.2.5`, the compatibility ABI, whose
-`pthread_cond_init` rejects a `CLOCK_MONOTONIC` condition attribute.
-
-The default versions set the oldest glibc that can load the result. That is
-the sysroot's own release for symbols whose default changed recently, such as
-`pthread_condattr_setclock@GLIBC_2.34`. To keep the floor that the inputs
-were built for, pass `-linux-max-symbol-version GLIBC_2.17` (repeatable, one
-per namespace such as `GLIBCXX_3.4.19`, or `"max_symbol_versions"` in the
-`linux` config section). Imports then bind the newest version at or below the
-cap. An import with no such version stays unversioned and is printed, and
-`linux_imports_above_version_cap` in bao-manifest.json lists it. The result
-loads on an older glibc, but fails if that import is bound there. Read that
-list before relying on the cap:
-
-- bao's own TLS runtime calls `__cxa_thread_atexit_impl`, from glibc 2.18,
-  the first time a thread uses native TLS, and aborts if it fails. An image
-  that uses native TLS therefore needs glibc 2.18 whatever the cap.
-- glibc 2.34 moved libpthread, libdl, librt, libutil and libanl symbols
-  into libc.so.6, keeping their old versions there. An import bound to
-  such an old version, such as `pthread_key_create@GLIBC_2.17`, names its
-  original library, here libpthread.so.0. Before 2.34 the symbol is
-  defined only there. glibc 2.34 and later keep that library as a stub
-  with the same version nodes, so the import resolves to libc.so.6. Bao
-  applies this to a fixed list of the 210 symbols concerned, taken from
-  glibc 2.33. It also applies when a shared-object input requires such a
-  version.
-- An import the inputs declare weak, such as an optional `getentropy` or
-  `sem_clockwait`, is listed too. The weak-reference paragraph below says
-  when a target may lack it.
-- Some symbols have no older version because they were never exported
-  before. For example, `stat64`, `fstat64` and `lstat64` became libc exports
-  in glibc 2.33. Before that they were static wrappers in
-  `libc_nonshared.a` around `__xstat64`, `__fxstat64` and `__lxstat64`. An
-  input built against glibc 2.33 or later imports `@GLIBC_2.33`, and no cap
-  can move it older. To keep an older floor, define the wrappers yourself in
-  the inputs, calling the `__*xstat64` functions with the version argument
-  that glibc's pre-2.33 headers define as `_STAT_VER` for the target.
-
-On every Linux target, an executable section aligned beyond 4096 bytes fails
-translation by default. Stock Go's linker starts `runtime.text` at its 4 KiB
-text address and then rounds the `.text` section up to the larger alignment,
-so method offsets no longer match `runtime.text`. Interface method calls
-through itabs built at run time then call the wrong function. Earlier packages
-silently produced such binaries. libffi's AArch64 `trampoline_code_table`
-(16 KiB) is one source. `-linux-max-text-alignment 4096` (or
-`"max_text_alignment": 4096` in the `linux` config section) links these
-sections at 4096 bytes, prints a notice and lists them under
-`linux_capped_text_alignments` in bao-manifest.json and as
-`BAO-ELF-TEXT-ALIGNMENT-CAPPED` in diagnostics. Code that depends on the
-stronger alignment, such as libffi's static trampolines on kernels with pages
-larger than 4 KiB, is unverified under the cap.
-
-Common symbols, which a partial link leaves unallocated, get zero-filled space
-in one `.bss.bao.common` section, with each symbol's size, alignment, binding
-and visibility, as a final link allocates them. They come from assembler
-`.comm` directives, such as OpenSSL's hidden `OPENSSL_ia32cap_P`, or from C
-tentative definitions built with `-fcommon`.
-
-A weak reference that no sysroot library defines reads as NULL, and
-`unavailable_weak_symbols` in bao-manifest.json lists it; a missing strong
-import is rejected. On amd64 that covers loads, calls and comparisons through
-its GOT slot, including `cmpq $0, sym@GOTPCREL(%rip)`, whose immediate after the
-displacement biases the relocation by -5, as in zstd's optional trace hooks.
-Other uses are refused with the symbol, section and offset. A weak import that
-the sysroot defines may still be missing on an older target. It is optional
-only if the code checks it before calling it. Where Bao binds it at package
-initialization, a target that lacks it gives 0, as the dynamic linker would.
-That covers every import of a shared-object input and pointers to it in an
-archive's data. An archive's code references, such as calls and GOT loads, are
-left to Go's linker. Go's linker cannot record a weak dynamic import, so the
-target must define those symbols or the executable fails to start.
-
-Every Linux target expects glibc and one combined native image. On arm64,
-native TLS must use descriptors (TLSDESC); other native TLS models, native IFUNC
-definitions, preinit arrays and static musl are not supported. A linked shared object is accepted as described in
-[Linux shared objects](#linux-shared-objects). Other architectures use their
-separate target profiles.
-
-TLS initializers may hold absolute pointers to image data or system imports,
-such as mimalloc's `__thread mi_heap_t *_mi_heap_default = &_mi_heap_empty`.
-Bao writes them into its native TLS template before any thread copies it. A
-pointer to another TLS variable, or any other relocation in a TLS template,
-is rejected. This applies to every Linux target; it has run natively only on
-arm64. Conditional and test-bit branches (`R_AARCH64_CONDBR19`,
-`R_AARCH64_TSTBR14`), which Go's linker does not apply, are resolved during
-translation when the target is in the same section; other targets fail
-translation. Unreferenced local absolute symbols, such as OpenSSL perlasm
-constants, are dropped; a relocation against an absolute symbol is rejected.
-
-glibc keeps `atexit` in the static `libc_nonshared.a`, and its version loads
-the value of `__dso_handle`, which Bao's private DSO identity does not
-provide. Libraries that call `atexit` need a small wrapper such as
-`int atexit(void (*f)(void)) { return __cxa_atexit((void (*)(void *))f, 0, &__dso_handle); }`.
-Code built with AArch64 outline atomics (the default of many Linux GCC and
-Clang toolchains) needs `__aarch64_cas*`/`__aarch64_ldadd*` helpers: pass
-`-link-archive "$(gcc -print-libgcc-file-name)"` or compiler-rt builtins, or
-build with `-mno-outline-atomics`. Other glibc/toolchain combinations need
-separate verification.
-The [example README](examples/linux_runtime/README.md) records the final
-pthread-destructor-pass boundary and process-lifetime libc bookkeeping after
-explicit main-thread finalization.
-`translate-elf` remains a compatibility alias; the `pack` and `probe-*`
-commands remain available for low-level diagnostics.
-
-On a native Linux host with the pinned Go SDK, GCC, binutils and a compatible
-glibc sysroot, `sh ci/cgo-linux.sh` exercises fresh typed bindings with and
-without cgo, including a separate cgo package and native TLS cleanup. Results
-and generated inputs are left under `.work/`.
-
-#### Linux TLS lookup
-
-Each thread's native TLS block is allocated on its first TLS access. Bao then
-records it in a process-wide table indexed by a hash of the thread pointer. A
-TLS access that finds the calling thread's entry costs a few loads, with no
-call and no `pthread_getspecific`. On arm64 and amd64 the TLSDESC thunk then
-saves three scratch registers instead of the full register and vector state.
-Threads whose hashes collide share a table slot and take the slower path in
-turn; that is still correct, only slower. Entries are removed when a thread's
-TLS is finalized. A forked child removes every entry but the forking thread's,
-because glibc may give a new thread in the child a dead thread's stack and so
-its thread pointer. As before, the child does not reclaim those threads' TLS
-blocks.
-
-`-linux-static-tls` (config key `linux.static_tls`) goes further: the image's
-TLS moves into glibc's static TLS, at one constant offset from every thread
-pointer, as for a library linked at startup. A TLS descriptor then resolves
-with a single load (`ldr x0, [x0, #8]` or `movq 8(%rax), %rax`), and a
-`__tls_get_addr` call adds that offset to the thread pointer. During package
-initialization, after the template's pointer fixups, the generated package:
-
-1. writes a small shared object to a memfd. Its PT_TLS segment is the
-   template, and its one relocation is an initial-exec reference to its own
-   TLS.
-2. dlopens it through `/proc/self/fd`. glibc must then place it in static
-   TLS, copying the template into every existing and future thread, or
-   refuse it.
-3. repoints the image's TLS descriptors at the constant resolver.
-
-glibc looks up a dlopen path among already loaded objects' names before it
-opens the file. So the memfd stays open for the life of the process, one
-file descriptor, and no later memfd gets its number and with it this
-module. If an object with that name is already loaded, the package does
-not use static TLS.
-
-glibc's spare static TLS is small. On glibc 2.41 a 1664-byte template fits by
-default and a 1728-byte one does not, on both arm64 and amd64. That space is
-shared with other libraries loaded later that use initial-exec TLS. It also requires
-the template's alignment to be no larger than its static TLS alignment, 64
-bytes on arm64. If memfd_create, /proc or the dlopen fails, the package keeps
-Bao's per-thread blocks, as without the flag. `TLSStatic()` reports which
-mode is in use. `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=N` raises the
-spare space at process start.
-
-Because the space is shared, the flag is opt-in: a library dlopened later
-that needs static TLS can fail to load once Bao has used it. With static TLS,
-glibc owns each thread's block. `TLSLiveBlocks` and `TLSDestroyedBlocks`
-then count only threads that registered native thread-exit destructors, such
-as C++ `thread_local` objects or Rust TLS with destructors. Finalizing a
-thread runs its destructors and restores the template's values in place,
-just as a new block would start with them.
-
-### Linux shared objects
-
-On every Linux target (arm64, amd64, loong64 and ppc64le), a linked PIC shared
-object, such as a distribution's `libpython3.13.so.1.0`, can be the input
-instead of an archive:
-
-```sh
-bao build -target linux/arm64 -sysroot / -o ./py libpython3.13.so.1.0
-```
-
-To add relocatable code that calls the library, such as an `atexit` wrapper or
-callback trampolines, pass that code as the input and the library with
-`-linux-shared-object` (config key `linux.shared_object`). The input is combined
-as usual and may reference the library's exports; the library's constructors
-run first.
-
-```sh
-bao build -target linux/arm64 -sysroot / -symbol glue_run \
-  -linux-shared-object libpython3.13.so.1.0 -o ./py libglue.a
-```
-
-`-wrap SYMBOL` applies to the library's imports too. The library's import of
-`SYMBOL` binds to the input's `__wrap_SYMBOL`, through its GOT and PLT slots.
-The input's `__real_SYMBOL` binds to the system symbol, with the version the
-library was linked against. A dynamic link cannot do this: whatever
-`--wrap` did, ld.so resolves the library's imports by name at run time. Bao
-can because it links the library's image into the package.
-
-- Only imports move. The library's calls to functions it defines itself do
-  not.
-- An import of `__wrap_SYMBOL` that the library already has binds to the same
-  wrapper.
-- Refused: a wrapped symbol that the library imports but the input does not
-  wrap, and a library that defines `__wrap_SYMBOL` itself.
-
-For example, glue that runs the library's threads on its own scheduler:
-
-```sh
-bao build -target linux/arm64 -sysroot / -symbol glue_run \
-  -wrap pthread_create -wrap pthread_join \
-  -linux-shared-object libpython3.13.so.1.0 -o ./py libglue.a
-```
-
-The library's code reaches its data through PC-relative instructions that no
-longer carry relocations, so Bao keeps its whole load image together as one
-4 KiB-aligned executable section in Go's text. Dynamic relocations become
-link-time pointers, init-time import fixups and Bao TLS descriptors. The
-generated package makes the writable segments read-write, and not executable,
-before native code runs, then makes RELRO read-only again after the fixups. It
-runs `DT_INIT` and `.init_array` at package initialization; `FinalizeRuntime`
-runs `.fini_array` and `DT_FINI`. The library's `.eh_frame` is registered in
-place.
-
-- Every default-version export (functions and data) is a native symbol that
-  `-symbol` can select and the relocatable input can call.
-  `SharedObjectExport(name)` returns any export's run-time address, and
-  `SharedObjectExports()` lists the names.
-- Functions from the library's `.symtab` are named in the executable's symbol
-  table for tools such as `perf` and `addr2line`. Where Go's function lookup
-  table would overflow, some names are left out; the manifest counts them.
-- Versioned imports are bound with `dlvsym` to the version the library was
-  linked against. glibc's compatibility versions of `exp`, `log`, `pow` and
-  `pthread_kill` are different code from their current defaults. Translation
-  fails if the sysroot lacks a required version.
-- Imports resolve against the standard library set and
-  `-linux-system-library`, as for archives. A `DT_NEEDED` library outside that
-  set, such as `libutil.so.1` on an older sysroot, must be named.
-- `bao-manifest.json` records the library under `shared_object`: its image
-  size, writable and RELRO ranges, largest supported page size, relocation
-  counts, versioned imports and exports.
-
-The largest supported page size is the smallest distance between a writable
-segment and executable code, at most 64 KiB, so that no page is both. GNU ld's
-default maximum page size is 64 KiB on AArch64, LoongArch and PowerPC64, which
-allows every page size those kernels use, and 4 KiB on x86-64, where the
-fixture allowed 8 KiB pages. The generated package panics on a kernel with
-larger pages.
-
-Thread-local storage uses Bao's per-thread template:
-
-| Target | TLS in the shared object |
-| --- | --- |
-| arm64 | TLS descriptors, the `-fPIC` default |
-| amd64 | `__tls_get_addr` (the default) or GNU2 descriptors (`-mtls-dialect=gnu2`) |
-| loong64 | `__tls_get_addr`, the default; `-mtls-dialect=desc` is rejected |
-| ppc64le | `__tls_get_addr`; link with `-Wl,--no-tls-get-addr-optimize`, since `__tls_get_addr_opt` is rejected |
-
-Initial-exec TLS, text relocations, IFUNCs and copy relocations are rejected,
-as are PIEs and files without section headers. On ppc64le the image's
-functions set up their own TOC from `r12` at their global entry point, so
-relocatable input must call them through function pointers; a direct call is
-rejected, because Go's linker has no cross-TOC call stubs. The
-library's symbols bind within the image as `-Bsymbolic` would; nothing can
-interpose them. Loading the library's own extension modules with `dlopen`
-needs its exports in the executable's dynamic symbol table, which Bao does not
-provide. The consumer must use Go's default build mode: the image's pointers
-are applied in text, which `-buildmode=pie` leaves unrelocated, and the
-generated package panics at initialization if it finds them so.
-
-### Linux amd64 / ELF
-
-`build -target linux/amd64 -sysroot /` accepts PIC ELF64 archives with a target
-glibc sysroot and GNU linker. The checked C++ profile is GCC 14.4.0 or Clang
-19.1.7 with GCC's libstdc++, glibc 2.41 and GNU ld 2.44. It supports
-exceptions caught inside C++, RAII cleanup, aligned TLS/destructors, native
-constructors, imported data, and explicit static finalization in one combined
-native image. Both runtime registration and DWARF-inferred assembly bindings
-are checked. See the [Docker examples](examples/cpp_linux/README.md), which also
-cover Linux arm64 with both compilers.
-
-The amd64 TLS profile accepts general/local dynamic TLS with ordinary SysV
-`__tls_get_addr` calls and GNU2 TLSDESC (`-mtls-dialect=gnu2`), including
-local-dynamic `_TLS_MODULE_BASE_` sequences. TLSDESC calls enter a Bao thunk.
-When the calling thread's block is in the lookup table described under
-[Linux TLS lookup](#linux-tls-lookup), the thunk clobbers only the flags, as
-glibc's own descriptor resolvers may. Otherwise it preserves the other
-general registers, flags, x87/MXCSR and XSAVE AVX/AVX-512 state while the C
-lookup runs. TLSDESC output has run only under QEMU, with AVX2 and SSE-only CPU
-models; AVX-512 preservation is unverified. Initial/local exec TLS (`R_X86_64_GOTTPOFF`, `R_X86_64_TPOFF32`)
-is rejected: it assumes the image's TLS sits at a fixed offset from the
-thread pointer, which Bao's per-thread blocks cannot provide. Native IFUNC
-definitions, preinit arrays and static musl remain unsupported; linked shared
-objects follow [Linux shared objects](#linux-shared-objects). Rust std is checked in the
-[static-runtime profile](#linux-runtimes);
-Clang with libc++ is unverified. Exceptions must stay inside native code;
-Go process exit does not run C++ static destructors. Explicit TLS/static
-finalization must follow the last native use.
-
-### Supported boundaries
-
-Linux loong64/glibc and ppc64le/glibc ELFv2 are separate experimental
-profiles. Their Rust runtime and typed-binding examples and their GCC 14.2 and
-Clang 19.1.7/libstdc++ C++ lifecycle suites run under QEMU; see
-[platform support](#platform-support). The source CI gate requires Rust examples
-from the same cross image before those C++ legs; release reuses the validated
-CI results. See the [cross-image recipe](testdata/toolchains/README.md) and
-[C++ checks](examples/cpp_linux/README.md).
-
-The Darwin profiles use little-endian arm64 and generic x86_64 MH_OBJECT input, one combined native
-runtime image per consumer executable,
-Darwin C ABI exports and system imports available in the supplied v4 SDK text
-stubs. Runtime verification is pinned to Go 1.26.11, Rust 1.99.1 and SDK 26.5.
-Other versions require rerunning the checks. Input objects are trusted build
-artifacts, not a hardened adversarial file format boundary.
-TLS-free C/no_std libraries can use the runtime translation path as well.
-`pack` retains its narrower byte-preserving leaf profile. Multiple separately
-translated Rust std runtime images in one executable are not verified.
-
-Unsupported inputs fail explicitly where recognized: arm64e objects, native
-ObjC/Swift image metadata or class registration in object input (a
-[dylib input](#macos-dylibs) registers it), indirect/stub sections,
-unsupported segments/relocations, tentative common/absolute/indirect symbols,
-TLS template relocations, TLS initializer callbacks, native terminator tables
-without an explicit shutdown policy, compact unwind encodings
-with personality/LSDA augmentation that cannot be synthesized, and custom
-initializer ABIs requiring dyld's fourth/fifth arguments. Calling existing ObjC
-classes through the runtime is exercised; Objective-C exception propagation
-across Go is not supported. Native AppKit windows/input, Metal rendering,
-notarization and general `go get` artifact distribution are unverified.
-
-The amd64 profile uses baseline x86-64/SSE2. Its TLV thunk preserves the other
-general registers, flags, x87 state and 128-bit XMM0–15; preservation of upper
-AVX/AVX-512 lanes is unverified. Compact unwind supports RBP frames and existing
-DWARF, and explicitly rejects frameless compact modes or unsupported augmentation.
-Intel data-in-code annotations are retained as provenance while inline jump
-table bytes remain in place.
-
-### Windows producer reference
-
-Produce ordinary COFF objects/archives for `windows/amd64` or `windows/arm64`.
-Bao selects archive members itself and emits COFF `.syso` files for Go's internal
-linker. A native partial linker is not required.
-
-```sh
-clang --target=x86_64-w64-windows-gnu -O2 -g -ffreestanding \
-  -funwind-tables -c examples/windows_runtime/native.c -o native.obj
-llvm-ar rcS native.a native.obj
-bao build -target windows/amd64 -bindings dwarf -symbol bao_windows_run \
-  -o ./native native.a
-```
-
-For ARM64, use `aarch64-w64-windows-gnu` and `windows/arm64`. MSVC and clang-cl
-CodeView inputs require an explicit signature manifest; DWARF inference is
-available for compatible Clang/GCC inputs. The checked MSVC C++ flags are
-`/O2 /Z7 /MD /GS- /std:c++20 /EHsc /GR-`, plus
-`/forceInterlockedFunctions-` on ARM64. Use the dynamic release CRT (`/MD`);
-static/debug Microsoft CRT requests remain unsupported.
-
-Use `-windows-cxx-runtime libc++` for LLVM-MinGW, or the default mapping for
-MSVC/MinGW GCC. Dynamic C++ packages need the matching Microsoft runtime DLLs
-or GNU C++/unwinder DLLs. Additional system functions require explicit
-`-windows-import Function=system.dll` mappings or a producer-named
-`-windows-import-library PATH` (repeatable). `-windows-crt ucrt` (default)
-or `-windows-crt msvcrt` must match the native toolchain.
-
-An import library such as LLVM-MinGW's `libuser32.a` supplies by-name
-IMPORT_CODE records for names that are otherwise unbound. The first listed
-library wins; `-windows-import` and Bao's built-in bindings take precedence.
-Data, ordinal and wrong-machine records grant nothing. Import records inside the
-native input or a `-link-archive` still grant no DLL binding. Each named library
-is recorded by name and SHA-256 in `bao-manifest.json`.
-
-Generated packages look up each system function when the package initializes. If
-a function or its DLL is missing, the program still starts, and only a call to
-that function prints its name to stderr and exits with status 2. That call cannot
-be recovered from, because Go cannot unwind native frames. Functions that depend
-on an activated assembly need it in the consumer: `TaskDialogIndirect`, for
-example, requires a Common-Controls 6.0 application manifest. Imported data is
-still resolved at startup and fails there, because it has no call to intercept.
-
-Go's PE reader cannot provide data alignment above 32 bytes, so a section
-requesting more fails by default. `-windows-max-data-alignment 32` links
-read-only data sections at 32 bytes instead; writable data and code still fail.
-This is an opt-in compromise: it breaks the alignment the native code declared,
-so use it only when that code does not depend on the extra alignment, as with
-tables aligned for cache behavior. Capped sections are listed under
-`windows_capped_alignments` in `bao-manifest.json`, and the generated runtime
-check enforces the applied value.
-
-For GNU Rust std, the checked Rust 1.99.1 targets are
-`x86_64-pc-windows-gnu` and `aarch64-pc-windows-gnullvm`, using
-`panic = "unwind"`. Link the matching LLVM-MinGW static unwinder and CRT
-compatibility wrappers. This Bash example includes the runtime notices:
-
-```sh
-export RUSTUP_TOOLCHAIN=1.99.1
-rustup target add --toolchain 1.99.1 aarch64-pc-windows-gnullvm
-runtime_prefix="$LLVM_MINGW/aarch64-w64-mingw32"
-rust_docs="$(rustc --print sysroot)/share/doc/rust"
-notices=(-link-notice "$LLVM_MINGW/LICENSE.TXT"
-  -link-notice "$runtime_prefix/share/mingw32/COPYING.MinGW-w64-runtime.txt"
-  -link-notice "$rust_docs/COPYRIGHT-library.html")
-for license in "$rust_docs"/licenses/*; do notices+=(-link-notice "$license"); done
-bao build -target windows/arm64 -manifest-path examples/windows_std/Cargo.toml \
-  -locked -offline -bindings examples/windows_std/signatures.json \
-  -symbol bao_windows_std_run -symbol bao_windows_std_check -symbol bao_windows_std_counts \
-  -link-archive "$runtime_prefix/lib/libunwind.a" \
-  -link-archive "$runtime_prefix/lib/libmingwex.a" \
-  -link-archive "$runtime_prefix/lib/libucrt.a" \
-  -require-static-runtime "${notices[@]}" -o ./native
-```
-
-For amd64, use `windows/amd64`, install `x86_64-pc-windows-gnu` and select the
-`x86_64-w64-mingw32` prefix. Omit `-bindings` for PureGo registration.
-See [bundling language runtimes](#bundling-language-runtimes) for C++
-archives and [examples/windows_std](examples/windows_std) for the complete std
-fixture. The smaller `examples/windows_runtime` Rust crate uses `no_std`.
-
-COFF weak aliases, common symbols and COMDAT selection are supported, including
-`ANY`, `NODUPLICATES`, `SAME_SIZE`, `EXACT_MATCH`, `LARGEST`, `NEWEST` and
-`ASSOCIATIVE`. Conflicting/malformed selection metadata is rejected. Ordinary
-data alignment is limited to 32 bytes and code alignment to 16 bytes. TLS supports
-alignment up to 8192 bytes and a 64 MiB template; unrecognized access forms and
-TLS template relocations are rejected. Managed FLS keys must stay within the
-image; destructor re-registration is bounded to four rounds. Native lifecycle
-callbacks must not throw. Bigobj inputs (which `bao objcopy` can still edit),
-ARM64EC and MSVC Rust targets remain unsupported.
-Debug stripping retains runtime unwind metadata.
-
-#### Windows DLLs
-
-A linked 64-bit DLL can be the input instead of COFF objects:
-
-```sh
-bao build -target windows/amd64 -symbol python_entry -o ./py python313.dll
-```
-
-A linked DLL's code reaches its data through PC-relative instructions without
-relocations, and Go's PE reader gives host code only function alignment, which
-ARM64 page-relative addressing cannot use. So the generated package embeds the
-DLL's prepared image and loads it at initialization into memory from
-`VirtualAlloc`, as the Windows loader would:
-- **Load steps:** base relocations; imports by name or ordinal, resolved with
-  `LoadLibrary`; section protections; the DLL's function table, registered with
-  its own base; TLS; then `DllMain(DLL_PROCESS_ATTACH)`.
-- **Shutdown:** `Shutdown` calls `DllMain(DLL_PROCESS_DETACH)` and then the TLS
-  callbacks.
-- **Exports:** every export is reachable through `SharedObjectExport(name)` and
-  `SharedObjectExports()`; `-symbol` selects exported functions for accessors
-  and typed bindings.
-- **Exceptions:** the DLL's exception handlers (SEH, MSVC C++, MinGW) work
-  unmodified, because the registered function table gives them the DLL's base.
-  RtlPcToFileHeader finds no module for private memory, which breaks MSVC's C++
-  throw; Bao's helper replaces the DLL's imports of `RtlPcToFileHeader` and
-  `_CxxThrowException` so the DLL's base is reported for its own addresses.
-- **TLS:** implicit TLS uses Bao's helper storage. Each TEB TLS-array load in the
-  DLL's code (`mov reg, gs:[0x58]` or `ldr xN, [x18, #0x58]`) is redirected to
-  a thunk. It must be within 64 bytes of a PC-relative reference to the DLL's
-  `_tls_index`, which the compiler's TLS sequence has; otherwise translation
-  fails. TLS callbacks run with the DLL's base.
-
-Not supported:
-- 32-bit DLLs, .NET assemblies, writable executable sections, and DLLs without
-  base relocations.
-- Relocatable code combined with a DLL.
-- Loading the DLL's own dependencies from inside the image: imports use the
-  ordinary `LoadLibrary` search.
-
-`DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH` are not delivered, and the DLL has
-no module handle: `GetModuleHandle` and `GetModuleFileName` do not know it, and
-its `DllMain` receives its base as `HINSTANCE`.
+### Platform reference
+
+Each target family has its own producer reference:
+
+- [Darwin](docs/darwin.md): the object profile and its unsupported inputs,
+  linked dylib input with Objective-C and Swift registration, and
+  implementation notes.
+- [Linux](docs/linux.md): sysroots and system libraries, symbol versions and
+  `-linux-max-symbol-version`, weak references, alignment and toolchain
+  requirements, TLS (including opt-in `-linux-static-tls`), linked shared object
+  input, and implementation notes.
+- [Windows](docs/windows.md): COFF producer profiles, compiler flags, imports
+  and CRTs, GNU Rust std, linked DLL input, and implementation notes.
 
 ### Distributing a generated package
 
@@ -1885,7 +887,7 @@ both modes; see [licensing](#licensing). Windows lifecycle packages also include
 For Bazel consumers, provide a public `go_library` with the module's import
 path and generated files in `srcs`. Include its `BUILD` files in the complete
 module tree before signing. Consumer applications configure their own
-`go_binary` and invoke the [Bazel verification backend](#bazel-consumer-builds).
+`go_binary` and invoke the [Bazel verification backend](docs/signature-verification.md#bazel-consumer-builds).
 
 ### Signing library releases
 
@@ -1903,14 +905,6 @@ bao sign -root ./generated-module -module example.org/native \
   -target darwin/arm64 -release v1.2.3 \
   -key /secure/release-key.pem -o /release/native-darwin-arm64.json
 ```
-
-`keygen` prints the public key as base64 plus its key ID (SHA-256 of the raw
-Ed25519 public key). `sign` prints that ID and the signed payload's SHA-256.
-Its envelope contains base64 `payload` and `signature` and a `key_id`.
-The payload is JSON schema 1: `module`, exact `target`, `release`, and sorted
-`files` entries containing `path` and `sha256`. Ed25519 signs the bytes
-`bao.module-release.v1\0` followed by the exact payload bytes. Verification
-does not reserialize or canonicalize untrusted JSON before checking a signature.
 
 ### Go library packages
 
@@ -2008,109 +1002,16 @@ are rejected. Thin archives are rejected without reading their external members.
 Ownership, mode and timestamp fields and symbol-index contents are not decoded
 or validated. This is a structural archive parser, not artifact authentication.
 
-### Diagnostics
+### Config files and diagnostics
 
-`build`, `translate` and `inspect` accept these flags; `doctor` accepts them for
-its toolchain checks. They collect errors rather than only logging more: `-v`
-keeps going within a stage and reports everything found there.
-
-| Flag | Effect |
-| --- | --- |
-| `-v` | One line per stage with limits and headroom |
-| `-vv` | Adds the symbols behind each number |
-| `-trace SYMBOL` | SYMBOL's state at each stage; repeatable |
-| `-report FILE` | Findings as JSON, for CI artifacts |
-| `-assume-consumer net,crypto/x509` | Counts libraries those dependencies add |
-
-```text
-limits OK sections 25 / 65,279 (headroom 65,254)
-imports FAIL 43 unresolved: xkb 29, xcb 14
-imports HINT -linux-system-library libxcb.so.1 would satisfy 14
-functions SKIPPED generation failed; no objects to measure
-stopped: 1 failures; no package written
-```
-
-Diagnostics go only to stderr or the report file, and they do not change the exit
-code or generated objects. Unresolved imports are listed together on every
-platform, with or without `-v`. A stage that did not run prints `SKIPPED` with
-the reason. A clean report means no known limit was exceeded; it does not verify
-execution. The findfunc density is a prediction from object layout.
-
-Findings have stable IDs: `BAO-ELF-SECTIONS`, `BAO-MACHO-SECTIONS`,
-`BAO-COFF-SECTIONS`, `BAO-GO-FINDFUNC`, `BAO-MACHO-ORDINAL`,
-`BAO-MACHO-FLAT-BIND`, `BAO-IMPORT-MISSING`, `BAO-ELF-TEXT-ALIGNMENT-CAPPED`,
-`BAO-COFF-ALIGNMENT-CAPPED` and `BAO-GENERATE`.
-
-`bao inspect -v -manifest bao-manifest.json ./program` reads a built Mach-O
-executable, reports flat-namespace binds, and compares each bind's dylib with
-the manifest. It exits non-zero on a failure. Library hints on Linux are advice:
-binding still requires `-linux-system-library`. `-trace` reads each stage's
-artifacts, so the translator stage it names is labeled as an inference.
-
-### Config files
-
-`bao build` and `bao translate` can read their options from a JSON file instead
-of the command line:
-
-```sh
-bao build -config bao.json -target windows/amd64 -o ./native native.lib
-```
-
-```json
-{
-  "schema": 1,
-  "package": "native",
-  "symbols": ["native_add"],
-  "bindings": {
-    "schema": 1,
-    "abi": "c",
-    "functions": [
-      {"name": "Add", "symbol": "native_add", "params": ["int64", "int64"], "result": "int64"}
-    ]
-  },
-  "linux": {
-    "sysroot": "${SYSROOT}",
-    "system_libraries": ["libxcb.so.1"]
-  },
-  "windows": {
-    "cxx_runtime": "libc++",
-    "max_data_alignment": 32,
-    "link_archives": ["${MINGW}/lib/libunwind.a"],
-    "import_libraries": ["${MINGW}/lib/libuser32.a"]
-  }
-}
-```
-
-`bindings` is an inline manifest, a manifest path, or `dwarf`. Other top-level
-keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `link_notices`,
-`require_static_runtime`, the [symbol edits](#symbol-edits) `wrap`,
-`redefine_symbols` (`OLD=NEW` strings), `redefine_symbol_files` and
-`prefix_symbols` (an object from path to prefix), `wildcard`, `symbol_visibility`
-(an object from path to `localize_symbols`, `localize_symbol_files`,
-`localize_hidden`, `keep_global_symbols`, `keep_global_symbol_files`,
-`globalize_symbols`, `weaken_symbols`, `strip_symbols`, `strip_unneeded`,
-`remove_sections`, `only_sections` and `add_symbols`),
-and `cargo` (`manifest_path`, `package`, `offline`,
-`locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
-`sysroot`, `ld`, `system_libraries`, `max_symbol_versions`, `max_text_alignment`, `shared_object` and `static_tls`; `windows` takes `imports`,
-`import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
-section also accepts `link_archives`, `link_notices` and
-`require_static_runtime`.
-
-Only the section for the build's target applies, and its link inputs follow the
-common ones. Paths are relative to the config file and may use `${VAR}`; an
-unset variable is an error. `${BAO_GOOS}`, `${BAO_GOARCH}` and `${BAO_CPU}` name
-the build target, with `${BAO_CPU}` being `x86_64`, `aarch64` and so on, so
-`${LLVM_MINGW}/${BAO_CPU}-w64-mingw32/lib/libuser32.a` serves both architectures.
-They are not available in `input`, which can decide the target. A flag given on the command line replaces that whole
-setting, including every entry of a repeatable flag. Unknown or duplicate keys
-are errors, as is a setting the command cannot use. `-o` and the diagnostics
-flags stay on the command line.
-
-Without `-config`, Bao uses `.bao.config.json` from the working directory if it
-exists and notes this on stderr. Parent directories are not searched. Use
-`-config ''` to run without it. The file can name a linker through `ld`, so
-review it before building in a checkout you do not trust.
+`bao build` and `bao translate` can read their options from a JSON file with
+`-config`. Without `-config`, Bao uses `.bao.config.json` from the working
+directory if it exists and notes this on stderr. The file can name a linker
+through `ld`, so review it before building in a checkout you do not trust.
+`-v`, `-vv`, `-trace SYMBOL` and `-report FILE` report limits, unresolved
+imports and other findings without changing the generated package. See
+[config files and diagnostics](docs/config.md) for the keys, the diagnostic
+output and finding IDs.
 
 ### Other commands
 
@@ -2134,7 +1035,7 @@ Use `translate` for the maintained Darwin output.
 | Accelerate | Strided vector addition and dot product versus scalar Rust |
 | Rust runtime + CoreFoundation | Caught panic, RAII cleanup, native threads, aligned TLS, TLS destructors, initializer ABI/order, data pointer fixups and addends |
 
-See [Darwin example verification](#darwin-example-verification) to run these checks.
+See [Darwin example verification](docs/maintainers.md#darwin-example-verification) to run these checks.
 
 [Darwin C++ lifecycle probes](examples/cpp/README.md) separately check exceptions,
 128-byte-aligned TLS and destructors, static construction and explicit static
@@ -2165,37 +1066,6 @@ bazel run //:bao -- targets
 bazel run //:bao -- help build
 ```
 
-### Runtime support and boundaries
-
-Pre-generated argument moves need a Go/native runtime transition. The adapters
-use the pinned Go runtime's `cgocall` path to switch to the native system stack
-and release the scheduler while native code blocks. They bundle adapted runtime
-bootstrap sources from PureGo v0.11.3's `internal/fakecgo`, preserving its
-Apache-2.0/Ebitengine and BSD/Go Authors notices. Generated packages carry both
-license texts, a notice and upstream source hashes. The call adapters themselves
-are Bao-authored. This removes the module/runtime-registration dependency; it
-does not claim that all bootstrap code was independently reimplemented.
-
-### Verification implementation
-
-The [verified-build flow](#go-build-flow-and-cache-boundary) addresses Go's cache
-caveat by construction. A standalone link hook can
-be skipped entirely when Go reuses a cached build result. `packInternal` also
-places `.syso` bytes into Go package archives inside `cmd/go`; there is no
-external `pack` invocation to intercept. Checking original source paths at link
-time would not authenticate a substituted cached archive.
-
-The private `_verified-tool` command is an implementation detail, not a
-supported mandatory verification hook for arbitrary `go build -toolexec` use.
-The outer command's fresh cache and required linker report are essential.
-These rules intentionally trade cache performance for a small trust model.
-
-### Translation probes
-
-`probe-lower-tlvp` and `probe-tls` expose explicitly incomplete diagnostic stages;
-`probe-tls -runtime -format macho` cannot preserve stronger section alignment.
-Use `translate` for the maintained Darwin output.
-
 ### Tests and native helpers
 
 ```sh
@@ -2204,219 +1074,26 @@ bazel run //:verify -- -suite tls
 bazel run //:verify -- -suite tls -target darwin/amd64
 ```
 
-Default Go tests use synthetic fixtures and embedded runtime provenance hashes;
-they need no Rust compiler or framework checkout. The `tls` suite additionally
-checks all 128-bit SIMD lanes and required general registers across the native
-TLV resolver, concurrent native threads, LIFO/reentrant destructors and a broken
-register-restoration negative control. Native helper regeneration is a maintainer
-action: `bazel run //:native`; sources, flags and hashes are recorded
-under `translate/native/`.
-Use `bazel run //:native -- -target darwin/amd64` for the Intel helpers.
+`bazel test //...` uses synthetic fixtures and needs no Rust compiler. The
+integration suites run with `bazel run //:verify -- -suite NAME`:
 
-Regenerate the Linux helpers with `bazel run //:native -- -target linux/ARCH`
-for arm64, amd64, loong64 and ppc64le, and the Windows helpers with
-`-target windows/amd64` or `windows/arm64`, which need Clang. Linux cross
-targets need the matching GNU compiler and linker, such as those in the maintained
-[cross image](testdata/toolchains/README.md). Each target writes its blob and
-`manifest.json` under `linuxelf/native/` or `pecoff/native/`.
+| Suite | Checks | Details |
+| --- | --- | --- |
+| `tls` | Darwin TLV resolver registers, threads and destructors | [Tests and native helpers](docs/maintainers.md#tests-and-native-helpers) |
+| `darwin` | The Darwin Rust examples, signed and unsigned | [Darwin example verification](docs/maintainers.md#darwin-example-verification) |
+| `cpp` | C++ lifecycle probes against native controls | [C++ runtime verification](docs/maintainers.md#c-runtime-verification) |
+| `static` | Bundled Rust and C++ runtimes | [Static runtime verification](docs/maintainers.md#static-runtime-verification) |
+| `bindings` | Typed bindings, DWARF inference and stripping | [Binding verification](docs/maintainers.md#binding-verification) |
+| `linux` | The Linux Rust runtime example in native arm64 Docker | [Linux verification](docs/maintainers.md#linux-verification) |
+| `signatures`, `bazel` | Signed modules and verified Go and Bazel builds | [Tests](docs/signature-verification.md#tests) |
 
-### Darwin example verification
+CI also runs the `linux-cross` and `windows` suites (`ci/check.sh`), and the
+release workflow runs `release-smoke` on packaged CLIs. `bazel run //:verify --
+-help` lists every suite.
 
-Run the explicit platform verification:
-
-```sh
-bazel run //:verify -- -suite darwin
-bazel run //:verify -- -suite darwin -target darwin/amd64
-```
-
-The Go verifier builds each library through the CLI, translates it, makes a fresh Go executable with
-cgo disabled and deliberately invalid native compiler paths, executes with
-`GOMAXPROCS=1` and `4`, checks native alignment in the final executable, signs
-with ad-hoc Hardened Runtime, strictly verifies the signature and runs again.
-The Rust runtime case has an unwind-registration negative control. These
-examples run headlessly. Dependency setup runs
-`go get github.com/ebitengine/purego@v0.11.3` into the workspace cache; subsequent
-consumer builds disable module networking. No local PureGo checkout or
-`--purego-root` option is used. See the [development journal](JOURNAL.md) for
-executed results and limitations; translation success alone is not an execution
-claim.
-
-### C++ runtime verification
-
-```sh
-bazel run //:verify -- -suite cpp -target darwin/arm64
-bazel run //:verify -- -suite cpp -target darwin/amd64
-```
-
-The suite compares independent C++ executable controls with Bao consumers in
-both binding modes, including signing and missing-initialization/finalization
-negative controls. Its result is `CHECKED_WITH_LIMITATIONS`, preserving explicit
-unsupported exception cases and any native TLS-alignment control failures.
-See the [probe documentation](examples/cpp/README.md) for the exact scope and
-producer adapter. Darwin CI runs this suite; release requires its validated
-CI result and separately checks the packaged CLI.
-
-For Linux, prepare the pinned compiler images and run `-suite cpp -target
-linux/arm64` or `linux/amd64` with `-cxx g++` or `clang++` and the matching
-`-image`. The [Linux recipe](examples/cpp_linux/README.md) gives complete
-commands. Each Linux suite requires all five C++ cases, both binding modes,
-unwind/lifecycle negative controls and scalar ABI checks to pass. Source CI
-and the reusable release CI gate run both compilers on each architecture. For loong64
-and ppc64le, use the maintained cross image and run the Rust runtime and typed
-binding gates first, as shown in the Linux recipe. Their C++ suites use explicit
-QEMU execution and the same image; C++ success alone does not pass the release gate.
-
-### Static runtime verification
-
-```sh
-bazel run //:verify -- -suite static -target darwin/ARCH -static-runtime-root PREFIX
-bazel run //:verify -- -suite static -target linux/ARCH -image bao-ci-cross
-```
-
-For Windows, add `-windows-driver clang -windows-cc CC -windows-cxx CXX`.
-These maintained suites gate C++ checks on fresh Rust checks, check fresh Rust
-and C++ inputs with both binding modes, and audit both generated packages and
-executable dependencies, with lifecycle negative controls. CI invokes the same
-suites on macOS, Linux and native Windows; `ci/check.sh` has the exact
-invocations. Local Linux arm64 execution was native; amd64, loong64 and ppc64le
-used QEMU. Ordinary compiler-produced fully static controls also ran, but Bao's
-current Go/native bootstrap still requires dynamic glibc/pthread/loader
-support. Those controls are separate from Bao support.
-
-### Binding verification
-
-```sh
-bazel test //bindings:bindings_test
-bazel run //:verify -- -suite bindings -target darwin/arm64
-bazel run //:verify -- -suite bindings -target darwin/amd64
-```
-
-The integration suite exercises explicit and inferred manifests, optimized debug
-inputs, native debug stripping with EH retention, scalar/mixed/narrow values,
-18 floating arguments, pointers, TLS and scheduler progress at GOMAXPROCS=1/4.
-Darwin executables are also signed with ad-hoc Hardened Runtime and rerun. Rust
-runtime checks retain panic, RAII, native threads and TLS destructors after
-optimized DWARF inference and stripping, with an unwind-registration negative
-control. Linux runs use the documented native arm64 or QEMU cross images.
-
-### Linux verification
-
-The independent [Linux runtime library](examples/linux_runtime/README.md) keeps
-Rust std and panic unwinding and has no third-party crates. Its explicit harness
-requires a native arm64 Linux Docker daemon and a Rust toolchain image:
-
-```sh
-bazel run //:verify -- -suite linux
-```
-
-The harness cross-builds a Go consumer on the host, then executes in native
-Linux arm64 containers with a read-only filesystem, no network, and invalid
-native compiler paths. Cross-linking alone is not counted as an execution pass.
-The Docker image digest and tool versions are recorded in its evidence.
-
-### Per-platform details
-
-#### macOS (Darwin)
-
-Bao lowers checked ARM64 TLVP or amd64 TLV address relocations while retaining per-thread
-semantics through its native TLS resolver. The resolver copies an aligned
-initialized/zero-fill template into per-thread native allocations, registers
-LIFO/reentrant destructors and frees storage when a pthread exits. Native calls
-use C ABI tail bridges; imported data pointers are fixed up in writable native
-data before initialization. No executable pages are patched.
-
-It preserves indexed local symbol identity, coalesces redundant same-address
-text aliases, synthesizes supported section-boundary symbols and normalizes
-relocation addends. DWARF FDEs are registered through Darwin's public
-`__register_frame`. Supported compact unwind FRAME/FRAMELESS entries become
-equivalent DWARF records; original native metadata remains in the artifact.
-Constructors run in table order after imports, unwind and TLS setup, with native
-`argc`, `argv` and `environ` on the startup OS thread.
-
-The generated `.syso` files use **ELF relocatable containers for Darwin ABI
-machine code** because Go's ELF object reader preserves section alignment that
-its Mach-O reader omits. Go's stock internal linker accepts these inputs and
-produces a normal Mach-O executable. This container choice is not Linux support
-and is not a claim of compatibility with Apple's external linker. Applications
-that link `runtime/cgo` through a cgo dependency still require Go's internal
-linker.
-
-#### Linux
-
-Bao lowers compiler TLS sequences (TLSDESC, and `__tls_get_addr` calls on amd64,
-loong64 and ppc64le) to image-private descriptors and a resolver that returns
-offsets relative to the native thread pointer. Per-thread blocks use native
-pthread storage and destructors and are found through the table described under
-[Linux TLS lookup](#linux-tls-lookup), or live in glibc's static TLS with
-`-linux-static-tls`. Native DWARF chains are registered with libgcc's `__register_frame`.
-Initializers run in numeric priority order with native copies of argv and libc's environ.
-Imported data pointers are fixed up in writable native storage before constructors.
-
-#### Windows (amd64 / ARM64)
-
-Bao selects ordinary COFF archive members by exported functions and their native
-dependencies, namespaces symbols and emits COFF `.syso` files for Go 1.26.11's
-internal linker. System DLL calls use private IAT entries and function stubs.
-Generated typed adapters use Win64 argument slots and shadow space on amd64,
-or fixed scalar ARM64 registers, with Go's Windows `runtime.cgocall` transition.
-This path needs no fakecgo bootstrap, native partial linker or runtime extraction.
-
-CRT C initializers precede C++ constructors during package initialization. amd64 retains
-`.pdata` for Go's PE exception directory and private native unwind/RTTI data;
-ARM64 registers image-relative
-function tables with `RtlAddFunctionTable`. DWARF inference precedes debug
-stripping; MSVC/clang-cl CodeView inputs require explicit signature manifests.
-Runtime unwind data is retained when debug information is stripped.
-
-Compiler TLS uses image-private FLS storage and native thread cleanup. Dynamic
-CRT/C++ exceptions, COMDAT selection with associated unwind data, function-local
-statics, weak aliases and explicit `Shutdown()`
-are supported within the detailed producer profile above. GNU Rust `std` with
-bundled unwinding is checked separately in the static suite; MSVC Rust targets
-and MSVC static/debug CRTs remain outside that profile. Native Windows VM CI is
-configured for VC++, Clang and clang-cl on both architectures and MinGW on
-amd64; its results are pending, and Wine is a local aid only. See
-[Windows producer commands and boundaries](#windows-producer-reference)
-for the complete profile, compiler flags and verification scope.
-
-### Signature verification checks
-
-```sh
-bazel test //verify:verify_test
-bazel run //:verify -- -suite signatures
-bazel run //:verify -- -suite bazel -bazel /path/to/bazel
-```
-
-The integration fixture uses a freshly generated **local test key** and a Rust
-leaf object produced once. Verification/build uses cgo disabled and unavailable
-C/C++/Rust compiler paths. It tests an approved build and repeat request,
-warm-shared-cache native substitution, altered generated Go/assembly, an extra
-selected native object, wrong target/release, an invalid signature, and native
-substitution inside a real cached package archive while its source stays
-unchanged. Consumer initialization is checked absent until the approved binary
-is deliberately run separately. The fixture currently runs on macOS/arm64.
-
-The suite also authenticates and builds a complete generated static-binding
-module, including its bundled runtime bootstrap, without a PureGo dependency.
-Assembly archive names truncated to the same 16-byte prefix are verified with
-their expected multiplicities; extra and missing members remain rejected.
-The signature suite also scans an actual downloaded module cache offline,
-rejects an unused unsigned native dependency and a modified cache entry, and
-reports a dependency whose sources have not been downloaded.
-
-The Bazel suite builds an independent local consumer on macOS arm64. It poisons
-an ordinary shared native archive, verifies and links from fresh private state,
-and rejects changed signed sources and a reachable custom action. The approved
-executable is run separately. Linux arm64's Bazel consumer has also been checked
-in native Docker execution; other Bazel target combinations need separate
-validation. Test signing keys are local fixtures, not release authority.
-
-### Archive parser checks
-
-Bao uses a small private adapter in `internal/ar` to select regular members for
-native object inspection and signature-input checks. That selection is separate
-from the public parser. Run its tests with
-`bazel test //ar:ar_test //internal/ar:ar_test` or `go test ./ar ./internal/ar`.
+Native helper regeneration (`bazel run //:native`), translation probes and
+the runtime bootstrap's provenance are covered in
+[maintaining Bao](docs/maintainers.md).
 
 ## FAQ
 
@@ -2445,7 +1122,7 @@ profile. See [consumer builds](#using-generated-go-packages),
 Native calls still need a transition from Go to the native ABI and system stack.
 Bao's generated typed adapters use the Go runtime's `cgocall` path; the runtime
 registration mode uses PureGo. Neither mode requires a custom Go toolchain. See
-[runtime support](#runtime-support-and-boundaries).
+[runtime support](docs/maintainers.md#runtime-support-and-boundaries).
 
 ### Is PureGo required?
 
@@ -2462,7 +1139,7 @@ Bao links the translated native code into the executable, while system libraries
 remain dynamically linked through the OS loader. It does not extract a native
 library at startup or allocate executable memory to load one. Linux profiles
 require compatible glibc/system libraries; static musl is unsupported. See the
-[Linux arm64](#linux-arm64--elf) and [Linux amd64](#linux-amd64--elf) profiles.
+[Linux reference](docs/linux.md).
 Fully static Bao executables with no shared-library dependencies are currently
 unsupported on every target. Linux native-compiler controls pass fully static
 linkage, but Bao's Go/native bootstrap still requires dynamic OS services.
@@ -2482,7 +1159,7 @@ Windows supports the documented C/C++ profiles and GNU Rust `std` with bundled
 unwinding; the smaller Rust `no_std` fixture remains a separate gate.
 Typed bindings
 accept scalar signatures, with explicit pointer/length pairs for buffers. See
-[supported boundaries](#supported-boundaries), [binding types](#explicit-declarations)
+[platform reference](#platform-reference), [binding types](#explicit-declarations)
 and the [Windows profile](#windows-amd64--arm64).
 
 ### Which platforms are supported, and can I cross-build?
@@ -2491,14 +1168,14 @@ See [platform support](#platform-support) for targets, input kinds and where
 each has run. Consumers can select `GOOS` and `GOARCH` when the library supplies matching
 generated files. Producers also need the target SDK/sysroot and a compatible
 linker when combining archives. See [target builds](#building-for-the-target)
-and [supported boundaries](#supported-boundaries) for verification limits.
+and [platform support](#platform-support) for verification limits.
 
 ### Why does a Darwin package contain ELF .syso objects?
 
 The ELF relocatable container preserves section alignment through Go's internal
 linker. Its machine code still uses the Darwin ABI, and the final executable is
 normal Mach-O. These objects are not Linux libraries. See
-[Darwin implementation details](#macos-darwin).
+[Darwin implementation details](docs/darwin.md#implementation-notes).
 
 ### Are native dependencies verified automatically by go build?
 

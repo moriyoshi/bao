@@ -1,11 +1,12 @@
 # Documents for humans and coding agents
 
-* [README.md](README.md): public APIs, build commands, examples, supported behavior, and trust boundaries.
+* [README.md](README.md): overview, walkthrough, platform support, consumer and producer workflows, public APIs, and FAQ.
+* [docs/](docs/): reference for symbol edits, each platform family (Darwin, Linux, Windows), signature verification, config files and diagnostics, and maintainer suites.
 * [JOURNAL.md](JOURNAL.md): durable findings, decisions, and verification history.
 
 # Documentation and journaling
 
-* Keep user workflows and supported behavior in `README.md`. Record operational findings, implementation decisions, investigations, and verification outcomes in `JOURNAL.md`.
+* Keep user workflows and an overview of supported behavior in `README.md`, and detailed reference for a platform, command family or subsystem in the matching `docs/` file. Link a `docs/` section from README rather than repeating it; state each fact in one place. Record operational findings, implementation decisions, investigations, and verification outcomes in `JOURNAL.md`.
 * Read the relevant journal entries before revisiting an investigation. Verify historical claims against the current implementation before relying on them.
 * Append dated entries to the end of `JOURNAL.md`. Do not rewrite, reorder, or remove earlier entries during ordinary work. Record corrections and superseding results in a new entry that identifies the earlier finding.
 * Journal entries should explain the concrete problem or decision, what changed, the result, and any remaining limitations. Include the reproduction commands, toolchain versions, target, and execution environment needed to assess a verification claim.

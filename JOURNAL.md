@@ -7537,3 +7537,61 @@ passed (links, anchors, fences, journal prefix, code blocks of the
 pre-clean-up README apart from the two removals recorded in the previous
 entry). `git diff --check` passed. Documentation-only change; no builds,
 runtime tests or hosted workflows were run.
+
+## 2026-11-17: README reference moved into docs/
+
+Last of the stacked README clean-up changes. README was 2,533 lines, 58% of
+it library-developer reference, and most Linux material sat under "Linux
+arm64 / ELF" whatever architecture it concerned. AGENTS.md now keeps workflows
+and an overview of supported behavior in README and detailed reference in
+`docs/`, with each fact stated in one place.
+
+- `docs/symbol-edits.md`: the symbol edit, binding/stripping and section edit
+  reference, unchanged apart from heading levels and a "Renames" heading.
+- `docs/linux.md`: every Linux section regrouped by topic (building, target
+  profiles per architecture, imports and symbol versions, weak references,
+  code and data, thread-local storage with lookup and static TLS, shared
+  objects, implementation notes). Paragraphs were moved rather than
+  rewritten. The exceptions are the opening, which described only
+  `-target linux/arm64`, the sentence that pointed at "separate target
+  profiles", and the amd64 TLS paragraph, whose non-TLS sentences went to the
+  amd64 profile; one repeated sentence about IFUNCs, preinit arrays and musl
+  was dropped.
+- `docs/darwin.md`: the Darwin object-input boundaries, dylib input and
+  implementation notes.
+- `docs/windows.md`: the producer reference, DLL input and implementation
+  notes.
+- `docs/signature-verification.md`: policy, scanning, both verified-build
+  flows, limitations, the release envelope format, implementation notes and
+  tests. README keeps the command table and a summary paragraph, so the
+  `#consumer-controlled-signature-verification` anchor stays. The
+  `verified-build` help text now points at the new file for the trust
+  boundary.
+- `docs/config.md`: config files, with the key list turned from one
+  paragraph into a table checked against `internal/cli/config.go`, and
+  diagnostics.
+- `docs/maintainers.md`: the maintainer suite details. README keeps the build
+  and test commands plus a table of `-suite` names, the checks each runs and
+  links to their details. `cmd/bao-verify` also has `linux-cross`, `windows`,
+  `release-smoke` and `gpui` suites, which README had never listed; it now
+  names where CI and release run the first three.
+
+README keeps short "Symbol edits", "Platform reference" and "Config files and
+diagnostics" sections that link out, and README is now 1,209 lines. Anchors
+linked from outside README (`internal/cli/verified.go`, `examples/README.md`,
+`examples/linux_runtime/README.md`, JOURNAL) are unchanged.
+
+The split was done by `.work/readme-cleanup/split.py`, with link rewriting by
+`.work/readme-cleanup/fixlinks.py`, followed by hand edits for the seams
+listed above.
+
+Verification on Linux arm64 with Python 3 and Go 1.26.11:
+`.work/readme-cleanup/check.py` passed. It checked links, anchors, fences, the
+journal prefix, and that every code block of the pre-clean-up README is in
+README or `docs/` apart from the two intended removals. A paragraph comparison
+against the previous commit's README found 42 of 341 prose paragraphs not
+verbatim. All 42 are renamed or promoted headings, paragraphs split at a topic
+boundary, or the edits listed above. `go build ./...` and
+`go test ./internal/cli -run 'Help|Verified|Usage'` passed after the help-text
+change. `git diff --check` passed. No other builds, runtime tests or hosted
+workflows were run.
