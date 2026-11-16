@@ -6932,3 +6932,99 @@ here, so the Bazel changes are checked only by CI.
   - A CGO_ENABLED=0 consumer of that package ran natively and printed
     `answer: 42`.
   - `go run ./cmd/bao version -json` still reports `devel`.
+
+## 2026-11-16: Linux TLS lookup without a call
+
+Problem. pythago measured bao's Linux TLS thunk at about half of all
+instructions in allocation-heavy CPython on arm64. Every TLSDESC access
+saved the full register file (672 bytes on arm64, XSAVE on amd64), called
+`bao_tls_lookup`, and that called `pthread_getspecific`. amd64 GD/LD calls
+went straight to the C lookup but also paid for `pthread_getspecific`. This
+entry is step (b) of the plan: a per-thread cache with an assembly fast path
+on arm64 and amd64. Step (a), glibc static TLS through a dlopen'ed stub DSO,
+is not started.
+
+Change (`linuxelf/native/tls.c`, both `thunk.S` files, all four runtime
+blobs).
+- `BaoThread` now starts with the owning thread pointer (offset 0) and the
+  block pointer (offset 8). `bao_tls_cache[4096]` holds one record pointer
+  per slot, indexed by `((tp >> 12) ^ (tp >> 23)) & 4095`. The thread pointer
+  is `tpidr_el0` on arm64, `%fs:0` on amd64, r13 on ppc64le and
+  `__builtin_thread_pointer()` on loong64.
+- A slot is trusted only when the record's `tp` equals the caller's. Records
+  are recycled through a mutex-protected free list and never freed, so a
+  stale slot always points at a record whose `tp` is 0 or another live
+  thread's. A thread finalizing its TLS clears its slot and sets `tp` to 0
+  before its block is freed. The slow path, `current_thread`, publishes the
+  record again after every miss, so colliding threads take turns.
+- arm64 thunk: spills x1-x3, hashes `tpidr_el0`, loads the slot through the
+  GOT, checks it and returns `block + offset - tp`. It leaves NZCV alone. On
+  a miss it restores x1-x3 and falls into the unchanged full-save path.
+- amd64 thunk: same, spilling RCX, RDX and RSI. The fast path clobbers the
+  flags, as glibc's `_dl_tlsdesc_undefweak` (`sub %fs:0`) does; compilers
+  treat a TLSDESC call as clobbering them. The full-save path still
+  preserves them. README's amd64 TLS text now says this.
+- `bao_tls_lookup` (amd64 GD/LD, loong64, ppc64le and both slow paths)
+  tries the cache before `current_thread`.
+- Fork: glibc's child reclaims the other threads' stacks into its stack
+  cache, so a new thread in the child can get a dead thread's TCB and thread
+  pointer. Its old record would still be in the table and match. Before the
+  cache this was harmless, because glibc's `__reclaim_stacks` clears those
+  threads' pthread key values. `bao_tls_configure` now registers fork handlers
+  through `__register_atfork` (exported by libc.so.6; `pthread_atfork` is in
+  libc_nonshared.a) with `bao_dso_handle`. They hold the free-list lock
+  across fork; the child then clears every slot whose record is not the
+  forking thread's and zeroes those records' `tp`. Their blocks are
+  abandoned, as before.
+- README: a new "Linux TLS lookup" subsection.
+
+Limitation. A pthread key destructor that touches native TLS after Bao's
+final destructor pass recreates the block, and nothing releases it. That was
+already outside the runtime's profile (a leak). With the cache, a later
+thread that reuses that TCB would match the leaked record instead of getting
+a fresh block.
+
+Verification. Host: Linux 7.0.0 aarch64 (Cortex-X925/A725), Docker 29.6.2.
+Runtime blobs were built with Debian GCC 14.2.0-19 in `bao-cpp-cross:20261108`
+(`cmd/bao-native -target linux/{arm64,amd64,loong64,ppc64le}`), and
+`TestEmbeddedRuntimeProvenance` passed. Consumers used Go 1.26.11 with
+CGO_ENABLED=0; Go 1.27.4 consumers fail at init with "cgocall unavailable",
+outside the documented toolchain.
+- Fixture (`.work/tlsfast`, `run.sh BAO OUT ARCH`): a C archive compiled
+  `-O2 -fPIC`, with an exported `__thread` variable and a static
+  `__thread` array accessed through `noipa` functions. On amd64 it is built
+  twice, `-mtls-dialect=gnu2` (TLSDESC) and `-mtls-dialect=gnu` (GD/LD).
+  The Go consumer runs three waves of 32 goroutines. Each one locks its
+  thread, checks fresh template values and a distinct block address,
+  bumps the counter 10000+i times checking each value, then exits locked,
+  so the thread exits. After every wave the destroyed count rises by
+  exactly 32 and the live count returns to its earlier value. Then a fork
+  check: 16 pthreads touch TLS and wait, the process forks, and the child
+  creates 16 threads one at a time, each of which must see the template.
+  Finally the startup thread is finalized and live must be 0.
+  - arm64: native, GOMAXPROCS=1 and 4: PASS.
+  - amd64 (TLSDESC and GD), loong64, ppc64le: QEMU 10.0.13 user mode,
+    GOMAXPROCS=1 and 4: PASS.
+  - Negative control: the same fixture against a runtime whose fork-child
+    loop was disabled (`.work/negctl`, arm64 native) failed with "desc fork
+    child: 16 threads saw stale TLS".
+- Microbenchmark (`run.sh BAO OUT ARCH bench N`, best of 5; each access is
+  a call to a `noipa` function that increments a TLS variable):
+
+  | Target | Access | main (345ad90) | this change |
+  | --- | --- | --- | --- |
+  | arm64, native | TLSDESC | 7.92 ns | 1.46 ns |
+  | amd64, QEMU | TLSDESC | 554 ns | 83 ns |
+  | amd64, QEMU | GD | 147 ns | 72 ns |
+
+  QEMU times reflect emulation cost, especially XSAVE, not native amd64.
+- Local equivalent of `ci/check.sh linux-arm64` without Bazel
+  (`.work/tlsfast/ci.sh`): `go test ./...`, then bao-verify with `-bao` and
+  Go 1.26.11.
+  - arm64: cpp (g++ and clang++ images), linux, bindings.
+  - loong64 and ppc64le: linux-cross, bindings, and cpp with g++ and
+    clang++.
+  - static: arm64, amd64, loong64 and ppc64le.
+  All passed (167 PASS records under `.work/tlsfast/ci-evidence`). The
+  linux-amd64 CI job, run natively on a hosted amd64 runner, was not run
+  here; amd64 has run only under QEMU.

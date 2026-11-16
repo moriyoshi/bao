@@ -1,12 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original Bao Linux arm64 TLSDESC thunk. Preserve all registers except x0
 // (the result) and LR, including complete SIMD registers and x16-x18.
+//
+// Fast path: the calling thread's record, published in bao_tls_cache at the
+// index tls.c's cache_index computes, gives the block without a call. It
+// spills only x1-x3 and leaves the flags alone. A missing or foreign entry
+// takes the full-save path, whose C lookup publishes the record.
 .text
 .p2align 2
 .globl bao_tls_thunk
 .type bao_tls_thunk, %function
 bao_tls_thunk:
     .cfi_startproc
+    stp x1, x2, [sp, #-32]!
+    .cfi_adjust_cfa_offset 32
+    str x3, [sp, #16]
+    mrs x1, tpidr_el0
+    lsr x2, x1, #23
+    eor x2, x2, x1, lsr #12
+    and x2, x2, #4095
+    adrp x3, :got:bao_tls_cache
+    ldr x3, [x3, :got_lo12:bao_tls_cache]
+    ldr x3, [x3, x2, lsl #3]
+    cbz x3, 1f
+    ldr x2, [x3]
+    sub x2, x2, x1
+    cbnz x2, 1f
+    ldr x2, [x3, #8]
+    ldr x0, [x0, #8]
+    add x0, x0, x2
+    sub x0, x0, x1
+    ldr x3, [sp, #16]
+    ldp x1, x2, [sp], #32
+    .cfi_adjust_cfa_offset -32
+    ret
+    .cfi_adjust_cfa_offset 32
+1:  ldr x3, [sp, #16]
+    ldp x1, x2, [sp], #32
+    .cfi_adjust_cfa_offset -32
     sub sp, sp, #672
     str x29, [sp, #656]
     str x30, [sp, #664]

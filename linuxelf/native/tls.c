@@ -18,15 +18,118 @@ typedef struct {
     BaoThread *thread;
 } BaoExitHook;
 
+// The thunks' fast paths read tp at offset 0 and data at offset 8.
 struct BaoThread {
+    _Atomic uintptr_t tp; // the owning thread's pointer, or 0 once released
     void *data;
     BaoTerminator *terminators;
     unsigned destructor_pass;
     BaoExitHook *hook;
+    BaoThread *next_free;
 };
+
+// Each thread's record is published in a table indexed by a hash of its
+// thread pointer, so that lookups need neither a call nor
+// pthread_getspecific. An entry is trusted only when the record's tp is the
+// caller's own thread pointer, which no other live thread shares. Records
+// are recycled, never freed, so a stale entry always points at a record
+// whose tp is 0 or another thread's. The thunks compute the same index.
+#define BAO_TLS_CACHE_BITS 12
+BaoThread *_Atomic bao_tls_cache[1u << BAO_TLS_CACHE_BITS];
+
+static inline uintptr_t thread_pointer(void) {
+#if defined(__x86_64__)
+    uintptr_t tp;
+    __asm__("movq %%fs:0, %0" : "=r"(tp));
+    return tp;
+#elif defined(__powerpc64__)
+    uintptr_t tp;
+    __asm__("mr %0, 13" : "=r"(tp));
+    return tp;
+#else
+    return (uintptr_t)__builtin_thread_pointer();
+#endif
+}
+
+static inline size_t cache_index(uintptr_t tp) {
+    return ((tp >> 12) ^ (tp >> 23)) & ((1u << BAO_TLS_CACHE_BITS) - 1);
+}
+
+static inline BaoThread *cached_thread(void) {
+    uintptr_t tp = thread_pointer();
+    BaoThread *thread = atomic_load_explicit(&bao_tls_cache[cache_index(tp)], memory_order_acquire);
+    if (thread != NULL && atomic_load_explicit(&thread->tp, memory_order_relaxed) == tp)
+        return thread;
+    return NULL;
+}
+
+static void publish(BaoThread *thread) {
+    atomic_store_explicit(&bao_tls_cache[cache_index(thread->tp)], thread, memory_order_release);
+}
+
+static pthread_mutex_t free_lock = PTHREAD_MUTEX_INITIALIZER;
+static BaoThread *free_records;
+
+static BaoThread *new_record(void) {
+    pthread_mutex_lock(&free_lock);
+    BaoThread *thread = free_records;
+    if (thread != NULL)
+        free_records = thread->next_free;
+    pthread_mutex_unlock(&free_lock);
+    if (thread == NULL) {
+        thread = calloc(1, sizeof(*thread));
+        if (thread == NULL)
+            abort();
+    }
+    thread->data = NULL;
+    thread->terminators = NULL;
+    thread->destructor_pass = 0;
+    thread->hook = NULL;
+    thread->next_free = NULL;
+    atomic_store_explicit(&thread->tp, thread_pointer(), memory_order_relaxed);
+    return thread;
+}
+
+// release unpublishes a record and returns it for reuse. Its tp becomes 0
+// before its storage goes, so no lookup can match it afterwards.
+static void release(BaoThread *thread) {
+    BaoThread *expected = thread;
+    atomic_compare_exchange_strong_explicit(&bao_tls_cache[cache_index(thread->tp)], &expected, NULL, memory_order_relaxed, memory_order_relaxed);
+    atomic_store_explicit(&thread->tp, 0, memory_order_release);
+    pthread_mutex_lock(&free_lock);
+    thread->next_free = free_records;
+    free_records = thread;
+    pthread_mutex_unlock(&free_lock);
+}
+
+// A forked child keeps only the forking thread, and glibc may hand a dead
+// thread's TCB, and so its thread pointer, to a new thread. Unpublish every
+// other record so that no new thread can match one. Their storage is
+// abandoned, as before the cache existed.
+static void fork_prepare(void) {
+    pthread_mutex_lock(&free_lock);
+}
+
+static void fork_parent(void) {
+    pthread_mutex_unlock(&free_lock);
+}
+
+static void fork_child(void) {
+    uintptr_t tp = thread_pointer();
+    for (size_t i = 0; i < sizeof(bao_tls_cache) / sizeof(bao_tls_cache[0]); i++) {
+        BaoThread *thread = atomic_load_explicit(&bao_tls_cache[i], memory_order_relaxed);
+        if (thread != NULL && atomic_load_explicit(&thread->tp, memory_order_relaxed) != tp) {
+            atomic_store_explicit(&bao_tls_cache[i], NULL, memory_order_relaxed);
+            atomic_store_explicit(&thread->tp, 0, memory_order_relaxed);
+        }
+    }
+    pthread_mutex_unlock(&free_lock);
+}
 
 extern char bao_dso_handle;
 extern int __cxa_thread_atexit_impl(void (*function)(void *), void *object, void *dso);
+// pthread_atfork itself lives in libc_nonshared.a; this is what it calls.
+extern int __register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void), void *dso);
 
 static pthread_key_t key;
 static const void *initial;
@@ -80,8 +183,9 @@ static void finalize_thread(BaoThread *thread, int explicit_finalization) {
         thread->hook->thread = NULL;
         thread->hook = NULL;
     }
-    free(thread->data);
-    free(thread);
+    void *data = thread->data;
+    release(thread);
+    free(data);
     atomic_fetch_sub_explicit(&live_blocks, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&destroyed_blocks, 1, memory_order_relaxed);
 }
@@ -101,6 +205,9 @@ int bao_tls_configure(const void *bytes, size_t size, size_t alignment) {
     int error = pthread_key_create(&key, destroy_thread);
     if (error != 0)
         return error;
+    error = __register_atfork(fork_prepare, fork_parent, fork_child, &bao_dso_handle);
+    if (error != 0)
+        return error;
     initial = bytes;
     initial_size = size;
     initial_alignment = alignment;
@@ -113,9 +220,7 @@ static BaoThread *current_thread(void) {
         abort();
     BaoThread *thread = pthread_getspecific(key);
     if (thread == NULL) {
-        thread = calloc(1, sizeof(*thread));
-        if (thread == NULL)
-            abort();
+        thread = new_record();
         if (posix_memalign(&thread->data, initial_alignment, initial_size) != 0)
             abort();
         memcpy(thread->data, initial, initial_size);
@@ -132,14 +237,18 @@ static BaoThread *current_thread(void) {
             abort();
         atomic_fetch_add_explicit(&live_blocks, 1, memory_order_relaxed);
     }
+    publish(thread);
     return thread;
 }
 
 void *bao_tls_lookup(const uintptr_t *descriptor) {
     uintptr_t offset = descriptor[1];
+    BaoThread *thread = cached_thread();
+    if (thread == NULL)
+        thread = current_thread();
     if (offset >= initial_size)
         abort();
-    return (char *)current_thread()->data + offset;
+    return (char *)thread->data + offset;
 }
 
 // Replacement for __cxa_thread_atexit_impl in this translated image.

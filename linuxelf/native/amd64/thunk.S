@@ -1,14 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original Bao Linux amd64 GNU2 TLSDESC thunk. RAX holds the descriptor on
 // entry and the offset from the thread pointer on return. Preserve every other
-// general register, flags, x87/MXCSR and the XSAVE AVX/AVX-512 state: the C
+// general register, x87/MXCSR and the XSAVE AVX/AVX-512 state: the C
 // lookup's first use per thread enters glibc allocation and copy routines.
+//
+// Fast path: the calling thread's record, published in bao_tls_cache at the
+// index tls.c's cache_index computes, gives the block without a call,
+// spilling only RCX, RDX and RSI. It clobbers the flags, as glibc's own
+// _dl_tlsdesc_undefweak does (SUB %fs:0); compilers treat a TLSDESC call as
+// clobbering them. A missing or foreign entry takes the full-save path,
+// which preserves the flags too and whose C lookup publishes the record.
 .text
 .p2align 4
 .globl bao_tls_thunk
 .type bao_tls_thunk, @function
 bao_tls_thunk:
     .cfi_startproc
+    pushq %rcx
+    .cfi_adjust_cfa_offset 8
+    pushq %rdx
+    .cfi_adjust_cfa_offset 8
+    pushq %rsi
+    .cfi_adjust_cfa_offset 8
+    movq %fs:0, %rdx
+    movq %rdx, %rcx
+    shrq $12, %rcx
+    movq %rdx, %rsi
+    shrq $23, %rsi
+    xorq %rsi, %rcx
+    andl $4095, %ecx
+    movq bao_tls_cache@GOTPCREL(%rip), %rsi
+    movq (%rsi,%rcx,8), %rsi
+    testq %rsi, %rsi
+    jz 7f
+    cmpq (%rsi), %rdx
+    jne 7f
+    movq 8(%rax), %rax
+    addq 8(%rsi), %rax
+    subq %rdx, %rax
+    popq %rsi
+    .cfi_adjust_cfa_offset -8
+    popq %rdx
+    .cfi_adjust_cfa_offset -8
+    popq %rcx
+    .cfi_adjust_cfa_offset -8
+    retq
+    .cfi_adjust_cfa_offset 24
+7:  popq %rsi
+    .cfi_adjust_cfa_offset -8
+    popq %rdx
+    .cfi_adjust_cfa_offset -8
+    popq %rcx
+    .cfi_adjust_cfa_offset -8
     pushq %rbp
     .cfi_def_cfa_offset 16
     .cfi_offset %rbp, -16
