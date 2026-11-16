@@ -1383,6 +1383,19 @@ glibc sysroot, `sh ci/cgo-linux.sh` exercises fresh typed bindings with and
 without cgo, including a separate cgo package and native TLS cleanup. Results
 and generated inputs are left under `.work/`.
 
+#### Linux TLS lookup
+
+Each thread's native TLS block is allocated on its first TLS access. Bao then
+records it in a process-wide table indexed by a hash of the thread pointer. A
+TLS access that finds the calling thread's entry costs a few loads, with no
+call and no `pthread_getspecific`. On arm64 and amd64 the TLSDESC thunk then
+saves three scratch registers instead of the full register and vector state. Threads whose hashes collide share a table slot and take the
+slower path in turn; that is still correct, only slower. Entries are removed
+when a thread's TLS is finalized. A forked child removes every entry but the
+forking thread's, because glibc may give a new thread in the child a dead
+thread's stack and so its thread pointer. As before, the child does not
+reclaim those threads' TLS blocks.
+
 ### Linux shared objects
 
 On every Linux target (arm64, amd64, loong64 and ppc64le), a linked PIC shared
@@ -1496,9 +1509,12 @@ cover Linux arm64 with both compilers.
 
 The amd64 TLS profile accepts general/local dynamic TLS with ordinary SysV
 `__tls_get_addr` calls and GNU2 TLSDESC (`-mtls-dialect=gnu2`), including
-local-dynamic `_TLS_MODULE_BASE_` sequences. TLSDESC calls enter a Bao thunk
-that preserves the other general registers, flags, x87/MXCSR and XSAVE
-AVX/AVX-512 state. GCC 14.2 and Clang 19.1.7 TLSDESC output has run only under
+local-dynamic `_TLS_MODULE_BASE_` sequences. TLSDESC calls enter a Bao thunk.
+When the calling thread's block is in the lookup table described under
+[Linux TLS lookup](#linux-tls-lookup), the thunk clobbers only the flags, as
+glibc's own descriptor resolvers may. Otherwise it preserves the other
+general registers, flags, x87/MXCSR and XSAVE AVX/AVX-512 state while the C
+lookup runs. GCC 14.2 and Clang 19.1.7 TLSDESC output has run only under
 QEMU 10.0.13 (AVX2 and SSE-only CPU models); AVX-512 preservation is
 unverified. Initial/local exec TLS (`R_X86_64_GOTTPOFF`, `R_X86_64_TPOFF32`)
 is rejected: it assumes the image's TLS sits at a fixed offset from the

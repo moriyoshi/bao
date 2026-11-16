@@ -1,5 +1,10 @@
 {
-  "compiler": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "compiler": "gcc (Debian 14.2.0-19) 14.2.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "files": {
+    "runtime.bin": "bdd7bdf173ef0e15c5c7e9eae15dad83d22cd2784e27f95e3af2dd5aa2684e8d",
+    "thunk.S": "6d950b2069974ecfe55263b08e110b2ef01f4790804708f26b7bbf28f9f8c346",
+    "tls.c": "d35a30968eb427c41abe502eb9a2aa76c04038591d2467935be76e564fc2d618"
+  },
   "flags": [
     "-O2",
     "-fPIC",
@@ -7,10 +12,5 @@
     "-mno-outline-atomics",
     "-c"
   ],
-  "target": "aarch64-linux-gnu",
-  "files": {
-    "tls.c": "50b516922dd08c77a52e9490117cae19275b982a2c98c3ea614df0a817d1a7df",
-    "thunk.S": "fdc998d9a42b12cf3e49ec059739682a675587fd1d8cfbae552e83a98efdcdbe",
-    "runtime.bin": "d4ee9daa74f4407bf8235266b5dad352732ded4353b2a790810ffe6d55804abe"
-  }
+  "target": "linux/arm64"
 }
