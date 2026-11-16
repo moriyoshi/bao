@@ -7737,3 +7737,37 @@ and `go test ./...` (pass); Go 1.26.11 for consumer builds.
   imports and the embedded-import fill. Those CI legs are its first execution.
 
 Scratch: `.work/windows-attach/`.
+
+## 2026-11-17: Darwin TLS at thread exit, seen from pthread key destructors
+
+pythago reported a problem with #41's darwin dylib-with-object mode. At thread
+exit, a pthread key destructor in its glue read a glue `__thread` variable as
+NULL. They worked around it by passing the value through the key.
+`docs/darwin.md` now has a "Thread-local variables at thread exit" section.
+
+Cause, from `translate/native/tls.c`:
+- Each generated package keeps every thread's block under one pthread key,
+  created by `bao_tls_configure` at package initialization.
+- Its destructor runs the thread's `_tlv_atexit` terminators and frees the
+  block.
+- A pthread key created later by native code can have its destructor run
+  after that.
+- A thread-local access there reaches `current_thread`, which finds no block
+  and allocates a new one from the template. The variable reads as its
+  initial value.
+
+Reproduction on dengaku.local (macOS 26.5.2, M1 Max, Apple clang 21.0.0):
+- Source is `.work/darwin-attach/tlskey/tlskey.c`. A worker thread sets a
+  `__thread int` to 42 and a value on a key created after package
+  initialization. The key's destructor records the `__thread` value.
+- Bao build: produced on Linux with `-darwin-dylib fixture.dylib -symbol
+  tls_key_check`, consumer built with Go 1.26.11 `CGO_ENABLED=0`.
+  - Three runs each printed 0.
+  - `TLSDestroyedBlocks` was 2 and `TLSLiveBlocks` 0 afterwards, so the new
+    block was freed by a later destructor round.
+- Native control: the same C, linked by `xcrun clang` into an ordinary
+  executable using dyld's TLV, also printed 0 in three runs. This is not a
+  Bao divergence from macOS.
+
+Not checked: amd64, plain object input (same runtime code), and an access
+during the last destructor round permitted by `PTHREAD_DESTRUCTOR_ITERATIONS`.

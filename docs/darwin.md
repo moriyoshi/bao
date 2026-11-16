@@ -130,7 +130,9 @@ bao build -target darwin/arm64 -symbol glue_run \
 - The input's thread-local variables use the same TLS runtime as the dylib's.
   Each thread's block holds the input's template, then the dylib's, and the
   loader moves the dylib's descriptor offsets past the input's. The input's
-  template must not hold addresses, as for object input.
+  template must not hold addresses, as for object input. Key destructors see
+  them as described in
+  [Thread-local variables at thread exit](#thread-local-variables-at-thread-exit).
 - The dylib's initializers run before the input's.
 
 `-wrap SYMBOL` applies to the dylib's binds too. The dylib's bind of `SYMBOL`
@@ -148,6 +150,23 @@ bao build -target darwin/arm64 -symbol glue_run \
 Python extension modules that libpython loads with `dlopen`, such as
 python-build-standalone's `_dbm` and `_tkinter`, are not expected to find its
 symbols, since dyld never loaded the dylib. This is unverified.
+
+## Thread-local variables at thread exit
+
+Bao's TLS runtime keeps each thread's block under one pthread key per
+generated package, created at package initialization. This covers object
+input, a dylib, and an object with a dylib. At thread exit, that key's
+destructor runs the thread's `thread_local` destructors, then frees the block.
+
+Pthread keys that native code creates after that can have their destructors
+run after Bao's. A thread-local access from such a destructor gets a new block
+initialized from the template, so the variable reads as its initial value,
+such as zero or NULL. That block is freed in a later destructor round. Pass a
+value that a key destructor needs through the key's own value
+(`pthread_setspecific`), not through a thread-local variable.
+
+This matches native macOS: with dyld's thread-local variables, the same C
+code also read the initial value in its key destructor.
 
 ## Implementation notes
 
