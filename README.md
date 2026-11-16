@@ -1318,7 +1318,12 @@ list before relying on the cap:
   version.
 - An import the inputs declare weak, such as an optional `getentropy` or
   `sem_clockwait`, is listed too. It is optional only if the code checks it
-  before calling it.
+  before calling it. Where Bao binds it at package initialization, a target
+  that lacks it gives 0, as the dynamic linker would. That covers every
+  import of a shared-object input and pointers to it in an archive's data.
+  An archive's code references, such as calls and GOT loads, are left to
+  Go's linker. Go's linker cannot record a weak dynamic import, so the
+  target must define those symbols or the executable fails to start.
 - Some symbols have no older version because they were never exported
   before. For example, `stat64`, `fstat64` and `lstat64` became libc exports
   in glibc 2.33. Before that they were static wrappers in

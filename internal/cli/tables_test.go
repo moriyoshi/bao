@@ -342,3 +342,19 @@ func TestLinuxSourcesAcceptTypedBindings(t *testing.T) {
 		})
 	}
 }
+
+// A weak import's fixups bind 0 when the target lacks it, so the generated
+// table records weakness and init uses the non-panicking lookup.
+func TestLinuxWeakFixups(t *testing.T) {
+	p := syntheticLinuxPlan(2)
+	p.Imports[1].Weak, p.Imports[1].Version = true, "GLIBC_2.30"
+	source, _, err := linuxSource(p, "native", []string{"answer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`{"a", "", 18446744073709551615, false}`, `{"b", "GLIBC_2.30", 0, true}`, "lookupVersion(f.name, f.version, f.weak)", "func lookupOptional(name string) uintptr"} {
+		if !strings.Contains(string(source), want) {
+			t.Errorf("generated source lacks %s", want)
+		}
+	}
+}

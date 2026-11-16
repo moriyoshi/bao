@@ -33,6 +33,10 @@ type Import struct {
 	// one, capped by Options.MaxSymbolVersions. The generated package
 	// records it for the dynamic linker, and fixups bind it with dlvsym.
 	Version string `json:"version,omitempty"`
+	// Weak marks an import that the inputs reference only weakly. Its
+	// init-time pointer fixups bind 0 when the target lacks it, as the
+	// dynamic linker does; see README for references Go's linker resolves.
+	Weak bool `json:"weak,omitempty"`
 }
 
 // ValidateSysroot checks the target shared-library export metadata required by
@@ -995,7 +999,7 @@ func (p *Plan) bind(images []*image, index map[string]string) error {
 			unresolved = append(unresolved, name)
 			continue
 		}
-		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: name, Library: lib}
+		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: name, Library: lib, Weak: weak[name] && !strong[name]}
 		p.Imports = append(p.Imports, b)
 		bindings[name] = b
 	}

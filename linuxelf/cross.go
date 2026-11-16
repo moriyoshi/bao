@@ -540,7 +540,7 @@ func (p *Plan) bindCross(images []*image, index map[string]string) error {
 			unresolved = append(unresolved, n)
 			continue
 		}
-		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: n, Library: lib}
+		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: n, Library: lib, Weak: weak[n] && !strong[n]}
 		bindings[n] = b
 		p.Imports = append(p.Imports, b)
 	}

@@ -22,6 +22,12 @@ func TestWeakImportDoesNotSelectSharedProvider(t *testing.T) {
 				if len(p.Imports) != 2 || len(p.WeakZero) != 0 {
 					t.Fatalf("%s: weak export of already required provider must bind: %+v", machine, p)
 				}
+				// Only the weak-only import may bind 0 at run time.
+				for _, b := range p.Imports {
+					if b.Weak != (b.Remote == "optional") {
+						t.Fatalf("%s: %s weak %v", machine, b.Remote, b.Weak)
+					}
+				}
 			} else if len(p.Imports) != 0 || len(p.WeakZero) != 1 || p.WeakZero[0] != "optional" {
 				t.Fatalf("%s: weak-only provider must remain NULL: %+v", machine, p)
 			}

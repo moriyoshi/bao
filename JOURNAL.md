@@ -7316,3 +7316,60 @@ this branch.
   - amd64 under ld-2.28.so: the same error for GLIBC_2.2.5.
 - Not run: the bao-verify suites, which use no cap, and a shared-object
   input built against a pre-2.34 glibc.
+
+## 2026-11-16: Weak imports bind 0 at initialization
+
+Problem, reported by pythago after #34. libpython references
+`sem_clockwait` (glibc 2.30) and `getentropy` (2.25) weakly. A shared-object
+input's imports are bound at init through `lookup`/`lookupVersion`, which
+panicked when `dlsym`/`dlvsym` failed. On glibc 2.19 and 2.28, init died with
+"undefined symbol: sem_clockwait" instead of binding 0 as ld.so does.
+
+Change.
+- `linuxelf.Import.Weak` (manifest `weak`) is set by all three binders
+  (arm64, amd64, loong64/ppc64le) when every reference is weak. The shared
+  object delinker keeps STB_WEAK on imports.
+- Generated Go:
+  - `lookupOptional` is the dlsym call and returns 0; `lookup` panics on 0.
+    The typed-bindings rewrite now replaces `lookupOptional`'s body with
+    its fixed-signature dlsym call.
+  - `lookupVersion(name, version, weak)` returns 0 for a weak import the
+    target lacks.
+  - `fixupImports` entries carry `weak`. A weak fixup writes 0 plus its
+    addend, as ld.so does for an unresolved weak symbol.
+- README: the cap's weak-import note now says which references bind 0.
+
+Limitation, verified rather than assumed. For an archive input, code
+references to a weak import that the sysroot defines (calls, GOT loads) go
+through Go's linker as ordinary dynamic imports. Go 1.26.11's linker has no
+weak dynamic symbols: `symtab.go` notes "maybe one day elf.STB_WEAK". A
+target that lacks the symbol then fails at load. The archive fixture with
+weak `close_range` (2.34) and `pthread_clockjoin_np` (2.31) references,
+capped to GLIBC_2.17, failed on buster with "symbol lookup error:
+/work/exe: undefined symbol: close_range". Fixing this needs per-symbol
+cells filled at init, with call stubs through them, for every target's
+reference forms. On ppc64le that includes the TOC save around calls. Not
+done here.
+
+Verification. Host and toolchains as in the static TLS entry.
+- `go vet ./...` and `go test ./...` passed. Tests:
+  - `TestWeakImportDoesNotSelectSharedProvider` checks `Weak` on all four
+    machines;
+  - `TestLinuxWeakFixups` checks the generated table and helpers;
+  - the typed-bindings rewrite test covers `lookupOptional`.
+- Fixture (`.work/tlsfast`; `OLDLINKROOT`/`OLDTRIPLE` in `run.sh`): the
+  shared-object build linked with `-nodefaultlibs` against buster's
+  libc.so.6, libpthread.so.0 and libdl.so.2, as a distribution build for
+  glibc 2.28 would be. Its weak `close_range` and `pthread_clockjoin_np`
+  stay unversioned, and its own `pthread_create@GLIBC_2.17` requirement
+  names libpthread.so.0. bao was built with `-linux-max-symbol-version
+  GLIBC_2.17`, with and without `-linux-static-tls`.
+  - This change: on glibc 2.41 the weak probe is 3 and all checks pass. On
+    glibc 2.28 (arm64 native in `debian:buster`, amd64 through buster's
+    ld-2.28.so under qemu) the probe is 0 and all checks pass, at
+    GOMAXPROCS=1 and 4.
+  - Negative control, bao at 28adac1: on glibc 2.28 the image loads, so the
+    previous entry's library naming works for a shared object's own
+    requirements, then init panics with "native symbol unavailable:
+    close_range". With static TLS on 2.41 it also shows the memfd collision
+    fixed in b991cc8.

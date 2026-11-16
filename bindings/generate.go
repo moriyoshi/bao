@@ -197,10 +197,11 @@ func Generate(out, pkg, target string, m Manifest, symbols []string) error {
 	if generationErr != nil {
 		return generationErr
 	}
-	// Linux resolves imports through dlsym, itself called using a fixed adapter.
+	// Linux resolves imports through dlsym, itself called using a fixed
+	// adapter; lookup panics when lookupOptional returns 0.
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "lookup" {
+		if !ok || fn.Name.Name != "lookupOptional" {
 			continue
 		}
 		factory, err := emit(Function{Params: []string{"uintptr", "pointer"}, Result: "uintptr"}, "", true)
@@ -213,7 +214,7 @@ func Generate(out, pkg, target string, m Manifest, symbols []string) error {
 		native := namespace + "dlsym"
 		assembly.WriteString(accessor(arch, "baoDlsymAddress", native))
 		fmt.Fprintf(&assembly, "\nTEXT %s(SB),NOSPLIT|NOFRAME,$0-0\n JMP bao_dlsym(SB)\n", native)
-		body, err := parser.ParseFile(token.NewFileSet(), "lookup.go", "package x\nfunc lookup(name string) uintptr { b:=append([]byte(name),0); call:="+factory+"(baoDlsymAddress()); p:=call(0,unsafe.Pointer(&b[0])); runtime.KeepAlive(b); if p==0 {panic(\"native symbol unavailable: \"+name)}; return p }", 0)
+		body, err := parser.ParseFile(token.NewFileSet(), "lookup.go", "package x\nfunc lookupOptional(name string) uintptr { b:=append([]byte(name),0); call:="+factory+"(baoDlsymAddress()); p:=call(0,unsafe.Pointer(&b[0])); runtime.KeepAlive(b); return p }", 0)
 		if err != nil {
 			return err
 		}
