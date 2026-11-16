@@ -7413,3 +7413,39 @@ import `__stack_chk_guard` from ld-linux-aarch64.so.1, built with
 
 amd64 images rarely import from ld-linux-x86-64.so.2 (its stack
 protector reads %fs), and this was not separately run there.
+
+## 2026-11-17: README stale-text fixes before the docs split
+
+First of four stacked documentation changes that end with moving reference
+material from README.md into `docs/`. This one corrects README statements that
+had fallen behind the implementation, without moving text:
+
+- The Linux profile said it "targets glibc/AArch64" inside text that covers all
+  four Linux architectures, and that "symbol version requirements… need
+  separate verification" right after the section documenting them. It now
+  states the glibc profile for every target, keeps the TLSDESC requirement to
+  arm64, and names `unavailable_weak_symbols`, the manifest field
+  (`linuxelf.Plan.WeakZero`) that lists missing weak imports.
+- The Darwin boundaries listed ObjC/Swift image metadata as unsupported. That
+  is true of object input (`translate/object.go` rejects it) but not of dylib
+  input, which registers it; the sentence now says so.
+- The diagnostics finding list lacked `BAO-ELF-TEXT-ALIGNMENT-CAPPED`, which
+  `internal/cli` emits.
+- Helper regeneration said to run `bazel run //:native` on Linux arm64. Per
+  `cmd/bao-native`, each Linux architecture and Windows target is regenerated
+  with `-target`, Linux cross targets with the matching GNU toolchain and
+  Windows with Clang.
+- The Linux implementation note described TLSDESC and pthread storage only; it
+  now also names `__tls_get_addr` lowering, the thread-pointer lookup table
+  and `-linux-static-tls`.
+- The `compatibility and pointer lifetimes` heading is capitalized; its anchor
+  is unchanged.
+
+Verification on Linux arm64 with Python 3: `.work/readme-cleanup/check.py`
+passed. It checks that every relative link and anchor in the repository's
+Markdown files and every `README.md#...` reference in Go sources resolves,
+that code fences balance, that every code block of the pre-change README
+survives, and that the prior journal is an unchanged prefix. Two journal links
+that already pointed at removed anchors (`#bindings`, `#verification`) are
+exempted. `git diff --check` passed. Documentation-only change; no builds,
+runtime tests or hosted workflows were run.
