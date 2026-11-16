@@ -31,6 +31,11 @@ type Options struct {
 	MaxDataAlignment uint32
 }
 type Import struct{ Local, Name, DLL string }
+
+// EmbeddedDLL is the DLL of an Import that the package's own loaded DLL
+// exports (see TranslateDLLWithObjects); it resolves after that DLL loads.
+const EmbeddedDLL = ""
+
 type Table struct {
 	Symbol string
 	Count  int
@@ -117,18 +122,28 @@ var systemImports = map[string]string{
 // Translate performs archive member selection without running a native linker.
 // Unsupported runtime profiles and TLS access forms fail before publication.
 func Translate(input []byte, opts Options) (*Plan, error) {
-	members := []ar.Member{{Name: "input.obj", Data: input}}
-	if bytes.HasPrefix(input, []byte("!<arch>\n")) {
-		var err error
-		members, err = ar.ParseCOFF(input)
-		if err != nil {
-			return nil, err
-		}
+	members, err := coffMembers(input)
+	if err != nil {
+		return nil, err
 	}
+	return translateMembers(members, sha256.Sum256(input), opts, nil)
+}
+
+// coffMembers returns an object's or archive's members.
+func coffMembers(input []byte) ([]ar.Member, error) {
+	if bytes.HasPrefix(input, []byte("!<arch>\n")) {
+		return ar.ParseCOFF(input)
+	}
+	return []ar.Member{{Name: "input.obj", Data: input}}, nil
+}
+
+// translateMembers translates selected members. The digest names the
+// package namespace. References that no member defines bind to dll's
+// exports, when dll is set, before the system import catalog.
+func translateMembers(members []ar.Member, sum [32]byte, opts Options, dll *DLLImage) (*Plan, error) {
 	if len(members) == 0 || len(opts.Symbols) == 0 {
 		return nil, fmt.Errorf("COFF translation requires object members and selected exports")
 	}
-	sum := sha256.Sum256(input)
 	p := &Plan{Namespace: fmt.Sprintf("bao_win_%x_", sum[:8])}
 	objects := make([]*object, len(members))
 	defs := map[string]int{}
@@ -320,6 +335,17 @@ func Translate(input []byte, opts Options) (*Plan, error) {
 			if _, bound := imports[name]; !bound {
 				imports[name] = dll
 				libraryFunctions[name] = true
+			}
+		}
+	}
+	if dll != nil {
+		// The loaded DLL's exports win over the catalog and import
+		// libraries, as a static link against it would; -windows-import
+		// still overrides them.
+		for _, e := range dll.Exports {
+			imports[e.Name] = EmbeddedDLL
+			if e.Function {
+				libraryFunctions[e.Name] = true
 			}
 		}
 	}

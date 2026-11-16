@@ -53,7 +53,71 @@ func (h *harness) windowsDLL(arch string) {
 		check(err != nil || !strings.Contains(string(out), "PASS:"), "Windows DLL %s control did not fail: %s", kind, out)
 	}
 	h.results["windows_dll"] = map[string]any{"driver": h.windowsDriver, "status": "CHECKED_WITH_LIMITATIONS", "checks": "DllMain, static construction, thread_local across 8 threads, C++ throw/catch inside the DLL, CRT/Win32 imports, exported data; negative controls drop the function table and TLS patches"}
+	h.windowsDLLAttached(arch, dll)
 }
+
+// windowsDLLAttached combines testdata/windows_dll_glue.c with the DLL that
+// windowsDLL linked, wrapping CreateThread in both. Negative controls drop
+// the wrapped DLL imports and the glue's imports of the DLL's exports.
+func (h *harness) windowsDLLAttached(arch, dll string) {
+	glue := filepath.Join(h.dst, "windows_dll_glue.obj")
+	h.run("windows-dll-glue-compile.log", h.dst, nil, h.windowsCompile(h.windowsCC, filepath.Join(h.root, "testdata/windows_dll_glue.c"), glue, arch, false)...)
+	app := filepath.Join(h.dst, "dll-attached")
+	require(os.Mkdir(app, 0755))
+	h.run("windows-dll-attached-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-windows-dll", dll, "-wrap", "CreateThread", "-symbol", "glue_check", "-o", filepath.Join(app, "native"), glue)
+	require(os.WriteFile(filepath.Join(app, "go.mod"), []byte("module bao-dll-attached-check\ngo 1.26.0\n"), 0644))
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(windowsDLLAttachedConsumer), 0644))
+	cross := h.consumerEnv(map[string]string{"GOOS": "windows", "GOARCH": arch})
+	exe := filepath.Join(h.dst, "dll-attached.exe")
+	h.run("windows-dll-attached-build.log", app, cross, h.goTool, "build", "-o", exe, ".")
+	for _, procs := range []string{"1", "4"} {
+		out, err := h.command("windows-dll-attached-run-"+procs+".log", h.root, map[string]string{"GOMAXPROCS": procs}, h.windowsExecute(exe)...)
+		check(err == nil && strings.Contains(string(out), "PASS: Windows DLL with object"), "Windows DLL with object failed: %v\n%s", err, out)
+	}
+	for kind, edit := range map[string][2]string{
+		"wrap":     {"if im.wrap >= 0 {", "if im.wrap >= 0 && false {"},
+		"embedded": {`if functionImports[i].dll == "" {`, `if functionImports[i].dll == "" && false {`},
+	} {
+		negative := filepath.Join(h.dst, "dll-attached-negative-"+kind)
+		copyTree(app, negative)
+		path := filepath.Join(negative, "native", "symbols_windows_"+arch+".go")
+		code := string(read(path))
+		check(strings.Contains(code, edit[0]), "no attached DLL %s step to disable", kind)
+		require(os.WriteFile(path, []byte(strings.Replace(code, edit[0], edit[1], 1)), 0644))
+		negativeExe := filepath.Join(h.dst, "dll-attached-negative-"+kind+".exe")
+		h.run("windows-dll-attached-negative-"+kind+"-build.log", negative, cross, h.goTool, "build", "-o", negativeExe, ".")
+		out, err := h.command("windows-dll-attached-negative-"+kind+"-run.log", h.root, nil, h.windowsExecute(negativeExe)...)
+		check(err != nil || !strings.Contains(string(out), "PASS:"), "Windows DLL with object %s control did not fail: %s", kind, out)
+	}
+	h.results["windows_dll_attached"] = map[string]any{"driver": h.windowsDriver, "status": "CHECKED_WITH_LIMITATIONS", "checks": "relocatable glue calling a DLL export and reading its data export through embedded-DLL imports, CreateThread wrapped in the glue and in the DLL's imports, glue thread-local variables (zero-fill and initialized) after the DLL's; negative controls drop the wrapped imports and the embedded-DLL import fill"}
+}
+
+const windowsDLLAttachedConsumer = `package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"syscall"
+	"unsafe"
+
+	"bao-dll-attached-check/native"
+)
+
+func main() {
+	runtime.LockOSThread()
+	var out [5]int32
+	syscall.SyscallN(native.SymbolAddr0(), 8, uintptr(unsafe.Pointer(&out[0])))
+	_, exported := native.SharedObjectExport("dll_threads")
+	got := fmt.Sprint(out, exported)
+	fmt.Println("attached:", got)
+	if got != "[85 9 14 16 7] true" {
+		os.Exit(1)
+	}
+	native.Shutdown()
+	fmt.Println("PASS: Windows DLL with object")
+}
+`
 
 const windowsDLLConsumer = `package main
 

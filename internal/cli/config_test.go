@@ -46,7 +46,7 @@ func TestConfigSelectOnlyTheTargetSection(t *testing.T) {
 	body := `{"schema":1,"package":"gen","symbols":["a","b"],"strip_debug":false,"strip_bitcode":false,
 	"linux":{"sysroot":"/root","system_libraries":["libxcb.so.1"],"max_text_alignment":4096,"shared_object":"/lib/libpython3.13.so.1.0","static_tls":true},
 	"darwin":{"dylib":"/lib/libpython3.13.dylib"},
-	"windows":{"imports":{"Zed":"z.dll","Abc":"a.dll"},"cxx_runtime":"libc++","crt":"msvcrt","max_data_alignment":32}}`
+	"windows":{"imports":{"Zed":"z.dll","Abc":"a.dll"},"cxx_runtime":"libc++","crt":"msvcrt","max_data_alignment":32,"dll":"/lib/python313.dll"}}`
 	o, _, _, err := configFlags(t, "build", body, "-target", "windows/arm64")
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestConfigSelectOnlyTheTargetSection(t *testing.T) {
 	if o.pkg != "gen" || o.stripDebug || o.stripBitcode || strings.Join(o.symbols, ",") != "a,b" {
 		t.Fatalf("common config: %+v", o)
 	}
-	if strings.Join(o.windowsImports, ",") != "Abc=a.dll,Zed=z.dll" || o.windowsCXXRuntime != "libc++" || o.windowsCRT != "msvcrt" || o.windowsMaxDataAlignment != 32 {
+	if strings.Join(o.windowsImports, ",") != "Abc=a.dll,Zed=z.dll" || o.windowsCXXRuntime != "libc++" || o.windowsCRT != "msvcrt" || o.windowsMaxDataAlignment != 32 || o.windowsDLL != "/lib/python313.dll" {
 		t.Fatalf("windows config: %+v", o)
 	}
 	if o.sysroot != "" || len(o.linuxSystemLibraries) != 0 || o.linuxMaxTextAlignment != 0 || o.linuxSharedObject != "" || o.linuxStaticTLS {
@@ -67,8 +67,8 @@ func TestConfigSelectOnlyTheTargetSection(t *testing.T) {
 	if o.sysroot != "/root" || strings.Join(o.linuxSystemLibraries, ",") != "libxcb.so.1" || o.linuxMaxTextAlignment != 4096 || o.linuxSharedObject != "/lib/libpython3.13.so.1.0" || !o.linuxStaticTLS || len(o.windowsImports) != 0 {
 		t.Fatalf("linux config: %+v", o)
 	}
-	if o.darwinDylib != "" {
-		t.Fatalf("darwin section leaked into linux: %+v", o)
+	if o.darwinDylib != "" || o.windowsDLL != "" {
+		t.Fatalf("darwin or windows section leaked into linux: %+v", o)
 	}
 	o, _, _, err = configFlags(t, "build", body, "-target", "darwin/arm64")
 	if err != nil {

@@ -250,7 +250,7 @@ func TestParseDLL(t *testing.T) {
 		if len(d.Relocations) != 7 || d.Relocations[0] != fxTLSDir {
 			t.Fatalf("%s relocations %#x", arch, d.Relocations)
 		}
-		want := []DLLImport{{fxIAT, "kernel32.dll", "GetTickCount64", 0}, {fxIAT + 8, "kernel32.dll", "", 5}}
+		want := []DLLImport{{Slot: fxIAT, DLL: "kernel32.dll", Name: "GetTickCount64"}, {Slot: fxIAT + 8, DLL: "kernel32.dll", Ordinal: 5}}
 		if len(d.Imports) != 2 || d.Imports[0] != want[0] || d.Imports[1] != want[1] {
 			t.Fatalf("%s imports %+v", arch, d.Imports)
 		}
@@ -374,5 +374,70 @@ func TestIsDLLRejectsObjects(t *testing.T) {
 	b, err := o.encode()
 	if err != nil || IsDLL(b) || IsDLL(bytes.Repeat([]byte("MZ"), 64)) {
 		t.Fatal("COFF objects and garbage are not DLLs")
+	}
+}
+
+// Relocatable input translated with a DLL binds its references to the DLL's
+// exports through embedded-DLL imports, selects functions of both, wraps the
+// DLL's imports and puts its TLS after the DLL's.
+func TestTranslateDLLWithObjects(t *testing.T) {
+	dll := dllFixture{}.build()
+	glue := func(wrapper bool) []byte {
+		o := fixture(pe.IMAGE_FILE_MACHINE_AMD64)
+		copy(o.sections[0].data, []byte{0xe8, 0, 0, 0, 0, 0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3})
+		o.addSymbol("fn", 0, 0)
+		o.addSymbol("__imp_data_value", 0, 0)
+		o.sections[0].relocs = []pe.Reloc{{VirtualAddress: 1, Type: 4, SymbolTableIndex: 1}, {VirtualAddress: 8, Type: 4, SymbolTableIndex: 2}}
+		if wrapper {
+			o.addSymbol("__wrap_GetTickCount64", 1, 12)
+			o.symbols[len(o.symbols)-1].Type = 0x20
+		}
+		o.sections = append(o.sections, section{name: ".tls$", flags: pe.IMAGE_SCN_CNT_INITIALIZED_DATA | pe.IMAGE_SCN_MEM_READ | pe.IMAGE_SCN_MEM_WRITE | 0x400000, size: 8, data: []byte("glue-tls")})
+		return encoded(t, o)
+	}
+	p, err := TranslateDLLWithObjects(dll, glue(true), Options{Symbols: []string{"example", "fn"}}, []string{"GetTickCount64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := p.DLL
+	if d == nil || !d.Attached || !p.Runtime {
+		t.Fatal("DLL plan missing")
+	}
+	if len(p.Exports) != 2 || p.Exports[0] != p.Namespace+"example" || p.Exports[1] != "" || len(d.Selected) != 2 || d.Selected[0] != 0 || d.Selected[1] != fxFn {
+		t.Fatalf("selection: exports %q, DLL %#x", p.Exports, d.Selected)
+	}
+	if d.Imports[0].Name != "GetTickCount64" || d.Imports[0].Wrap != p.Namespace+"__wrap_GetTickCount64" || d.Imports[1].Wrap != "" {
+		t.Fatalf("DLL imports %+v", d.Imports)
+	}
+	embedded := map[string]bool{}
+	for _, im := range p.Imports {
+		if im.DLL == EmbeddedDLL {
+			embedded[im.Name] = true
+		}
+	}
+	if !embedded["fn"] || !embedded["data_value"] || len(embedded) != 2 {
+		t.Fatalf("imports %+v", p.Imports)
+	}
+	// The DLL's TLS initializer stays at offset 0; the input's follows.
+	var template []byte
+	for _, b := range p.Objects {
+		o, err := parse(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, name := range o.names {
+			if name == p.TLS.Symbol && o.symbols[i].SectionNumber > 0 {
+				template = o.sections[o.symbols[i].SectionNumber-1].data[o.symbols[i].Value:]
+			}
+		}
+	}
+	if len(template) < 16 || binary.LittleEndian.Uint64(template) != dllImageBase+fxFn || !bytes.Contains(template[8:], []byte("glue-tls")) {
+		t.Fatalf("template % x", template[:min(len(template), 32)])
+	}
+	if _, err := TranslateDLLWithObjects(dll, glue(false), Options{Symbols: []string{"example"}}, []string{"GetTickCount64"}); err == nil || !strings.Contains(err.Error(), "__wrap_GetTickCount64") {
+		t.Fatalf("a wrap without a definition was accepted: %v", err)
+	}
+	if _, err := TranslateDLLWithObjects(dll, glue(true), Options{Symbols: []string{"data_value"}}, nil); err == nil {
+		t.Fatal("selecting DLL data was accepted")
 	}
 }

@@ -7,8 +7,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"go/token"
+	"slices"
 	"sort"
 	"strings"
+
+	"github.com/moriyoshi/bao/internal/ar"
 )
 
 // A linked DLL reaches its own code and data through PC-relative instructions
@@ -39,7 +42,10 @@ type DLLImage struct {
 	Protections []DLLRange
 	Exports     []DLLExport
 	// Selected holds the image offsets of the -symbol exports, in order.
-	Selected      []uint32
+	Selected []uint32
+	// Attached is set when relocatable input is translated with the DLL
+	// (see TranslateDLLWithObjects).
+	Attached      bool `json:",omitempty"`
 	FunctionTable DLLRange
 	TLS           *DLLTLS
 	Patches       []DLLPatch
@@ -52,6 +58,9 @@ type DLLImport struct {
 	DLL     string
 	Name    string `json:",omitempty"`
 	Ordinal uint16 `json:",omitempty"`
+	// Wrap is the input's definition that replaces the import, by its
+	// translated symbol name (see TranslateDLLWithObjects).
+	Wrap string `json:",omitempty"`
 }
 
 // DLLRange is a half-open range of image offsets with a page protection.
@@ -542,6 +551,135 @@ func TranslateDLL(input []byte, opts Options) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	anchor, err := dllAnchorObject(input, d, arch)
+	if err != nil {
+		return nil, err
+	}
+	sub := opts
+	sub.Symbols = []string{dllAnchor}
+	p, err := Translate(anchor, sub)
+	if err != nil {
+		return nil, err
+	}
+	if !p.Runtime || p.Arch != arch {
+		return nil, fmt.Errorf("Bao's Windows helper was not linked for the DLL")
+	}
+	p.Exports = nil
+	p.DLL = d
+	return p, nil
+}
+
+// TranslateDLLWithObjects translates relocatable input, an object or
+// archive, together with a DLL that the generated package loads, as a
+// static link of the input against the DLL's import library would. Input
+// references that no member defines bind to the DLL's exports through
+// private import cells, filled once the DLL is loaded. The input's TLS
+// follows the DLL's in Bao's template. Each DLL import of a name in wrap
+// resolves to the input's __wrap_ definition instead, as ld --wrap applies
+// to a shared library's references; the input itself is edited separately.
+//
+// opts.Symbols name the input's functions, then the DLL's: Plan.Exports
+// holds "" for a DLL export, and DLL.Selected 0 for an input function.
+func TranslateDLLWithObjects(dll, input []byte, opts Options, wrap []string) (*Plan, error) {
+	d, arch, err := parseDLL(dll, nil)
+	if err != nil {
+		return nil, err
+	}
+	d.Attached = true
+	members, err := coffMembers(input)
+	if err != nil {
+		return nil, err
+	}
+	defined := map[string]bool{}
+	for _, m := range members {
+		o, err := parse(m.Data)
+		if err != nil {
+			return nil, fmt.Errorf("COFF member %q: %w", m.Name, err)
+		}
+		for i := 0; i < len(o.symbols); {
+			s := o.symbols[i]
+			if s.StorageClass == 2 && s.SectionNumber > 0 {
+				defined[o.names[i]] = true
+			}
+			i += 1 + int(s.NumberOfAuxSymbols)
+		}
+	}
+	exports := map[string]DLLExport{}
+	for _, e := range d.Exports {
+		exports[e.Name] = e
+	}
+	var symbols []string
+	for _, name := range opts.Symbols {
+		if defined[name] {
+			symbols = append(symbols, name)
+			d.Selected = append(d.Selected, 0)
+			continue
+		}
+		e, ok := exports[name]
+		if !ok || !e.Function {
+			return nil, fmt.Errorf("selected export %q is neither defined by the input nor a function the DLL exports", name)
+		}
+		d.Selected = append(d.Selected, e.RVA)
+	}
+	wrapped := map[string]bool{}
+	for _, name := range wrap {
+		wrapped[name] = true
+	}
+	var targets []string
+	for i := range d.Imports {
+		im := &d.Imports[i]
+		if im.Name == "" || !wrapped[im.Name] {
+			continue
+		}
+		if !defined["__wrap_"+im.Name] {
+			return nil, fmt.Errorf("the DLL imports wrapped %s, but the input does not define __wrap_%s", im.Name, im.Name)
+		}
+		im.Wrap = "__wrap_" + im.Name
+		if !slices.Contains(targets, im.Wrap) {
+			targets = append(targets, im.Wrap)
+		}
+	}
+	anchor, err := dllAnchorObject(dll, d, arch)
+	if err != nil {
+		return nil, err
+	}
+	// The anchor goes first, so the DLL's TLS starts Bao's template at the
+	// offsets its code uses.
+	members = append([]ar.Member{{Name: "bao-dll-anchor.obj", Data: anchor}}, members...)
+	sub := opts
+	sub.Symbols = append(append(append([]string{}, symbols...), targets...), dllAnchor)
+	sum := sha256.Sum256(append(append([]byte{}, input...), d.SHA256...))
+	p, err := translateMembers(members, sum, sub, d)
+	if err != nil {
+		return nil, err
+	}
+	if !p.Runtime || p.Arch != arch {
+		return nil, fmt.Errorf("Bao's Windows helper was not linked for the DLL")
+	}
+	// Plan.Exports follows sub.Symbols: the input's selections, the wrap
+	// targets, then the anchor.
+	selected, wraps := p.Exports[:len(symbols)], p.Exports[len(symbols):len(symbols)+len(targets)]
+	for i := range d.Imports {
+		if w := d.Imports[i].Wrap; w != "" {
+			d.Imports[i].Wrap = wraps[slices.Index(targets, w)]
+		}
+	}
+	p.Exports = nil
+	for _, rva := range d.Selected {
+		if rva != 0 {
+			p.Exports = append(p.Exports, "")
+			continue
+		}
+		p.Exports = append(p.Exports, selected[0])
+		selected = selected[1:]
+	}
+	p.DLL = d
+	return p, nil
+}
+
+// dllAnchorObject builds the COFF object that links Bao's Windows helper for
+// a DLL and carries the DLL's TLS template.
+func dllAnchorObject(input []byte, d *DLLImage, arch string) ([]byte, error) {
 	machine := uint16(pe.IMAGE_FILE_MACHINE_AMD64)
 	ret, abs := []byte{0xc3, 0xcc, 0xcc, 0xcc}, uint16(1) // IMAGE_REL_AMD64_ADDR64
 	if arch == "arm64" {
@@ -580,22 +718,7 @@ func TranslateDLL(input []byte, opts Options) (*Plan, error) {
 		}
 		o.sections = append(o.sections, section{name: ".tls", flags: pe.IMAGE_SCN_CNT_INITIALIZED_DATA | pe.IMAGE_SCN_MEM_READ | pe.IMAGE_SCN_MEM_WRITE | bits<<20, size: uint32(len(data)), data: data})
 	}
-	anchor, err := o.encode()
-	if err != nil {
-		return nil, err
-	}
-	sub := opts
-	sub.Symbols = []string{dllAnchor}
-	p, err := Translate(anchor, sub)
-	if err != nil {
-		return nil, err
-	}
-	if !p.Runtime || p.Arch != arch {
-		return nil, fmt.Errorf("Bao's Windows helper was not linked for the DLL")
-	}
-	p.Exports = nil
-	p.DLL = d
-	return p, nil
+	return o.encode()
 }
 
 const dllAnchor = "bao_dll_anchor"
