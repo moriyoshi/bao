@@ -600,6 +600,7 @@ func TranslateWithOptions(input []byte, sysroot string, exports []string, opts O
 			}
 		}
 	}
+	nameMovedLibraries(p.Imports, versionCaps)
 	if opts.StaticTLS {
 		module, err := StaticTLSStub(p.Arch, p.TLSTemplateSize, p.TLSTemplateAlignment)
 		if err != nil {

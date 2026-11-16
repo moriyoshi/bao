@@ -174,3 +174,47 @@ func TestBindVersions(t *testing.T) {
 		t.Error("release order")
 	}
 }
+
+func TestNameMovedLibraries(t *testing.T) {
+	type c struct{ name, version, library, want string }
+	cases := []c{
+		{"pthread_key_create", "GLIBC_2.17", "libc.so.6", "libpthread.so.0"},
+		{"pthread_key_create", "GLIBC_2.34", "libc.so.6", "libc.so.6"},
+		{"dlsym", "GLIBC_2.2.5", "libc.so.6", "libdl.so.2"},
+		{"shm_open", "GLIBC_2.17", "libc.so.6", "librt.so.1"},
+		{"openpty", "GLIBC_2.17", "libc.so.6", "libutil.so.1"},
+		{"getaddrinfo_a", "GLIBC_2.17", "libc.so.6", "libanl.so.1"},
+		// Old libc.so.6 already exported these.
+		{"pthread_mutex_lock", "GLIBC_2.17", "libc.so.6", "libc.so.6"},
+		{"memcpy", "GLIBC_2.14", "libc.so.6", "libc.so.6"},
+		// Another provider, or another namespace, is left alone.
+		{"pthread_key_create", "GLIBC_2.17", "libfoo.so.1", "libfoo.so.1"},
+		{"pthread_key_create", "FOO_1.0", "libc.so.6", "libc.so.6"},
+	}
+	for _, capped := range []bool{false, true} {
+		var caps map[string]symbolVersion
+		unversioned := "libc.so.6"
+		if capped {
+			caps, _ = ParseMaxSymbolVersions([]string{"GLIBC_2.18"})
+			unversioned = "libpthread.so.0"
+		}
+		// Unversioned, such as an import with no version at or below the cap.
+		all := append(cases, c{"pthread_clockjoin_np", "", "libc.so.6", unversioned})
+		imports := make([]Import, len(all))
+		for i, x := range all {
+			imports[i] = Import{Remote: x.name, Version: x.version, Library: x.library}
+		}
+		nameMovedLibraries(imports, caps)
+		for i, x := range all {
+			if imports[i].Library != x.want {
+				t.Errorf("capped %v: %s@%s from %s binds %s, want %s", capped, x.name, x.version, x.library, imports[i].Library, x.want)
+			}
+		}
+	}
+	// A cap at 2.34 or later leaves unversioned imports in libc.so.6.
+	caps, _ := ParseMaxSymbolVersions([]string{"GLIBC_2.34"})
+	imports := []Import{{Remote: "pthread_clockjoin_np", Library: "libc.so.6"}}
+	if nameMovedLibraries(imports, caps); imports[0].Library != "libc.so.6" {
+		t.Errorf("cap 2.34 moved an unversioned import to %s", imports[0].Library)
+	}
+}

@@ -1308,11 +1308,14 @@ list before relying on the cap:
   the first time a thread uses native TLS, and aborts if it fails. An image
   that uses native TLS therefore needs glibc 2.18 whatever the cap.
 - glibc 2.34 moved libpthread, libdl, librt, libutil and libanl symbols
-  into libc.so.6. With a sysroot from 2.34 or later, a capped import of such
-  a symbol, such as `pthread_key_create@GLIBC_2.17`, still names libc.so.6.
-  An older glibc defines it only in the original library, so the result
-  fails to start there. Bao's own TLS runtime imports `pthread_key_create`.
-  Until this is fixed, use a sysroot from the oldest glibc you target.
+  into libc.so.6, keeping their old versions there. An import bound to
+  such an old version, such as `pthread_key_create@GLIBC_2.17`, names its
+  original library, here libpthread.so.0. Before 2.34 the symbol is
+  defined only there. glibc 2.34 and later keep that library as a stub
+  with the same version nodes, so the import resolves to libc.so.6. Bao
+  applies this to a fixed list of the 210 symbols concerned, taken from
+  glibc 2.33. It also applies when a shared-object input requires such a
+  version.
 - An import the inputs declare weak, such as an optional `getentropy` or
   `sem_clockwait`, is listed too. It is optional only if the code checks it
   before calling it.

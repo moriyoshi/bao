@@ -138,3 +138,23 @@ func bindVersions(root string, imports []Import, caps map[string]symbolVersion) 
 	sort.Strings(above)
 	return above, nil
 }
+
+// nameMovedLibraries names the original library of each libc.so.6 import
+// that glibc 2.34 moved there when the import binds an older version, or is
+// unversioned under a GLIBC cap older than 2.34. That version is defined in
+// libc.so.6 only from 2.34; before then only the original library had it,
+// and an executable that names libc.so.6 fails to start there.
+func nameMovedLibraries(imports []Import, caps map[string]symbolVersion) {
+	moved, _ := parseSymbolVersion("GLIBC_2.34")
+	limit, capped := caps[moved.space]
+	capped = capped && limit.less(moved)
+	for i, b := range imports {
+		library := glibcMovedSymbols[b.Remote]
+		if library == "" || b.Library != "libc.so.6" {
+			continue
+		}
+		if v, ok := parseSymbolVersion(b.Version); ok && v.space == moved.space && v.less(moved) || b.Version == "" && capped {
+			imports[i].Library = library
+		}
+	}
+}
