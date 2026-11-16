@@ -7449,3 +7449,61 @@ survives, and that the prior journal is an unchanged prefix. Two journal links
 that already pointed at removed anchors (`#bindings`, `#verification`) are
 exempted. `git diff --check` passed. Documentation-only change; no builds,
 runtime tests or hosted workflows were run.
+
+## 2026-11-17: README platform support matrix and merged duplicates
+
+Second of the stacked README clean-up changes. README repeated several facts
+in different words, and its user sections carried dated verification history
+that belongs here.
+
+- A new "Platform support" section has one table of targets, profile status,
+  native input kinds, where runtime checks ran, and where cgo-enabled
+  consumer builds ran, with the remaining gaps listed under it. It replaces
+  three differently worded lists of cgo-enabled executions (walkthrough,
+  "Using generated Go packages", FAQ). The FAQ's Windows arm64 caveat,
+  "cross-linked but not executed", appeared in only one of them; it is now in
+  the table.
+- The cgo/internal-linker rule is stated once, under "Using generated Go
+  packages". The walkthrough and FAQ link to it; their copies of
+  `CGO_ENABLED=1 go build -ldflags=-linkmode=internal` were removed.
+- Linux weak references were described in three places. One paragraph now
+  covers references no sysroot library defines (NULL, listed in
+  `unavailable_weak_symbols`), the amd64 GOT forms, and imports an older
+  target lacks (0 when bound at initialization, still required for an
+  archive's code references).
+- The Windows implementation note said native VM CI "checks" compilers and
+  that native runtime verification "remains pending"; it now says the CI is
+  configured and its results are pending, consistent with the table.
+
+Dated statements removed from README, preserved here as README stated them
+before this change:
+
+- Linux amd64 C++ profile (GCC 14.4.0 or Clang 19.1.7, libstdc++, glibc 2.41,
+  GNU ld 2.44): "checked with Go 1.26.10 and not yet rechecked with the pinned
+  Go 1.26.11".
+- Linux amd64 TLSDESC: "GCC 14.2 and Clang 19.1.7 TLSDESC output has run only
+  under QEMU 10.0.13 (AVX2 and SSE-only CPU models)". "Local amd64 Docker
+  verification uses QEMU on an arm64 daemon; hosted CI selects a native amd64
+  runner."
+- Linux loong64 and ppc64le: "Their Rust runtime and typed-binding examples
+  pass under QEMU 10.0.13 with Go 1.26.11. Both GCC 14.2 and Clang
+  19.1.7/libstdc++ C++ lifecycle suites passed with Go 1.26.10 and have not
+  yet been rechecked with Go 1.26.11."
+- Darwin amd64: "The eight examples and TLS register negative control passed
+  under Rosetta 2 on macOS/arm64 with Go 1.26.11. The first hosted release
+  rehearsal also passed on native macOS Intel before the current SDK bump;
+  that hosted check has not yet run with the new SDK."
+- Windows consumer: "Current local checks use Wine; native Windows CI remains
+  a release gate."
+
+The table keeps the still-current caveats from these: the Go 1.26.10 C++
+suites, the hosted Intel check, unverified physical LoongArch/PowerPC
+hardware, and pending native Windows results.
+
+Verification on Linux arm64 with Python 3: `.work/readme-cleanup/check.py`
+passed (links, anchors, fences, journal prefix). It reports the two removed
+`go build -ldflags=-linkmode=internal` blocks, listed as intended removals in
+`.work/readme-cleanup/removed-blocks.txt`; every other code block of the
+pre-clean-up README is present. `git diff --check` passed.
+Documentation-only change; no builds, runtime tests or hosted workflows were
+run.
