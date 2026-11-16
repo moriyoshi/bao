@@ -18,6 +18,7 @@ import (
 	"github.com/moriyoshi/bao/bindings"
 	"github.com/moriyoshi/bao/linuxelf"
 	"github.com/moriyoshi/bao/toolchain"
+	"github.com/moriyoshi/bao/translate"
 )
 
 type nativeFlags struct {
@@ -36,9 +37,11 @@ type nativeFlags struct {
 	linuxMaxTextAlignment             uint
 	linuxSharedObject                 string
 	linuxStaticTLS                    bool
-	// linuxSharedObjectWrap lists the -wrap symbols, which also apply to
-	// the shared object's imports.
+	darwinDylib                       string
+	// linuxSharedObjectWrap and darwinDylibWrap list the -wrap symbols,
+	// which also apply to the shared object's or dylib's imports.
 	linuxSharedObjectWrap []string
+	darwinDylibWrap       []string
 	config                string
 	inlineBindings        []byte
 	diagnostics           diagnosticFlags
@@ -64,6 +67,7 @@ func (o *nativeFlags) register(fs *flag.FlagSet) {
 	fs.UintVar(&o.linuxMaxTextAlignment, "linux-max-text-alignment", 0, "link executable sections requesting more alignment at this value; only 4096 is supported, and capped sections are recorded in the manifest")
 	fs.StringVar(&o.linuxSharedObject, "linux-shared-object", "", "linked PIC shared object to translate with the input, which may reference its exports; a shared object can also be the input itself")
 	fs.BoolVar(&o.linuxStaticTLS, "linux-static-tls", false, staticTLSUsage)
+	fs.StringVar(&o.darwinDylib, "darwin-dylib", "", "linked dylib to load with the input object, which may reference its exports; a dylib can also be the input itself")
 	fs.StringVar(&o.windowsCXXRuntime, "windows-cxx-runtime", "auto", "Windows C++ runtime: auto (MSVC/libstdc++), libstdc++, or libc++ (LLVM-MinGW)")
 	fs.StringVar(&o.windowsCRT, "windows-crt", "ucrt", "Windows system C runtime: ucrt or msvcrt; match the producer toolchain")
 	o.diagnostics.register(fs)
@@ -142,6 +146,9 @@ func resolvePlatform(ctx context.Context, o *nativeFlags, target toolchain.Targe
 	}
 	if o.linuxStaticTLS && !strings.HasPrefix(target.Name, "linux/") {
 		return usage("-linux-static-tls requires a Linux target")
+	}
+	if o.darwinDylib != "" && !strings.HasPrefix(target.Name, "darwin/") {
+		return usage("-darwin-dylib requires a darwin target")
 	}
 	if strings.HasPrefix(target.Name, "windows/") {
 		if !o.stripBitcode {
@@ -224,6 +231,12 @@ func generateNativeRaw(o nativeFlags, target toolchain.Target, input, output str
 			}
 		}
 		return translateELF(append(args, "-sysroot", o.sysroot, input), stderr)
+	}
+	if o.darwinDylib != "" {
+		args = append(args, "-darwin-dylib", o.darwinDylib)
+		for _, name := range o.darwinDylibWrap {
+			args = append(args, "-darwin-dylib-wrap", name)
+		}
 	}
 	return runLegacy(append([]string{"translate"}, append(args, "-sdk", o.sdk, input)...), stdout, stderr)
 }
@@ -412,9 +425,9 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	sourceHash := fmt.Sprintf("%x", sha256.Sum256(inputBytes))
-	sharedInput := linuxelf.IsSharedObject(inputBytes)
+	sharedInput := linuxelf.IsSharedObject(inputBytes) || translate.IsDylib(inputBytes)
 	if sharedInput && len(linkArchives) > 0 {
-		return usage("-link-archive cannot extend a shared-object input; pass relocatable code as the input and the library with -linux-shared-object")
+		return usage("-link-archive cannot extend a shared-object input; pass relocatable code as the input and the library with -linux-shared-object or -darwin-dylib")
 	}
 	if sharedInput && edits.any() {
 		return usage("symbol edits apply to relocatable inputs, not a linked shared object")
@@ -517,6 +530,23 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		o.linuxSharedObject = snapshot
 		o.linuxSharedObjectWrap = edits.wrap
 	}
+	var dylib *linkedInput
+	if o.darwinDylib != "" {
+		if sharedInput {
+			return usage("the input is already a dylib; -darwin-dylib needs relocatable input")
+		}
+		data, err := os.ReadFile(o.darwinDylib)
+		if err != nil {
+			return err
+		}
+		snapshot := filepath.Join(work, "library.dylib")
+		if err := writeNew(snapshot, data); err != nil {
+			return err
+		}
+		dylib = &linkedInput{Path: o.darwinDylib, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}
+		o.darwinDylib = snapshot
+		o.darwinDylibWrap = edits.wrap
+	}
 	if archive && !strings.HasPrefix(target.Name, "windows/") || len(linkArchives) > 0 {
 		fmt.Fprintf(stderr, "Combining archive for %s\n", target.Name)
 		combined = filepath.Join(work, "combined.o")
@@ -565,10 +595,11 @@ func buildNative(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		Commands             []toolchain.Command `json:"producer_commands"`
 		LinkedArchives       []linkedInput       `json:"linked_archives,omitempty"`
 		SharedObject         *linkedInput        `json:"linux_shared_object,omitempty"`
+		Dylib                *linkedInput        `json:"darwin_dylib,omitempty"`
 		LinkedNotices        []linkedInput       `json:"linked_notices,omitempty"`
 		RequireStaticRuntime bool                `json:"require_static_runtime,omitempty"`
 		SymbolEdits          *symbolEditRecord   `json:"symbol_edits,omitempty"`
-	}{1, baoVersion(), target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, notices, *requireStaticRuntime, symbolEdits}
+	}{1, baoVersion(), target, input, sourceHash, fmt.Sprintf("%x", sha256.Sum256(bytes)), *manifest, append([]string{}, o.symbols...), executor.Commands, linked, sharedObject, dylib, notices, *requireStaticRuntime, symbolEdits}
 	b, err := json.MarshalIndent(provenance, "", "  ")
 	if err != nil {
 		return err

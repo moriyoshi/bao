@@ -7595,3 +7595,83 @@ boundary, or the edits listed above. `go build ./...` and
 `go test ./internal/cli -run 'Help|Verified|Usage'` passed after the help-text
 change. `git diff --check` passed. No other builds, runtime tests or hosted
 workflows were run.
+
+## 2026-11-17: Relocatable code with a Darwin dylib (`-darwin-dylib`)
+
+pythago's macOS port needs on darwin what `-linux-shared-object` does on
+Linux. Its glue object references libpython's `Py*` exports and defines
+`__wrap_pthread_{create,join,detach,exit}`, and libpython's own pthread
+imports should go to those wrappers. Darwin dylib input could not be combined
+with relocatable code until now.
+
+What changed:
+- `-darwin-dylib PATH` (config `darwin.dylib`, `build.Options.Darwin.Dylib`)
+  takes the dylib, and the input is relocatable code. It is one object, or an
+  archive that the partial linker combines first; the archive case was not
+  exercised.
+- `translate.AttachDylib` appends the parsed image to the object as a 16
+  KiB-aligned `__TEXT,__bao_image` section, the same placement as the dylib
+  anchor. Each undefined object symbol that the dylib exports becomes a local
+  definition at its image offset. The object's calls, GOT loads and data
+  pointers to the dylib are therefore ordinary relocations: no `dlsym`, no
+  import, and no native linker. Go inserts its trampolines for arm64 branches
+  into the image.
+- `-symbol` resolves against the object's global definitions first, then
+  against functions the dylib exports, which get a global definition.
+- `-wrap` (from `bao build`) edits the object as before. A dylib bind of a
+  wrapped name records the object's `__wrap_` symbol, and the loader resolves
+  it from an address table. A wrapped name that the dylib binds while the
+  object does not define it is refused.
+- The object's own TLS, which pythago's glue has as `static __thread`
+  variables, shares the dylib's TLS runtime. The combined template is the
+  object's template followed by the dylib's, and `dylibLoad` adds that shift
+  to every dylib TLV offset.
+- Existing dylib-input bug fixed. An `LC_DYLD_INFO` dylib (no chained
+  fixups), such as python-build-standalone's libpython, binds
+  `dyld_stub_binder` for its stub helpers, and `dlsym` does not find it on
+  macOS 26.5.2. The load panicked with "dylib import dyld_stub_binder is
+  unavailable". Lazy binds are bound eagerly, so that bind is now dropped. The
+  existing fixtures use chained fixups and never reached this path.
+
+Verification:
+- Linux host: Linux 7.0.0 aarch64. Producer and consumer builds used Go
+  1.26.11 (`GOTOOLCHAIN=go1.26.11`); `go vet ./...` and `go test ./...` used
+  Go 1.27.4. New tests: `TestAttachDylib` (local and selected definitions,
+  the data relocation's target in the ELF container, the wrap target name,
+  refused wraps and selections) and the config/command-line tests.
+- Cross production on Linux: `bao build -target darwin/{arm64,amd64}` used
+  only the SDK text stubs copied from dengaku.local (CommandLineTools
+  MacOSX.sdk 26.5) as `-sdk`. Inputs were Mac-compiled
+  `testdata/darwin_dylib_glue.c` and `darwin_dylib.cpp`. Consumers were built
+  with `CGO_ENABLED=0` and run natively on dengaku.local (macOS 26.5.2, M1
+  Max, Apple clang 21.0.0) for arm64, and on macbook-pro-2.local (macOS
+  26.6.2, i9-9880H, Apple clang 17.0.0) for amd64. Two dylib builds were used:
+  chained fixups, and `-Wl,-no_fixup_chains` (`LC_DYLD_INFO`).
+  - On each Mac and dylib build, at GOMAXPROCS 1 and 4: `[85 9 14 16 7]`. In
+    order: the dylib's 8-thread TLS sum, 1 glue plus 8 dylib
+    `pthread_create` calls through `__wrap_`, a new thread's glue TLS
+    (zero-fill plus initialized), this thread's glue TLS, and the dylib's
+    data export.
+  - Negative controls failed on every pair. With the wrapped binds dropped,
+    the dylib's 8 thread starts bypass the wrapper: `[85 1 ...]`. With the TLV
+    offset shift dropped, the dylib's TLS overlaps the glue's: `[84 ...]`.
+- Real inputs, arm64 only, on dengaku.local: python-build-standalone
+  20261110 `libpython3.13.dylib` (3.13.18) and free-threaded
+  `libpython3.14t.dylib` (3.14.10), both `LC_DYLD_INFO` with
+  `MH_HAS_TLV_DESCRIPTORS`. Each was combined with pythago's unity glue object
+  (`unity-python3.13-arm64.o` and `unity-python3.14t-arm64.o`, four `__thread`
+  variables), produced on Linux with `-wrap` for all four pthread calls.
+  - The consumer ran `Py_InitializeEx`, eight `threading` threads,
+    `hashlib` and `json`, then `Py_FinalizeEx`. Both versions passed at
+    GOMAXPROCS 1 and 4, and 3.14t reported the GIL disabled.
+  - pythago's spawn hook was not installed, so the wrappers fell through to
+    `__real_pthread_*`. That glue copy has no `pythago_symtab`, so
+    `-symbol pythago_config_new` stood in.
+- Not run: the `darwin` bao-verify suite, which now includes
+  `darwinDylibAttached`, and hosted CI; the Macs have no Go toolchain. The
+  amd64 real-input case was not run; no x86_64 libpython was available.
+  Extension modules that libpython loads with `dlopen` (`_dbm`, `_tkinter`)
+  were not tried and are not expected to find its symbols.
+
+Scripts and logs: `.work/darwin-attach/` (`fetch.sh`, `run.sh`,
+`py/run.sh`, `run-1.26.11.log`, `py/run-1.26.11.log`).

@@ -9,6 +9,21 @@ import (
 	"github.com/moriyoshi/bao/translate"
 )
 
+// dylibWrapTargets lists the attached object's definitions that wrapped
+// binds use, sorted.
+func dylibWrapTargets(d *translate.DylibImage) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, b := range d.Binds {
+		if b.Wrap != "" && !seen[b.Wrap] {
+			seen[b.Wrap] = true
+			names = append(names, b.Wrap)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // dylibSource emits the loader for a dylib image linked into the executable's
 // signed __TEXT segment (see translate.dylibAnchor). dylibLoad makes the
 // image's data segments writable, binds them as dyld would and returns its TLS
@@ -53,14 +68,26 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 	}
 	fmt.Fprintf(src, "\nvar dylibLibraries = [...]string{%s}\n", goList(paths, strconv.Quote))
 	fmt.Fprintf(src, "\nvar dylibRPaths = [...]string{%s}\n", goList(d.RPaths, strconv.Quote))
-	fmt.Fprintf(src, "\nvar dylibBinds = [...]struct{ slot uint64; name string; library int; addend int64; weak bool; self int64 }{%s}\n", goList(d.Binds, func(b translate.DylibBind) string {
-		self, library := int64(-1), -1
-		if b.Library != "" {
+	wraps := dylibWrapTargets(d)
+	wrapIndex := map[string]int{}
+	for i, name := range wraps {
+		wrapIndex[name] = i
+	}
+	if len(wraps) != 0 {
+		fmt.Fprintf(src, "\nfunc dylibWraps() []uintptr { return baoAddresses(dylibWrapTable(), %d) }\n", len(wraps))
+	} else {
+		src.WriteString("\nfunc dylibWraps() []uintptr { return nil }\n")
+	}
+	fmt.Fprintf(src, "\nvar dylibBinds = [...]struct{ slot uint64; name string; library int; addend int64; weak bool; self int64; wrap int }{%s}\n", goList(d.Binds, func(b translate.DylibBind) string {
+		self, library, wrap := int64(-1), -1, -1
+		if b.Wrap != "" {
+			wrap = wrapIndex[b.Wrap]
+		} else if b.Library != "" {
 			library = libraries[b.Library]
 		} else if off, ok := exports[b.Name]; ok {
 			self = int64(off)
 		}
-		return fmt.Sprintf("{%#x,%q,%d,%d,%t,%d}", b.Slot, b.Name, library, b.Addend, b.Weak, self)
+		return fmt.Sprintf("{%#x,%q,%d,%d,%t,%d,%d}", b.Slot, b.Name, library, b.Addend, b.Weak, self, wrap)
 	}))
 	var descriptors []uint64
 	tlsStart, tlsData, tlsEnd, tlsAlign := uint64(0), uint64(0), uint64(0), uint64(8)
@@ -105,8 +132,10 @@ func dylibSource(src *strings.Builder, p *translate.TLSProbe) {
 var dylibTLSTemplate []byte
 
 // dylibLoad binds the dylib image in place and returns its TLS template's
-// address, size and alignment for Bao's TLS runtime.
-func dylibLoad() (uintptr, uintptr, uintptr) {
+// address, size and alignment for Bao's TLS runtime. An attached object's
+// template, if any, comes first, and the dylib's descriptors are offset past
+// it.
+func dylibLoad(objectTemplate, objectSize, objectAlign uintptr) (uintptr, uintptr, uintptr) {
 	const size, tlsStart, tlsData, tlsEnd, tlsAlign = %#x, %#x, %#x, %#x, %d
 	libc, err := purego.Dlopen("/usr/lib/libSystem.B.dylib", purego.RTLD_NOW|purego.RTLD_GLOBAL)
 	if err != nil { panic(err) }
@@ -130,9 +159,12 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 			if handles[i], err = purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL); err == nil { break }
 		}
 	}
+	wraps := dylibWraps()
 	for _, b := range dylibBinds {
 		var address uintptr
 		switch {
+		case b.wrap >= 0:
+			address = wraps[b.wrap]
 		case b.self >= 0:
 			address = base + uintptr(b.self)
 		case b.library >= 0 && handles[b.library] == 0:
@@ -149,7 +181,10 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 		if address != 0 { address = uintptr(int64(address) + b.addend) }
 		*word(b.slot) = uint64(address)
 	}
+	align := max(uintptr(tlsAlign), objectAlign)
+	shift := (objectSize + align - 1) &^ (align - 1)
 	for _, d := range dylibTLVDescriptors { *word(d), *word(d + 8) = uint64(tlsAddress_thunk()), 0 }
+	for _, d := range dylibTLVDescriptors { *word(d + 16) += uint64(shift) }
 	// libobjc may write the image's selector and protocol references. Swift
 	// classes are Objective-C classes, so libobjc reads them first.
 	dylibObjCRegister(base, dylibObjC)
@@ -158,13 +193,14 @@ func dylibLoad() (uintptr, uintptr, uintptr) {
 		if mprotect(base+uintptr(s.start), uintptr(s.end-s.start), s.prot) != 0 { panic("bao: dylib page protection failed") }
 	}
 	for _, f := range dylibFDEs { registerFrame(base + uintptr(f)) }
-	n := uintptr(tlsEnd - tlsStart)
+	n := shift + uintptr(tlsEnd - tlsStart)
 	if n == 0 { n = 8 }
-	buffer := make([]byte, n+tlsAlign)
-	offset := (tlsAlign - uintptr(unsafe.Pointer(&buffer[0]))%%tlsAlign) %% tlsAlign
+	buffer := make([]byte, n+align)
+	offset := (align - uintptr(unsafe.Pointer(&buffer[0]))%%align) %% align
 	dylibTLSTemplate = buffer[offset : offset+n]
-	copy(dylibTLSTemplate, image[tlsStart:tlsData])
-	return uintptr(unsafe.Pointer(&dylibTLSTemplate[0])), n, tlsAlign
+	if objectSize != 0 { copy(dylibTLSTemplate, unsafe.Slice((*byte)(unsafe.Pointer(objectTemplate)), objectSize)) }
+	copy(dylibTLSTemplate[shift:], image[tlsStart:tlsData])
+	return uintptr(unsafe.Pointer(&dylibTLSTemplate[0])), n, align
 }
 
 // dylibSearchPaths expands a dependency's install name as dyld would for an

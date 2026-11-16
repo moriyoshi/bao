@@ -857,8 +857,8 @@ available for those compilers.
 Each target family has its own producer reference:
 
 - [Darwin](docs/darwin.md): the object profile and its unsupported inputs,
-  linked dylib input with Objective-C and Swift registration, and
-  implementation notes.
+  linked dylib input with Objective-C and Swift registration, relocatable code
+  with a dylib and `-wrap` of its binds, and implementation notes.
 - [Linux](docs/linux.md): sysroots and system libraries, symbol versions and
   `-linux-max-symbol-version`, weak references, alignment and toolchain
   requirements, TLS (including opt-in `-linux-static-tls`), linked shared object

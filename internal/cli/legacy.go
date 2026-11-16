@@ -38,6 +38,12 @@ func runLegacy(args []string, stdout, stderr io.Writer) error {
 		fs.StringVar(pkg, "package", "native", "generated Go package name")
 		fs.Var(&symbols, "symbol", "native export without Mach-O's extra leading underscore; repeatable")
 	}
+	var dylibPath string
+	var dylibWrap symbolFlags
+	if cmd == "translate" {
+		fs.StringVar(&dylibPath, "darwin-dylib", "", "linked dylib to load with the input object, which may reference its exports")
+		fs.Var(&dylibWrap, "darwin-dylib-wrap", "redirect the dylib's imports of SYMBOL to the input's __wrap_SYMBOL, as ld --wrap; repeatable")
+	}
 	if cmd == "translate" || cmd == "probe-tls" {
 		fs.StringVar(sdk, "sdk", "", "macOS SDK for system import bindings")
 		fs.BoolVar(metadata, "runtime", false, "register native unwind records and run initializers (requires -sdk)")
@@ -53,7 +59,7 @@ func runLegacy(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if cmd == "translate" && translate.IsDylib(input) {
+	if cmd == "translate" && translate.IsDylib(input) && dylibPath == "" {
 		dylib, anchor, err := translate.PrepareDylib(input, symbols)
 		if err != nil {
 			return err
@@ -66,6 +72,37 @@ func runLegacy(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return probeDylib(*out, *pkg, *sdk, symbols, dylib, anchor, report, stderr)
+	}
+	if dylibPath == "" && len(dylibWrap) != 0 {
+		return usage("-darwin-dylib-wrap requires -darwin-dylib")
+	}
+	if dylibPath != "" {
+		if translate.IsDylib(input) {
+			return usage("the input is already a dylib; -darwin-dylib needs a relocatable object")
+		}
+		if *out == "" {
+			return usage("-o is required")
+		}
+		library, err := os.ReadFile(dylibPath)
+		if err != nil {
+			return err
+		}
+		objects, err := translate.Parse(filepath.Base(fs.Arg(0)), input)
+		if err != nil {
+			return err
+		}
+		if len(objects) != 1 {
+			return usage("-darwin-dylib needs one relocatable object, not an archive")
+		}
+		dylib, attached, err := translate.AttachDylib(library, objects[0], symbols, dylibWrap)
+		if err != nil {
+			return err
+		}
+		report, err := translate.Inspect(input, objects)
+		if err != nil {
+			return err
+		}
+		return probeTLSImage(*out, *pkg, *sdk, "elf", true, symbols, attached.Data, []translate.Object{attached}, report, stderr, dylib)
 	}
 	objects, err := translate.Parse(filepath.Base(fs.Arg(0)), input)
 	if err != nil {

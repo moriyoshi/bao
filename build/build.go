@@ -18,8 +18,8 @@ import (
 // Options are bao build's flags. Empty fields are left out, so the command's
 // defaults apply. See the README for each flag.
 type Options struct {
-	// Input is the relocatable object, static archive or Linux shared
-	// object to translate.
+	// Input is the relocatable object, static archive, Linux shared object
+	// or Darwin dylib to translate.
 	Input string
 	// Output is the generated Go package directory (-o). It must not exist.
 	Output string
@@ -47,8 +47,8 @@ type Options struct {
 	// StripDebug removes native debug information (-strip-debug).
 	StripDebug bool
 	// Wrap redirects each symbol to __wrap_SYMBOL, as ld.lld --wrap
-	// (-wrap). With Linux.SharedObject it applies to that library's imports
-	// too.
+	// (-wrap). With Linux.SharedObject or Darwin.Dylib it applies to that
+	// library's imports too.
 	Wrap []string
 	// RedefineSymbols renames OLD to NEW in every input (-redefine-sym).
 	RedefineSymbols map[string]string
@@ -100,6 +100,9 @@ type WindowsOptions struct {
 type DarwinOptions struct {
 	// MinOS is the deployment version for partial linking (-min-os).
 	MinOS string
+	// Dylib is a linked dylib to load with the input object
+	// (-darwin-dylib).
+	Dylib string
 }
 
 // CommandLine returns the bao build arguments, after "build", that Run
@@ -160,6 +163,7 @@ func (o Options) CommandLine() []string {
 	flag("windows-cxx-runtime", o.Windows.CXXRuntime)
 	number("windows-max-data-alignment", o.Windows.MaxDataAlignment)
 	flag("min-os", o.Darwin.MinOS)
+	flag("darwin-dylib", o.Darwin.Dylib)
 	args = append(args, o.Args...)
 	// The input follows "--", so a path that starts with "-" is not a flag.
 	return append(args, "--", o.Input)

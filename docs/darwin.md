@@ -54,9 +54,11 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
   read-write, fixed up, and `__DATA_CONST` is made read-only again. Code pages
   are never written.
 - **Fixups:** chained fixups (`DYLD_CHAINED_PTR_64` and `_64_OFFSET`) or
-  `LC_DYLD_INFO` rebase and bind opcodes; lazy binds are bound eagerly. Each
-  bind resolves in the library its two-level namespace names, opened with
-  `dlopen` by its install name. A missing weak import is null.
+  `LC_DYLD_INFO` rebase and bind opcodes; lazy binds are bound eagerly. Only
+  stub helpers use `dyld_stub_binder`, which `dlsym` does not find on macOS
+  26, so its bind is dropped. Each bind resolves in the library its two-level
+  namespace names, opened with `dlopen` by its install name. A missing weak
+  import is null.
 - **Library paths:** the dylib's code is part of the executable, so
   `@executable_path` and `@loader_path` both name the executable's directory,
   as dyld treats the main executable. `@rpath` tries the dylib's `LC_RPATH`
@@ -100,11 +102,52 @@ relocations, so Bao keeps its image together and lets it run where Go links it:
 
 Not supported:
 - arm64e dylibs, and tagged or multi-start chained fixups.
-- Relocatable code combined with a dylib.
 
 `dladdr` reports the executable for the dylib's code, `__mod_term_func` does not
 run, and weak definitions are not coalesced across images. Making the
 `__TEXT` data pages writable has run only without the hardened runtime.
+
+### Relocatable code with a dylib
+
+To add relocatable code that calls the dylib, such as glue for an embedded
+interpreter, pass that code as the input and the dylib with `-darwin-dylib`
+(config key `darwin.dylib`). The input is combined as usual. Its undefined
+references to the dylib's exports then bind to the image, as a static link
+against the dylib would, and its other references bind to the SDK as usual.
+
+```sh
+bao build -target darwin/arm64 -symbol glue_run \
+  -darwin-dylib libpython3.13.dylib -o ./py glue.o
+```
+
+- The image is a section of the translated input, so these references are
+  ordinary relocations: no import, no `dlsym`, and no Apple linker. A
+  producer on Linux needs only `-sdk`, and a single object needs no partial
+  link.
+- `-symbol` selects the input's exports, then functions the dylib exports.
+  `SharedObjectExport(name)` and `SharedObjectExports()` cover the dylib's
+  exports, as for dylib input.
+- The input's thread-local variables use the same TLS runtime as the dylib's.
+  Each thread's block holds the input's template, then the dylib's, and the
+  loader moves the dylib's descriptor offsets past the input's. The input's
+  template must not hold addresses, as for object input.
+- The dylib's initializers run before the input's.
+
+`-wrap SYMBOL` applies to the dylib's binds too. The dylib's bind of `SYMBOL`
+resolves to the input's `__wrap_SYMBOL`, and the input's `__real_SYMBOL` binds
+to the system symbol. Only binds move; the dylib's calls to functions it
+defines itself do not. A wrapped symbol that the dylib binds but the input
+does not define as `__wrap_SYMBOL` is refused.
+
+```sh
+bao build -target darwin/arm64 -symbol glue_run \
+  -wrap pthread_create -wrap pthread_join \
+  -darwin-dylib libpython3.13.dylib -o ./py glue.o
+```
+
+Python extension modules that libpython loads with `dlopen`, such as
+python-build-standalone's `_dbm` and `_tkinter`, are not expected to find its
+symbols, since dyld never loaded the dylib. This is unverified.
 
 ## Implementation notes
 

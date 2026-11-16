@@ -19,6 +19,7 @@ func TestCommandLine(t *testing.T) {
 		RedefineSymbols: map[string]string{"b": "b2", "a": "a2"},
 		Linux:           LinuxOptions{SharedObject: "libpython3.13.so", MaxSymbolVersions: []string{"GLIBC_2.18"}, MaxTextAlignment: 4096, StaticTLS: true},
 		Windows:         WindowsOptions{Imports: map[string]string{"Sleep": "kernel32.dll"}},
+		Darwin:          DarwinOptions{Dylib: "libpython3.13.dylib"},
 		Args:            []string{"-keep-global-symbol", "libglue.o=glue_*"},
 	}
 	want := []string{
@@ -26,7 +27,7 @@ func TestCommandLine(t *testing.T) {
 		"-symbol", "glue_run", "-symbol", "glue_stop", "-link-archive", "liba.a", "-strip-debug",
 		"-wrap", "pthread_create", "-wrap", "pthread_join", "-redefine-sym", "a=a2", "-redefine-sym", "b=b2",
 		"-linux-shared-object", "libpython3.13.so", "-linux-max-symbol-version", "GLIBC_2.18", "-linux-max-text-alignment", "4096", "-linux-static-tls",
-		"-windows-import", "Sleep=kernel32.dll", "-keep-global-symbol", "libglue.o=glue_*", "--", "libglue.o",
+		"-windows-import", "Sleep=kernel32.dll", "-darwin-dylib", "libpython3.13.dylib", "-keep-global-symbol", "libglue.o=glue_*", "--", "libglue.o",
 	}
 	if got := o.CommandLine(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("CommandLine =\n%q\nwant\n%q", got, want)
