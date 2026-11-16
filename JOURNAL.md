@@ -7251,3 +7251,68 @@ It requires a new handle with `cos`.
   the script's hardcoded `m-` paths.
 - The `RTLD_NOLOAD` refusal path was not exercised, since nothing can
   dlopen a memfd path before the package's init.
+
+## 2026-11-16: Version cap names the pre-2.34 library of moved glibc symbols
+
+This fixes the earlier finding entry, "the version cap binds glibc 2.34
+library moves to libc.so.6". pythago reproduced it independently: its
+examples/hello, built from main 345ad90 with `-linux-max-symbol-version
+GLIBC_2.18` and a glibc 2.39 sysroot, failed under buster's ld-2.28.so the
+same way.
+
+Change.
+- `linuxelf.nameMovedLibraries` runs after version binding and after a
+  shared object's own required versions are applied (`checkVersions` still
+  checks those against libc.so.6, which defines them). It renames a
+  libc.so.6 import's library to the symbol's pre-2.34 library in two
+  cases:
+  - the bound version is a GLIBC version older than 2.34;
+  - the import is unversioned under a GLIBC cap older than 2.34, such as
+    one with no version at or below the cap.
+
+  The generated package already emits a DT_NEEDED request for every
+  import's library.
+- The library comes from `glibcMovedSymbols` (`linuxelf/glibcmoved.go`): 210
+  names (libpthread.so.0 156, librt.so.1 35, libdl.so.2 9, libutil.so.1 6,
+  libanl.so.1 4), without the version placeholder. No name maps to two
+  libraries. Each name is exported outside GLIBC_PRIVATE by glibc 2.33's
+  library abilist but not by its libc.so.6 abilist, unioned over aarch64,
+  x86_64/64 and powerpc/powerpc64/le. The abilists came from
+  `https://raw.githubusercontent.com/bminor/glibc/glibc-2.33/sysdeps/unix/sysv/linux/<arch>/<lib>.abilist`
+  (`.work/glibcmove/abilist`). Only `__send` and `pthread_atfork` differ by
+  arch. loong64 began at glibc 2.36, so its versions are never older than
+  2.34.
+- Why the old library name also works on new glibc: glibc 2.41's stubs
+  (Debian `bao-cpp-cross:20261108`: arm64 native libs, x86_64 and
+  ppc64le cross libs) define every version node that a moved symbol of
+  that library used in 2.33 (`readelf -V`, `.work/glibcmove/stubs.txt`),
+  so the verneed check passes. The lookup is by name and version in the
+  global scope, so it finds the compat symbol in libc.so.6, as for old
+  binaries.
+- README: the cap caveat now describes this behavior.
+
+Verification. Same host and toolchains as the static TLS entry; bao from
+this branch.
+- `TestNameMovedLibraries` checks each of the five libraries, symbols old
+  libc.so.6 already exported, other providers and namespaces, unversioned
+  imports with and without a cap, and a cap at 2.34. `go vet ./...` and
+  `go test ./...` passed.
+- The previous entries' fixture, built against the glibc 2.41 sysroot with
+  `-linux-max-symbol-version GLIBC_2.17`, both with and without
+  `-linux-static-tls`. `pthread_key_create` now binds libpthread.so.0, and
+  the image needs libc.so.6 and libpthread.so.0. Each run below passed at
+  GOMAXPROCS=1 and 4:
+  - arm64: glibc 2.41 in `bao-cpp-cross`, and natively in `debian:buster`
+    (glibc 2.28).
+  - amd64: glibc 2.41, and buster's amd64 `ld-2.28.so --library-path` under
+    qemu-x86_64.
+  - ppc64le: glibc 2.41, and Ubuntu 20.04's ppc64le `ld-2.31.so` under
+    qemu-ppc64le. Debian buster and bullseye publish no ppc64le image.
+
+  The old roots were exported from those images into `.work/statictls/`.
+- Negative controls, built with bao before this change and the same cap:
+  - arm64 under glibc 2.28: "symbol pthread_key_create version GLIBC_2.17
+    not defined in file libc.so.6 with link time reference" (earlier entry);
+  - amd64 under ld-2.28.so: the same error for GLIBC_2.2.5.
+- Not run: the bao-verify suites, which use no cap, and a shared-object
+  input built against a pre-2.34 glibc.
