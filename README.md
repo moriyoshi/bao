@@ -386,6 +386,17 @@ move finalization into another goroutine: locking that goroutine would not
 select the original OS thread. `os.Exit` and `log.Fatal` skip the deferred
 cleanup shown above.
 
+#### Linux runtime finalization
+
+Generated Linux packages expose `FinalizeRuntime()` to run retained ELF fini
+arrays once, in reverse entry and priority order. Stop and join native workers,
+then complete caller TLS cleanup and explicit C++ shutdown in the library's
+required order before calling it. Caller TLS cleanup must run on its locked OS
+thread. This function does not replace C++ shutdown,
+run automatically at Go process exit, or permit subsequent native use or image
+unloading. `FinalizeRuntime` is a reserved binding name. Use one combined native
+runtime image per executable; exceptions must remain within native frames.
+
 ### Windows amd64 / arm64
 
 Use the supplied Go package with stock Go 1.26.11 and either generated typed
@@ -1207,6 +1218,89 @@ of leaving a dangling reference. The build log reports the dropped bytes, and
 COFF always drops `.llvmbc`/`.llvmcmd` and other `IMAGE_SCN_LNK_REMOVE` sections,
 so `-strip-bitcode=false` is rejected for Windows targets.
 
+### Bundling language runtimes
+
+A package can link a language runtime statically, within the checked profiles
+below. OS libraries remain dynamic throughout.
+
+| Target | Statically linked language runtime | Local execution |
+| --- | --- | --- |
+| macOS arm64 | Rust std/unwinder; LLVM libc++ without C++ exceptions | Native |
+| macOS amd64 | Same bounded profile | Rosetta 2 |
+| Linux arm64 | Rust std/unwinder; GCC libstdc++/unwinder | Native Docker |
+| Linux amd64 / loong64 / ppc64le | Same glibc profile | QEMU in Docker |
+| Windows amd64 / arm64 | LLVM-MinGW libc++/ABI/unwinder; GNU Rust std/unwinder | Wine; native Windows CI configured, pending |
+
+Use repeated `bao build -link-archive PATH` arguments to search native runtime
+archives. The producer snapshots every archive before linking and records its
+SHA-256 in `bao-build.json`. Repeated `-link-notice PATH` arguments copy matching
+license notices byte-for-byte into `bao-linked-license-N.txt` and record their
+hashes. Supply the required notices for every bundled runtime; Bao does not
+automatically determine license obligations or authenticate those files.
+`-require-static-runtime` rejects recognized shared language-runtime imports
+before publishing the package. It also scans generated bootstrap imports, but
+does not audit arbitrary `dlopen`/`LoadLibrary`, renamed libraries or transitive
+OS dependencies. Keep one compatible native runtime image per executable.
+
+#### macOS runtimes
+
+On macOS, `ci/darwin-static-runtime.sh arm64` (or `amd64`) builds the pinned LLVM
+23.1.5 runtime profile and preserves its notices. It requires Git, CMake, Make
+and the macOS SDK on the producer. Link `lib/libc++.a` for C++, or
+`lib/libunwind.a` alongside a Rust staticlib, from the resulting
+`.work/static-runtimes/darwin-ARCH` prefix. C++ exceptions remain unsupported;
+Rust catch/unwind, aligned TLS, allocation, explicit C++ finalization and signed
+execution are checked. Typed consumers without another cgo dependency need no
+native compiler.
+
+#### Linux runtimes
+
+Linux packages can bundle C++ and Rust runtimes within the checked glibc
+profile on arm64, amd64, loong64 and ppc64le. `bao build` can search extra
+static archives for the native library's unresolved references. For example, on
+a matching Linux arm64 GNU producer:
+
+```sh
+bao build -target linux/arm64 -sysroot / -bindings dwarf \
+  -symbol bao_example_run -require-static-runtime \
+  -link-archive "$(g++ -print-file-name=libstdc++.a)" \
+  -link-archive "$(g++ -print-file-name=libgcc_eh.a)" \
+  -link-archive "$(g++ -print-file-name=libgcc.a)" \
+  -link-notice /path/to/runtime-copyright \
+  -link-notice /path/to/runtime-license \
+  -o ./native ./library.a
+```
+
+The input needs C ABI exports and DWARF for this binding mode. Use the target
+cross compiler's archive paths and sysroot when cross-producing. Rust staticlibs
+already contain Rust std; the checked Rust profile adds `libgcc_eh.a` and
+`libgcc.a`. The producer retains the primary ELF input and searches dependency
+archives as a group. It records input digests and copies explicitly supplied
+license/notice bytes. Supply every required notice for the distributed native
+code; packaging does not change its licenses.
+
+With `-require-static-runtime`, the checked final executables retain
+dynamic OS dependencies (`libc`, pthreads and dynamic lookup); this flag
+does not make a fully static executable or authenticate third-party inputs.
+
+Consumers finalize such packages with
+[`FinalizeRuntime`](#linux-runtime-finalization).
+
+#### Windows runtimes
+
+On Windows, supply the matching LLVM-MinGW target prefix's `libc++.a`,
+`libc++abi.a`, `libunwind.a`, `libmingwex.a`, compiler builtins archive and
+`libucrt.a` compatibility wrappers, with their LLVM and MinGW notices. Pass
+`-windows-cxx-runtime libc++ -require-static-runtime`. Bao selects ordinary
+native objects from explicitly EC-indexed hybrid archives; ARM64EC code remains
+unsupported. Import-library declarations do not become native definitions or
+implicitly grant new DLL mappings. The checked suite exercises C++ throw/catch,
+TLS destructors, constructors/finalizers and multi-file COMDAT selection.
+MSVC `/MT` is still unsupported because its guard metadata needs additional
+handling. MinGW GCC static archives requesting 64-byte code alignment also
+remain outside the checked stock-Go profile. Dynamic runtime profiles remain
+available for those compilers.
+
 ### macOS dylibs
 
 A linked arm64 or x86_64 dylib can be the input instead of objects or an
@@ -1591,7 +1685,7 @@ is rejected: it assumes the image's TLS sits at a fixed offset from the
 thread pointer, which Bao's per-thread blocks cannot provide. Native IFUNC
 definitions, preinit arrays and static musl remain unsupported; linked shared
 objects follow [Linux shared objects](#linux-shared-objects). Rust std is checked in the
-[static-runtime profile](#can-linux-packages-bundle-c-and-rust-runtimes);
+[static-runtime profile](#linux-runtimes);
 Clang with libc++ is unverified. Exceptions must stay inside native code;
 Go process exit does not run C++ static destructors. Explicit TLS/static
 finalization must follow the last native use.
@@ -1712,7 +1806,7 @@ bao build -target windows/arm64 -manifest-path examples/windows_std/Cargo.toml \
 
 For amd64, use `windows/amd64`, install `x86_64-pc-windows-gnu` and select the
 `x86_64-w64-mingw32` prefix. Omit `-bindings` for PureGo registration.
-See [bundling language runtimes](#can-packages-bundle-language-runtimes) for C++
+See [bundling language runtimes](#bundling-language-runtimes) for C++
 archives and [examples/windows_std](examples/windows_std) for the complete std
 fixture. The smaller `examples/windows_runtime` Rust crate uses `no_std`.
 
@@ -2172,6 +2266,23 @@ and ppc64le, use the maintained cross image and run the Rust runtime and typed
 binding gates first, as shown in the Linux recipe. Their C++ suites use explicit
 QEMU execution and the same image; C++ success alone does not pass the release gate.
 
+### Static runtime verification
+
+```sh
+bazel run //:verify -- -suite static -target darwin/ARCH -static-runtime-root PREFIX
+bazel run //:verify -- -suite static -target linux/ARCH -image bao-ci-cross
+```
+
+For Windows, add `-windows-driver clang -windows-cc CC -windows-cxx CXX`.
+These maintained suites gate C++ checks on fresh Rust checks, check fresh Rust
+and C++ inputs with both binding modes, and audit both generated packages and
+executable dependencies, with lifecycle negative controls. CI invokes the same
+suites on macOS, Linux and native Windows; `ci/check.sh` has the exact
+invocations. Local Linux arm64 execution was native; amd64, loong64 and ppc64le
+used QEMU. Ordinary compiler-produced fully static controls also ran, but Bao's
+current Go/native bootstrap still requires dynamic glibc/pthread/loader
+support. Those controls are separate from Bao support.
+
 ### Binding verification
 
 ```sh
@@ -2358,101 +2469,9 @@ linkage, but Bao's Go/native bootstrap still requires dynamic OS services.
 
 ### Can packages bundle language runtimes?
 
-Yes, with the following checked profiles. OS libraries remain dynamic throughout.
-
-| Target | Statically linked language runtime | Local execution |
-| --- | --- | --- |
-| macOS arm64 | Rust std/unwinder; LLVM libc++ without C++ exceptions | Native |
-| macOS amd64 | Same bounded profile | Rosetta 2 |
-| Linux arm64 | Rust std/unwinder; GCC libstdc++/unwinder | Native Docker |
-| Linux amd64 / loong64 / ppc64le | Same glibc profile | QEMU in Docker |
-| Windows amd64 / arm64 | LLVM-MinGW libc++/ABI/unwinder; GNU Rust std/unwinder | Wine; native Windows CI configured, pending |
-
-Use repeated `bao build -link-archive PATH` arguments to search native runtime
-archives. The producer snapshots every archive before linking and records its
-SHA-256 in `bao-build.json`. Repeated `-link-notice PATH` arguments copy matching
-license notices byte-for-byte into `bao-linked-license-N.txt` and record their
-hashes. Supply the required notices for every bundled runtime; Bao does not
-automatically determine license obligations or authenticate those files.
-`-require-static-runtime` rejects recognized shared language-runtime imports
-before publishing the package. It also scans generated bootstrap imports, but
-does not audit arbitrary `dlopen`/`LoadLibrary`, renamed libraries or transitive
-OS dependencies. Keep one compatible native runtime image per executable.
-
-On macOS, `ci/darwin-static-runtime.sh arm64` (or `amd64`) builds the pinned LLVM
-23.1.5 runtime profile and preserves its notices. It requires Git, CMake, Make
-and the macOS SDK on the producer. Link `lib/libc++.a` for C++, or
-`lib/libunwind.a` alongside a Rust staticlib, from the resulting
-`.work/static-runtimes/darwin-ARCH` prefix. C++ exceptions remain unsupported;
-Rust catch/unwind, aligned TLS, allocation, explicit C++ finalization and signed
-execution are checked. Typed consumers without another cgo dependency need no
-native compiler.
-
-On Windows, supply the matching LLVM-MinGW target prefix's `libc++.a`,
-`libc++abi.a`, `libunwind.a`, `libmingwex.a`, compiler builtins archive and
-`libucrt.a` compatibility wrappers, with their LLVM and MinGW notices. Pass
-`-windows-cxx-runtime libc++ -require-static-runtime`. Bao selects ordinary
-native objects from explicitly EC-indexed hybrid archives; ARM64EC code remains
-unsupported. Import-library declarations do not become native definitions or
-implicitly grant new DLL mappings. The checked suite exercises C++ throw/catch,
-TLS destructors, constructors/finalizers and multi-file COMDAT selection.
-MSVC `/MT` is still unsupported because its guard metadata needs additional
-handling. MinGW GCC static archives requesting 64-byte code alignment also
-remain outside the checked stock-Go profile. Dynamic runtime profiles remain
-available for those compilers.
-
-Run `bao-verify -suite static -target darwin/ARCH -static-runtime-root PREFIX`
-or add `-windows-driver clang -windows-cc CC -windows-cxx CXX` for Windows.
-These maintained suites gate C++ checks on fresh Rust checks and audit both
-generated packages and executable dependencies. CI invokes the same suites on
-macOS and native Windows. See the following Linux recipe for its Docker suite
-and shutdown requirements.
-
-### Can Linux packages bundle C++ and Rust runtimes?
-
-Yes, within the checked glibc profile on arm64, amd64, loong64 and ppc64le.
-`bao build` can search extra static archives for the native library's unresolved
-references. For example, on a matching Linux arm64 GNU producer:
-
-```sh
-bao build -target linux/arm64 -sysroot / -bindings dwarf \
-  -symbol bao_example_run -require-static-runtime \
-  -link-archive "$(g++ -print-file-name=libstdc++.a)" \
-  -link-archive "$(g++ -print-file-name=libgcc_eh.a)" \
-  -link-archive "$(g++ -print-file-name=libgcc.a)" \
-  -link-notice /path/to/runtime-copyright \
-  -link-notice /path/to/runtime-license \
-  -o ./native ./library.a
-```
-
-The input needs C ABI exports and DWARF for this binding mode. Use the target
-cross compiler's archive paths and sysroot when cross-producing. Rust staticlibs
-already contain Rust std; the checked Rust profile adds `libgcc_eh.a` and
-`libgcc.a`. The producer retains the primary ELF input and searches dependency
-archives as a group. It records input digests and copies explicitly supplied
-license/notice bytes. Supply every required notice for the distributed native
-code; packaging does not change its licenses.
-
-`-require-static-runtime` rejects known shared C++/Rust/unwinder library imports,
-including imports introduced by generated registration code. It checks declared
-imports, not arbitrary native `dlopen` behavior. The checked final executables
-retain dynamic OS dependencies (`libc`, pthreads and dynamic lookup); this flag
-does not make a fully static executable or authenticate third-party inputs.
-
-Generated Linux packages expose `FinalizeRuntime()` to run retained ELF fini
-arrays once, in reverse entry and priority order. Stop and join native workers,
-then complete caller TLS cleanup and explicit C++ shutdown in the library's
-required order before calling it. Caller TLS cleanup must run on its locked OS
-thread. This function does not replace C++ shutdown,
-run automatically at Go process exit, or permit subsequent native use or image
-unloading. `FinalizeRuntime` is a reserved binding name. Use one combined native
-runtime image per executable; exceptions must remain within native frames.
-
-The maintained `-suite static` checks fresh Rust and C++ inputs with both binding
-modes, dependency audits and lifecycle negative controls. Local arm64 execution
-was native; amd64, loong64 and ppc64le used QEMU. Ordinary compiler-produced fully
-static controls also ran, but Bao's current Go/native bootstrap still requires
-dynamic glibc/pthread/loader support. Those controls are separate from Bao support.
+Yes. Rust std with its unwinder and C++ runtimes can be linked into the package
+on macOS, Linux and Windows within checked profiles; OS libraries stay dynamic.
+See [bundling language runtimes](#bundling-language-runtimes).
 
 ### Can I translate any Rust or C++ library?
 

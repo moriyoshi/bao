@@ -7507,3 +7507,33 @@ passed (links, anchors, fences, journal prefix). It reports the two removed
 pre-clean-up README is present. `git diff --check` passed.
 Documentation-only change; no builds, runtime tests or hosted workflows were
 run.
+
+## 2026-11-17: README runtime bundling moved out of the FAQ
+
+Third of the stacked README clean-up changes. Two FAQ answers, "Can packages
+bundle language runtimes?" and "Can Linux packages bundle C++ and Rust
+runtimes?", held about 100 lines of reference: the bundling flags, a Linux
+example, `FinalizeRuntime()` and maintainer suite commands.
+
+- They are now a "Bundling language runtimes" section for library developers,
+  with macOS, Linux and Windows subsections. The FAQ keeps a three-line answer
+  that links to it, and the Linux-only question is gone. Links from the Linux
+  amd64 and Windows producer sections point at the new anchors; nothing
+  outside README linked to the old ones.
+- The Linux answer repeated what the general paragraph says about
+  `-require-static-runtime` (declared imports only, not `dlopen`). The repeat
+  was dropped; its statement that final executables keep dynamic OS
+  dependencies stays.
+- `FinalizeRuntime()` is consumer API, so its paragraph moved to the consumer
+  "Runtime caveats" as "Linux runtime finalization", beside TLS finalization.
+- The `-suite static` commands and results moved to a maintainer "Static
+  runtime verification" section. It now shows the Bazel form used by the
+  other maintainer sections, adds the Linux invocation from `ci/check.sh`, and
+  drops a dangling "see the following Linux recipe" that had pointed at the
+  removed FAQ answer.
+
+Verification on Linux arm64 with Python 3: `.work/readme-cleanup/check.py`
+passed (links, anchors, fences, journal prefix, code blocks of the
+pre-clean-up README apart from the two removals recorded in the previous
+entry). `git diff --check` passed. Documentation-only change; no builds,
+runtime tests or hosted workflows were run.
