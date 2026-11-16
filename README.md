@@ -1418,6 +1418,12 @@ initialization, after the template's pointer fixups, the generated package:
    refuse it.
 3. repoints the image's TLS descriptors at the constant resolver.
 
+glibc looks up a dlopen path among already loaded objects' names before it
+opens the file. So the memfd stays open for the life of the process, one
+file descriptor, and no later memfd gets its number and with it this
+module. If an object with that name is already loaded, the package does
+not use static TLS.
+
 glibc's spare static TLS is small. On glibc 2.41 a 1664-byte template fits by
 default and a 1728-byte one does not, on both arm64 and amd64. That space is
 shared with other libraries loaded later that use initial-exec TLS. It also requires

@@ -7214,3 +7214,40 @@ from glibc's history. Not fixed here.
 
 Static TLS itself was verified on 2.28 by building against buster's own
 root filesystem as the sysroot; see the static TLS entry's verification.
+
+## 2026-11-16: Static TLS memfd path collision
+
+Problem, reported by pythago on 3b1d95e..d209874. `useStaticTLS` closed its
+memfd after the dlopen. pythago's extension loader then created its own
+memfd, which got the freed number, and dlopened the same
+`/proc/self/fd/N`. glibc matches a dlopen path against loaded objects' names
+before opening the file, so it returned Bao's RTLD_NODELETE stub. Every
+CPython C extension then failed with "undefined symbol: PyExc_SystemError".
+The reverse is worse: if an earlier object was loaded under the path, Bao
+would have read its "offset word" from the wrong module.
+
+Change (generated `useStaticTLS`):
+- The memfd now stays open for the life of the process once the module is
+  loaded; it is closed only on failure.
+- A `RTLD_NOLOAD` probe of the path comes first. If an object with that
+  name is already loaded, static TLS is not used, and the probe's
+  reference is left in place.
+- After the dlopen, the link map must be the stub's: `l_ld` must equal
+  `l_addr` plus `StaticTLSModule.Dynamic`, the PT_DYNAMIC address, now
+  recorded and checked in `TestStaticTLSStub`.
+- README: a paragraph on the open memfd.
+
+Verification (host, toolchains and fixture as in the static TLS entry). The
+fixture gains `memfd_dlopen`. After init it creates a memfd, so it gets the
+lowest free number, copies libm.so.6 into it and dlopens `/proc/self/fd/M`.
+It requires a new handle with `cos`.
+- d209874's bao on arm64 with `-linux-static-tls` failed: "desc: a later
+  memfd dlopen did not load its own object (0)".
+- The fixed bao passes `matrix2.sh` with `PREFIX=c`
+  (`.work/tlsfast/matrix-collide.log`): all four targets in both modes,
+  shared-object input on arm64 and amd64, the 16 KiB fallback and the
+  tunable, and the buster sysroot build at GOMAXPROCS=1 and 4 on glibc 2.41
+  and 2.28. The last two were rerun against the `c-` builds after fixing
+  the script's hardcoded `m-` paths.
+- The `RTLD_NOLOAD` refusal path was not exercised, since nothing can
+  dlopen a memfd path before the package's init.

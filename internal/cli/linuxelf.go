@@ -453,13 +453,19 @@ const staticTLSPrefix = %q
 // glibc place it in static TLS, copying the template into every thread, or
 // refuse it. The relocated word is then every block's thread-pointer offset.
 // Any failure leaves Bao's per-thread blocks in use.
+//
+// glibc matches a dlopen path against loaded objects' names before opening
+// it. The memfd therefore stays open for the life of the process, so that no
+// later memfd reuses its number and is handed this module, and the load is
+// refused when an earlier object already has the name.
 func useStaticTLS() bool {
     image := append([]byte(staticTLSPrefix), unsafe.Slice((*byte)(unsafe.Pointer(templateAddress())), %d)...)
     name := []byte("bao-tls\x00")
     fd, _, errno := syscall.Syscall(%d, uintptr(unsafe.Pointer(&name[0])), 1, 0) // memfd_create(name, MFD_CLOEXEC)
     runtime.KeepAlive(name)
     if errno != 0 { return false }
-    defer syscall.Close(int(fd))
+    loaded := false
+    defer func() { if !loaded { syscall.Close(int(fd)) } }()
     for written := 0; written < len(image); {
         n, err := syscall.Write(int(fd), image[written:])
         if err == syscall.EINTR { continue }
@@ -469,9 +475,13 @@ func useStaticTLS() bool {
     path := append([]byte("/proc/self/fd/"+strconv.Itoa(int(fd))), 0)
     var staticDlopen func(uintptr, int32) uintptr
     purego.RegisterFunc(&staticDlopen, lookup("dlopen"))
+    other := staticDlopen(uintptr(unsafe.Pointer(&path[0])), 4) // RTLD_NOLOAD
+    runtime.KeepAlive(path)
+    if other != 0 { return false } // another object already has this name; leave its reference
     handle := staticDlopen(uintptr(unsafe.Pointer(&path[0])), 0x1002) // RTLD_NOW|RTLD_NODELETE
     runtime.KeepAlive(path)
     if handle == 0 { return false }
+    loaded = true // RTLD_NODELETE: the module, and so its name, stays
     var staticDlinfo func(uintptr, int32, uintptr) int32
     purego.RegisterFunc(&staticDlinfo, lookup("dlinfo"))
     linkMap := new(uintptr)
@@ -480,11 +490,13 @@ func useStaticTLS() bool {
     if status != 0 { return false }
     var staticReadPointer func(uintptr) uintptr
     purego.RegisterFunc(&staticReadPointer, address_runtime_read_pointer())
-    offset := staticReadPointer(staticReadPointer(*linkMap) + %d) // l_addr, then the word
+    base := staticReadPointer(*linkMap) // l_addr
+    if staticReadPointer(*linkMap+16) != base+%d { return false } // l_ld: not this module
+    offset := staticReadPointer(base + %d) // the relocated word
     var staticUse func(uintptr, uintptr, uintptr) int32
     purego.RegisterFunc(&staticUse, address_tls_use_static())
     return staticUse(offset, %s, %d) == 0
 }
-`, string(p.StaticTLS.Prefix), p.TLSTemplateSize, nr, p.StaticTLS.OffsetWord, descriptors, len(p.TLSDescriptorSymbols))
+`, string(p.StaticTLS.Prefix), p.TLSTemplateSize, nr, p.StaticTLS.Dynamic, p.StaticTLS.OffsetWord, descriptors, len(p.TLSDescriptorSymbols))
 	return nil
 }
