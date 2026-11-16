@@ -148,7 +148,7 @@ func (p *Plan) bindAMD64(images []*image, index map[string]string) error {
 			unresolved = append(unresolved, name)
 			continue
 		}
-		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: name, Library: library}
+		b := Import{Local: fmt.Sprintf("%simport_%d", p.Namespace, len(p.Imports)), Remote: name, Library: library, Weak: weak[name] && !strong[name]}
 		imports[name] = b
 		p.Imports = append(p.Imports, b)
 	}

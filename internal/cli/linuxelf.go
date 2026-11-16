@@ -213,9 +213,9 @@ func linuxSource(p *linuxelf.Plan, pkg string, symbols []string) ([]byte, []byte
 		for _, b := range p.Imports {
 			imports[b.Local] = b
 		}
-		fmt.Fprintf(&goSrc, "\nvar fixupImports = [...]struct{ name, version string; addend uintptr }{%s}\n", goList(p.Fixups, func(f linuxelf.Fixup) string {
+		fmt.Fprintf(&goSrc, "\nvar fixupImports = [...]struct{ name, version string; addend uintptr; weak bool }{%s}\n", goList(p.Fixups, func(f linuxelf.Fixup) string {
 			b := imports[f.Import]
-			return fmt.Sprintf("{%q,%q,%d}", b.Remote, b.Version, uint64(f.Addend))
+			return fmt.Sprintf("{%q,%q,%d,%t}", b.Remote, b.Version, uint64(f.Addend), b.Weak)
 		}))
 	}
 	if len(p.Unwind) != 0 {
@@ -244,16 +244,23 @@ var tlsLive func() uint64
 var tlsDestroyed func() uint64
 var tlsFinalize func()
 
+// lookupOptional returns 0 when no loaded object defines name.
+func lookupOptional(name string) uintptr {
+    address, _ := purego.Dlsym(purego.RTLD_DEFAULT, name)
+    return address
+}
+
 func lookup(name string) uintptr {
-    address, err := purego.Dlsym(purego.RTLD_DEFAULT, name)
-    if err != nil { panic(err) }; return address
+    if address := lookupOptional(name); address != 0 { return address }
+    panic("bao: native symbol unavailable: " + name)
 }
 
 var dlvsym func(uintptr, uintptr, uintptr) uintptr
 
 // lookupVersion binds a versioned import exactly, as the dynamic linker would.
-// glibc's RTLD_DEFAULT is 0.
-func lookupVersion(name, version string) uintptr {
+// A weak import the target lacks binds 0. glibc's RTLD_DEFAULT is 0.
+func lookupVersion(name, version string, weak bool) uintptr {
+    if version == "" && weak { return lookupOptional(name) }
     if version == "" { return lookup(name) }
     if dlvsym == nil {
         purego.RegisterFunc(&dlvsym, lookup("dlvsym"))
@@ -261,7 +268,7 @@ func lookupVersion(name, version string) uintptr {
     n, v := append([]byte(name), 0), append([]byte(version), 0)
     address := dlvsym(0, uintptr(unsafe.Pointer(&n[0])), uintptr(unsafe.Pointer(&v[0])))
     runtime.KeepAlive(n); runtime.KeepAlive(v)
-    if address == 0 { panic("bao: target lacks " + name + "@" + version) }
+    if address == 0 && !weak { panic("bao: target lacks " + name + "@" + version) }
     return address
 }
 
@@ -298,7 +305,7 @@ func init() {
 `)
 	if len(p.Fixups) != 0 {
 		goSrc.WriteString("    var patch func(uintptr, uintptr)\n    purego.RegisterFunc(&patch, address_tls_patch_pointer())\n")
-		fmt.Fprintf(&goSrc, "    for i, address := range baoAddresses(fixupAddresses(), %d) { patch(address, lookupVersion(fixupImports[i].name, fixupImports[i].version)+fixupImports[i].addend) }\n", len(p.Fixups))
+		fmt.Fprintf(&goSrc, "    for i, address := range baoAddresses(fixupAddresses(), %d) { f := fixupImports[i]; patch(address, lookupVersion(f.name, f.version, f.weak)+f.addend) }\n", len(p.Fixups))
 	}
 	if len(p.LocalFixups) != 0 {
 		word, u32 := false, false
