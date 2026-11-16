@@ -170,13 +170,13 @@ func linuxSource(p *linuxelf.Plan, pkg string, symbols []string) ([]byte, []byte
 	for _, b := range p.Imports {
 		libraries[b.Library] = true
 	}
-	for _, lib := range slices.Sorted(maps.Keys(libraries)) {
-		fmt.Fprintf(&goSrc, "\n//go:cgo_import_dynamic _ _ %q\n", lib)
-	}
 	if p.RegisterFrame == "" {
-		goSrc.WriteString("\n//go:cgo_import_dynamic _ _ \"libgcc_s.so.1\"\n")
+		libraries["libgcc_s.so.1"] = true
 	} else {
 		accessor("registerFrameAddress", p.RegisterFrame)
+	}
+	for _, lib := range neededOrder(libraries) {
+		fmt.Fprintf(&goSrc, "\n//go:cgo_import_dynamic _ _ %q\n", lib)
 	}
 	accessor("templateAddress", p.TLSTemplateSymbol)
 	for _, name := range []string{"tls_configure", "tls_patch_pointer", "tls_live_blocks", "tls_destroyed_blocks", "tls_finalize_current_thread", "runtime_allocate_args", "runtime_set_arg", "runtime_call_constructor", "runtime_read_pointer"} {
@@ -506,4 +506,29 @@ func useStaticTLS() bool {
 }
 `, string(p.StaticTLS.Prefix), p.TLSTemplateSize, nr, p.StaticTLS.Dynamic, p.StaticTLS.OffsetWord, descriptors, len(p.TLSDescriptorSymbols))
 	return nil
+}
+
+// neededOrder orders DT_NEEDED requests: libc.so.6 first, the dynamic
+// linker (ld-linux-*.so.*, ld64.so.*) last, the rest by name. Before glibc
+// 2.32, rtld rebinds its malloc family to the first definition in the
+// global scope. With the dynamic linker searched before libc.so.6 it finds
+// its own minimal allocator again and keeps it for the life of the process,
+// which is not thread-safe and asserts when RTLD_GLOBAL loads grow the
+// global scope.
+func neededOrder(libraries map[string]bool) []string {
+	rank := func(lib string) int {
+		switch {
+		case lib == "libc.so.6":
+			return 0
+		case strings.HasPrefix(lib, "ld-") || strings.HasPrefix(lib, "ld64.so"):
+			return 2
+		}
+		return 1
+	}
+	return slices.SortedFunc(maps.Keys(libraries), func(a, b string) int {
+		if c := rank(a) - rank(b); c != 0 {
+			return c
+		}
+		return strings.Compare(a, b)
+	})
 }

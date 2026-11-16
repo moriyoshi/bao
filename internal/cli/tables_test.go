@@ -358,3 +358,11 @@ func TestLinuxWeakFixups(t *testing.T) {
 		}
 	}
 }
+
+func TestNeededOrder(t *testing.T) {
+	got := neededOrder(map[string]bool{"ld-linux-aarch64.so.1": true, "libpthread.so.0": true, "libc.so.6": true, "libdl.so.2": true, "ld64.so.2": true, "libgcc_s.so.1": true})
+	want := []string{"libc.so.6", "libdl.so.2", "libgcc_s.so.1", "libpthread.so.0", "ld-linux-aarch64.so.1", "ld64.so.2"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("order %q, want %q", got, want)
+	}
+}
