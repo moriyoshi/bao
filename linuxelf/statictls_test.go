@@ -50,6 +50,11 @@ func TestStaticTLSStub(t *testing.T) {
 		if stack == nil || stack.Flags&elf.PF_X != 0 {
 			t.Fatalf("%s: stack segment %+v", arch, stack)
 		}
+		for _, p := range f.Progs {
+			if p.Type == elf.PT_DYNAMIC && p.Vaddr != m.Dynamic {
+				t.Fatalf("%s: dynamic table at %#x, recorded %#x", arch, p.Vaddr, m.Dynamic)
+			}
+		}
 		if dyn[elf.DT_FLAGS] != uint64(elf.DF_STATIC_TLS) || dyn[elf.DT_RELASZ] != 24 || dyn[elf.DT_SYMTAB] == 0 {
 			t.Fatalf("%s: dynamic table %v", arch, dyn)
 		}

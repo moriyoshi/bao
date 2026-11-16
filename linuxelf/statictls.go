@@ -16,6 +16,9 @@ import (
 type StaticTLSModule struct {
 	Prefix     []byte `json:"-"`           // ELF headers, padded to the template's alignment
 	OffsetWord uint64 `json:"offset_word"` // module-relative address of the relocated word
+	// Dynamic is the module-relative address of the dynamic table, which
+	// identifies the module from its link map (l_ld - l_addr).
+	Dynamic uint64 `json:"dynamic"`
 }
 
 var staticTLSMachines = map[string]struct {
@@ -101,5 +104,5 @@ func StaticTLSStub(arch string, size, alignment uint64) (StaticTLSModule, error)
 	// local initial-exec references.
 	le.PutUint64(b[relaOff:], wordOff)
 	le.PutUint64(b[relaOff+8:], uint64(m.tprel))
-	return StaticTLSModule{Prefix: b, OffsetWord: wordOff}, nil
+	return StaticTLSModule{Prefix: b, OffsetWord: wordOff, Dynamic: dynOff}, nil
 }
