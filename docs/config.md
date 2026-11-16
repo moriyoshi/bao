@@ -47,7 +47,7 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 | `cargo` | `manifest_path`, `package`, `offline`, `locked` |
 | `darwin` | `sdk`, `min_os`, `ld`, `dylib` |
 | `linux` | `sysroot`, `ld`, `system_libraries`, `max_symbol_versions`, `max_text_alignment`, `shared_object`, `static_tls` |
-| `windows` | `imports`, `import_libraries`, `cxx_runtime`, `crt`, `max_data_alignment` |
+| `windows` | `imports`, `import_libraries`, `cxx_runtime`, `crt`, `max_data_alignment`, `dll` |
 
 Every platform section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.

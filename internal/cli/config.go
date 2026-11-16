@@ -80,6 +80,7 @@ type buildConfig struct {
 		CXXRuntime       string            `json:"cxx_runtime"`
 		CRT              string            `json:"crt"`
 		MaxDataAlignment *uint             `json:"max_data_alignment"`
+		DLL              string            `json:"dll"`
 	} `json:"windows"`
 }
 
@@ -366,6 +367,7 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 			func() error { return setPaths("windows-import-library", s.Windows.ImportLibraries...) },
 			func() error { return setText("windows-cxx-runtime", s.Windows.CXXRuntime) },
 			func() error { return setText("windows-crt", s.Windows.CRT) },
+			func() error { return setPaths("windows-dll", s.Windows.DLL) },
 			func() error {
 				if s.Windows.MaxDataAlignment == nil {
 					return nil

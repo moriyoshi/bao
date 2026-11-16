@@ -18,8 +18,8 @@ import (
 // Options are bao build's flags. Empty fields are left out, so the command's
 // defaults apply. See the README for each flag.
 type Options struct {
-	// Input is the relocatable object, static archive, Linux shared object
-	// or Darwin dylib to translate.
+	// Input is the relocatable object, static archive, Linux shared object,
+	// Darwin dylib or Windows DLL to translate.
 	Input string
 	// Output is the generated Go package directory (-o). It must not exist.
 	Output string
@@ -47,8 +47,8 @@ type Options struct {
 	// StripDebug removes native debug information (-strip-debug).
 	StripDebug bool
 	// Wrap redirects each symbol to __wrap_SYMBOL, as ld.lld --wrap
-	// (-wrap). With Linux.SharedObject or Darwin.Dylib it applies to that
-	// library's imports too.
+	// (-wrap). With Linux.SharedObject, Darwin.Dylib or Windows.DLL it
+	// applies to that library's imports too.
 	Wrap []string
 	// RedefineSymbols renames OLD to NEW in every input (-redefine-sym).
 	RedefineSymbols map[string]string
@@ -94,6 +94,8 @@ type WindowsOptions struct {
 	// MaxDataAlignment links read-only data that requests more at this
 	// alignment; only 32 is supported (-windows-max-data-alignment).
 	MaxDataAlignment uint
+	// DLL is a linked DLL to load with the input (-windows-dll).
+	DLL string
 }
 
 // DarwinOptions are the macOS target's flags.
@@ -162,6 +164,7 @@ func (o Options) CommandLine() []string {
 	flag("windows-crt", o.Windows.CRT)
 	flag("windows-cxx-runtime", o.Windows.CXXRuntime)
 	number("windows-max-data-alignment", o.Windows.MaxDataAlignment)
+	flag("windows-dll", o.Windows.DLL)
 	flag("min-os", o.Darwin.MinOS)
 	flag("darwin-dylib", o.Darwin.Dylib)
 	args = append(args, o.Args...)

@@ -130,13 +130,52 @@ DLL's prepared image and loads it at initialization into memory from
 Not supported:
 - 32-bit DLLs, .NET assemblies, writable executable sections, and DLLs without
   base relocations.
-- Relocatable code combined with a DLL.
 - Loading the DLL's own dependencies from inside the image: imports use the
   ordinary `LoadLibrary` search.
 
 `DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH` are not delivered, and the DLL has
 no module handle: `GetModuleHandle` and `GetModuleFileName` do not know it, and
 its `DllMain` receives its base as `HINSTANCE`.
+
+### Relocatable code with a DLL
+
+To add relocatable code that calls the DLL, such as glue for an embedded
+interpreter, pass that code as the input and the DLL with `-windows-dll`
+(config key `windows.dll`). The input, an object or archive, is translated as
+usual. References that no input member defines then bind to the DLL's
+exports, as a static link against its import library would. They take
+precedence over the built-in import catalog and `-windows-import-library`,
+but not over `-windows-import`.
+
+```sh
+bao build -target windows/amd64 -symbol glue_run \
+  -windows-dll python313.dll -o ./py glue.obj
+```
+
+- The input reaches the DLL's exports through private import cells, filled
+  as soon as the DLL is loaded and before its `DllMain` runs. Calls work as
+  direct calls or through `__imp_`. Data needs a `__declspec(dllimport)`
+  declaration, the `__imp_` form.
+- `-symbol` selects the input's functions, then functions the DLL exports.
+  `SharedObjectExport(name)` and `SharedObjectExports()` cover the DLL's
+  exports, as for DLL input.
+- The input's thread-local variables follow the DLL's in Bao's TLS template.
+  The DLL's stay at the offsets its code uses.
+- Order at initialization: the DLL loads and its `DllMain` runs, then the
+  input's initializers.
+- The input's TLS callbacks receive the DLL's base as their module, like the
+  DLL's own.
+
+`-wrap SYMBOL` applies to the DLL's imports too. The DLL's import of `SYMBOL`
+resolves to the input's `__wrap_SYMBOL`, and the input's `__real_SYMBOL` binds
+to the system DLL. Only imports by name move; the DLL's calls to functions it
+defines itself do not. A wrapped symbol that the DLL imports but the input
+does not define as `__wrap_SYMBOL` is refused.
+
+```sh
+bao build -target windows/amd64 -symbol glue_run \
+  -wrap CreateThread -windows-dll python313.dll -o ./py glue.obj
+```
 
 ## Implementation notes
 

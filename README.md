@@ -864,7 +864,8 @@ Each target family has its own producer reference:
   requirements, TLS (including opt-in `-linux-static-tls`), linked shared object
   input, and implementation notes.
 - [Windows](docs/windows.md): COFF producer profiles, compiler flags, imports
-  and CRTs, GNU Rust std, linked DLL input, and implementation notes.
+  and CRTs, GNU Rust std, linked DLL input, relocatable code with a DLL and
+  `-wrap` of its imports, and implementation notes.
 
 ### Distributing a generated package
 

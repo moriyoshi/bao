@@ -54,6 +54,18 @@ func generateWindows(o nativeFlags, target toolchain.Target, input, output strin
 	if pecoff.IsDLL(b) {
 		translate = pecoff.TranslateDLL
 	}
+	if o.windowsDLL != "" {
+		if pecoff.IsDLL(b) {
+			return usage("the input is already a DLL; -windows-dll needs relocatable input")
+		}
+		dll, err := os.ReadFile(o.windowsDLL)
+		if err != nil {
+			return err
+		}
+		translate = func(input []byte, options pecoff.Options) (*pecoff.Plan, error) {
+			return pecoff.TranslateDLLWithObjects(dll, input, options, o.windowsDLLWrap)
+		}
+	}
 	p, err := translate(b, options)
 	if err != nil {
 		return err
@@ -161,7 +173,9 @@ func windowsSource(p *pecoff.Plan, pkg string) ([]byte, []byte, error) {
 	}
 	tableCount := func(t pecoff.Table) string { return strconv.Itoa(t.Count) }
 	for i, symbol := range p.Exports {
-		accessor(fmt.Sprintf("SymbolAddr%d", i), symbol)
+		if symbol != "" { // "" selects a DLL export; see dllSource
+			accessor(fmt.Sprintf("SymbolAddr%d", i), symbol)
+		}
 	}
 	if p.DLL != nil {
 		dllSource(&src, p, accessor)
@@ -306,7 +320,7 @@ func baoResolveImport(dll, name string) uintptr {
 `)
 	src.WriteString("var registerFunctionTable = func(table uintptr,count uintptr,base uintptr) { r,_,_:=syscall.NewLazyDLL(\"kernel32.dll\").NewProc(\"RtlAddFunctionTable\").Call(table,count,base);if r==0{panic(\"native Windows unwind registration failed\")} }\nvar callConstructor=func(address uintptr){syscall.SyscallN(address)}\nfunc init(){\n")
 	if len(p.Imports) > 0 {
-		fmt.Fprintf(&src, "for i,slot:=range baoAddresses(functionImportAddresses(),%d){*(*uintptr)(unsafe.Pointer(slot))=baoResolveImport(functionImports[i].dll,functionImports[i].name)}\n", len(p.Imports))
+		fmt.Fprintf(&src, "for i,slot:=range baoAddresses(functionImportAddresses(),%d){if functionImports[i].dll!=%q{*(*uintptr)(unsafe.Pointer(slot))=baoResolveImport(functionImports[i].dll,functionImports[i].name)}}\n", len(p.Imports), pecoff.EmbeddedDLL)
 	}
 	if len(p.DataImports) > 0 {
 		fmt.Fprintf(&src, "for i,slot:=range baoAddresses(dataImportAddresses(),%d){im:=dataImports[i];*(*uintptr)(unsafe.Pointer(slot+im.offset))=syscall.NewLazyDLL(im.dll).NewProc(im.name).Addr()+im.addend}\n", len(p.DataImports))
@@ -331,6 +345,14 @@ registerFunctionTable(unwindAddressMerged(),uintptr(len(functionRecords)),base)
 	}
 	if p.DLL != nil {
 		src.WriteString("dllLoad()\n")
+		embedded := false
+		for _, im := range p.Imports {
+			embedded = embedded || im.DLL == pecoff.EmbeddedDLL
+		}
+		if embedded {
+			// The input's imports of the DLL's own exports.
+			fmt.Fprintf(&src, "for i,slot:=range baoAddresses(functionImportAddresses(),%d){if functionImports[i].dll==%q{address,ok:=SharedObjectExport(functionImports[i].name);if !ok{panic(\"bao: DLL export \"+functionImports[i].name+\" is missing\")};*(*uintptr)(unsafe.Pointer(slot))=address}}\n", len(p.Imports), pecoff.EmbeddedDLL)
+		}
 	}
 	if p.Runtime {
 		src.WriteString("moduleBase,_,_:=syscall.NewLazyDLL(\"kernel32.dll\").NewProc(\"GetModuleHandleW\").Call(0);if moduleBase==0{panic(\"native Windows image base unavailable\")}\n")
@@ -385,12 +407,30 @@ func dllSource(src *strings.Builder, p *pecoff.Plan, accessor func(string, strin
 	}
 	fmt.Fprintf(src, "\n//go:embed dll_windows_%s.bin\nvar dllImage string\nvar dllBase uintptr\n", p.Arch)
 	for i, rva := range d.Selected {
-		fmt.Fprintf(src, "func SymbolAddr%d() uintptr { return dllBase + %#x }\n", i, rva)
+		if rva != 0 { // 0 selects a function of the attached input
+			fmt.Fprintf(src, "func SymbolAddr%d() uintptr { return dllBase + %#x }\n", i, rva)
+		}
 	}
+	// Wrapped imports resolve to the attached input's __wrap_ definitions.
+	wraps := map[string]int{}
+	var wrapAccessors []string
+	for _, im := range d.Imports {
+		if _, ok := wraps[im.Wrap]; im.Wrap != "" && !ok {
+			wraps[im.Wrap] = len(wraps)
+			name := fmt.Sprintf("dllWrap%d", len(wrapAccessors))
+			accessor(name, im.Wrap)
+			wrapAccessors = append(wrapAccessors, name)
+		}
+	}
+	fmt.Fprintf(src, "var dllWraps = [...]func() uintptr{%s}\n", goList(wrapAccessors, func(s string) string { return s }))
 	u32 := func(v uint32) string { return fmt.Sprintf("%#x", v) }
 	fmt.Fprintf(src, "var dllRelocations = [...]uint32{%s}\n", goList(d.Relocations, u32))
-	fmt.Fprintf(src, "var dllImports = [...]struct{slot uint32;dll,name string;ordinal uint16}{%s}\n", goList(d.Imports, func(im pecoff.DLLImport) string {
-		return fmt.Sprintf("{%#x,%q,%q,%d}", im.Slot, im.DLL, im.Name, im.Ordinal)
+	fmt.Fprintf(src, "var dllImports = [...]struct{slot uint32;dll,name string;ordinal uint16;wrap int}{%s}\n", goList(d.Imports, func(im pecoff.DLLImport) string {
+		wrap := -1
+		if im.Wrap != "" {
+			wrap = wraps[im.Wrap]
+		}
+		return fmt.Sprintf("{%#x,%q,%q,%d,%d}", im.Slot, im.DLL, im.Name, im.Ordinal, wrap)
 	}))
 	fmt.Fprintf(src, "var dllProtections = [...]struct{start,end,protect uint32}{%s}\n", goList(d.Protections, func(r pecoff.DLLRange) string { return fmt.Sprintf("{%#x,%#x,%#x}", r.Start, r.End, r.Protect) }))
 	fmt.Fprintf(src, "var dllPatches = [...]struct{site,thunk,slot uint32;code,body string}{%s}\n", goList(d.Patches, func(t pecoff.DLLPatch) string {
@@ -440,6 +480,10 @@ func dllLoad() {
 	for _, rva := range dllRelocations { *(*uint64)(unsafe.Pointer(&image[rva])) += uint64(base) - preferred }
 	originals := map[string]uintptr{}
 	for _, im := range dllImports {
+		if im.wrap >= 0 {
+			*(*uintptr)(unsafe.Pointer(&image[im.slot])) = dllWraps[im.wrap]()
+			continue
+		}
 		address := dllResolve(im.dll, im.name, im.ordinal)
 		switch im.name {
 		case "RtlPcToFileHeader":

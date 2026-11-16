@@ -7675,3 +7675,65 @@ Verification:
 
 Scripts and logs: `.work/darwin-attach/` (`fetch.sh`, `run.sh`,
 `py/run.sh`, `run-1.26.11.log`, `py/run-1.26.11.log`).
+
+## 2026-11-17: Relocatable code with a Windows DLL (`-windows-dll`)
+
+The Windows counterpart of `-darwin-dylib` (previous entry) and
+`-linux-shared-object`. `docs/windows.md` listed "Relocatable code combined
+with a DLL" as unsupported.
+
+What changed:
+- `-windows-dll PATH` (config `windows.dll`, `build.Options.Windows.DLL`)
+  takes the DLL; the input is a COFF object or archive.
+- `pecoff.TranslateDLLWithObjects` puts the DLL's existing anchor object (the
+  helper references and the DLL's TLS template) ahead of the input's members.
+  It translates them together through the factored-out `translateMembers`.
+- References that no member defines bind to the DLL's exports before the
+  import catalog and import libraries; `-windows-import` still overrides.
+  They become ordinary private import cells whose DLL is
+  `pecoff.EmbeddedDLL` (""). The generated init skips them in the
+  `LoadLibrary` pass and fills them from `SharedObjectExport` right after
+  `dllLoad`, before the TLS runtime, `DllMain` and the input's initializers.
+  Unlike Darwin, the DLL lives in `VirtualAlloc` memory outside the
+  executable, so static relocations to it are impossible.
+- `-symbol` resolves the input's definitions first, then the DLL's function
+  exports. `Plan.Exports` holds "" and `DLL.Selected` holds 0 for the entry
+  the other side supplies.
+- `-wrap` from `bao build` edits the input as before. A DLL import by name
+  of a wrapped symbol records the input's `__wrap_` function, which is
+  selected so that its namespaced name survives. `dllLoad` stores its address
+  instead of resolving the import. A wrapped import without a `__wrap_`
+  definition is refused.
+- TLS needs no shift: the anchor's `.tls` sorts before the input's `.tls$`
+  contributions, so the DLL's template stays at offset 0 and the input's
+  follows.
+
+Verification. Linux host: Linux 7.0.0 aarch64, Go 1.27.4 for `go vet ./...`
+and `go test ./...` (pass); Go 1.26.11 for consumer builds.
+- `TestTranslateDLLWithObjects` covers the following. A hand-built amd64 glue
+  object directly calls the fixture DLL's `fn` and loads `__imp_data_value`,
+  and both become embedded-DLL imports. The mixed selection maps to
+  `Exports`/`Selected`. The `GetTickCount64` import gets the namespaced
+  `__wrap_` target. The glue's `.tls$` bytes follow the DLL's initializer in
+  the template. A missing wrapper and selecting DLL data are refused.
+- `testdata/windows_dll_glue.c` was compiled with clang 19 (image
+  `bao-ci-cpp-clang`) for `x86_64`/`aarch64-w64-windows-gnu` with the
+  harness's GNU flags, and for `x86_64`/`aarch64-pc-windows-msvc` with its
+  clang-cl flags. Each object was built by `bao build -windows-dll -wrap
+  CreateThread -symbol glue_check` against the synthetic fixture DLL, patched
+  to export `dll_threads`/`dll_value` and import `CreateThread`. All four
+  translated:
+  - `dll_threads` and `dll_value` were embedded-DLL imports;
+  - the glue's `__real_CreateThread` became kernel32 `CreateThread`;
+  - the DLL's `CreateThread` import got the `__wrap_` target;
+  - 4 glue TLS accesses were lowered.
+  The `windowsDLLAttached` consumer then cross-linked with
+  `GOOS=windows CGO_ENABLED=0` for amd64 and arm64.
+- Not run: execution. Neither Wine nor a Windows C++ toolchain is installed
+  here or on the Macs now (the Wine setup recorded on 2026-11-09 is gone).
+  `windowsDLLAttached` runs inside the `windows` suite after `windowsDLL`
+  (llvm-mingw clang and MSVC drivers) on the hosted native Windows runners.
+  Its result is `[85 9 14 16 7]`, and its negative controls drop the wrapped
+  imports and the embedded-import fill. Those CI legs are its first execution.
+
+Scratch: `.work/windows-attach/`.
