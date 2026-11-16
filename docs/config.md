@@ -45,7 +45,7 @@ bao build -config bao.json -target windows/amd64 -o ./native native.lib
 | `prefix_symbols` | An object from input path to prefix |
 | `symbol_visibility` | An object from input path to `localize_symbols`, `localize_symbol_files`, `localize_hidden`, `keep_global_symbols`, `keep_global_symbol_files`, `globalize_symbols`, `weaken_symbols`, `strip_symbols`, `strip_unneeded`, `remove_sections`, `only_sections` and `add_symbols` |
 | `cargo` | `manifest_path`, `package`, `offline`, `locked` |
-| `darwin` | `sdk`, `min_os`, `ld` |
+| `darwin` | `sdk`, `min_os`, `ld`, `dylib` |
 | `linux` | `sysroot`, `ld`, `system_libraries`, `max_symbol_versions`, `max_text_alignment`, `shared_object`, `static_tls` |
 | `windows` | `imports`, `import_libraries`, `cxx_runtime`, `crt`, `max_data_alignment` |
 

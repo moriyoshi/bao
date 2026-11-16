@@ -61,6 +61,7 @@ type buildConfig struct {
 		SDK    string `json:"sdk"`
 		MinOS  string `json:"min_os"`
 		Linker string `json:"ld"`
+		Dylib  string `json:"dylib"`
 	} `json:"darwin"`
 	Linux *struct {
 		platformLinkConfig
@@ -335,6 +336,7 @@ func (o *nativeFlags) applyConfig(fs *flag.FlagSet, stderr io.Writer) ([]string,
 			func() error { return setPaths("sdk", s.Darwin.SDK) },
 			func() error { return setText("min-os", s.Darwin.MinOS) },
 			func() error { return setLinker(s.Darwin.Linker) },
+			func() error { return setPaths("darwin-dylib", s.Darwin.Dylib) },
 		}
 		steps = append(steps, link(s.Darwin.platformLinkConfig)...)
 	case strings.HasPrefix(target.Name, "linux/") && s.Linux != nil:

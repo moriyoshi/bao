@@ -80,6 +80,72 @@ func main() {
 }
 `
 
+// darwinDylibAttached combines testdata/darwin_dylib_glue.c with
+// testdata/darwin_dylib.cpp's dylib, wrapping pthread_create in both. The
+// dylib is linked with LC_DYLD_INFO opcodes instead of chained fixups, as
+// python-build-standalone's libpython is, so its lazy binds and
+// dyld_stub_binder import are exercised. Negative controls drop the wrapped
+// binds and the shift of the dylib's TLV offsets past the glue's
+// thread-local variables. darwinDylib has linked libdep.dylib.
+func (h *harness) darwinDylibAttached(arch, sdk string) {
+	ldarch := map[string]string{"arm64": "arm64", "amd64": "x86_64"}[arch]
+	dylib := filepath.Join(h.dst, "fixture-dyld-info.dylib")
+	h.run("dylib-dyld-info-link.log", h.dst, nil, "xcrun", "clang++", "-dynamiclib", "-O2", "-std=c++17", "-arch", ldarch, "-Wl,-no_fixup_chains", "-lz", "-L"+h.dst, "-ldep", "-Wl,-rpath,@executable_path", "-o", dylib, filepath.Join(h.root, "testdata/darwin_dylib.cpp"))
+	glue := filepath.Join(h.dst, "glue.o")
+	h.run("dylib-glue-compile.log", h.dst, nil, "xcrun", "clang", "-c", "-O2", "-arch", ldarch, "-o", glue, filepath.Join(h.root, "testdata/darwin_dylib_glue.c"))
+	app := filepath.Join(h.dst, "dylib-attached")
+	require(os.Mkdir(app, 0o755))
+	h.run("dylib-attached-producer.log", h.root, nil, h.bao, "build", "-target", h.target, "-sdk", sdk, "-darwin-dylib", dylib, "-wrap", "pthread_create", "-symbol", "glue_check", "-o", filepath.Join(app, "native"), glue)
+	h.module(app, "bao-dylib-attached-check", "")
+	require(os.WriteFile(filepath.Join(app, "main.go"), []byte(darwinDylibAttachedConsumer), 0o644))
+	exe := filepath.Join(h.dst, "dylib-attached-check")
+	h.consumer("dylib-attached-build.log", app, h.goTool, "build", "-o", exe, ".")
+	for _, procs := range []string{"1", "4"} {
+		out, err := h.command("dylib-attached-run-"+procs+".log", h.root, map[string]string{"GOMAXPROCS": procs}, exe)
+		check(err == nil && strings.Contains(string(out), "PASS: Darwin dylib with object"), "Darwin dylib with object failed: %v\n%s", err, out)
+	}
+	for kind, edit := range map[string][2]string{
+		"wrap":      {"case b.wrap >= 0:", "case b.wrap >= 0 && false:"},
+		"tls-shift": {"*word(d + 16) += uint64(shift)", "_ = d"},
+	} {
+		negative := filepath.Join(h.dst, "dylib-attached-negative-"+kind)
+		copyTree(app, negative)
+		path := filepath.Join(negative, "native", "symbols_darwin_"+arch+".go")
+		code := string(read(path))
+		check(strings.Contains(code, edit[0]), "no attached dylib %s step to disable", kind)
+		require(os.WriteFile(path, []byte(strings.Replace(code, edit[0], edit[1], 1)), 0o644))
+		negativeExe := filepath.Join(h.dst, "dylib-attached-negative-"+kind)
+		h.consumer("dylib-attached-negative-"+kind+"-build.log", negative, h.goTool, "build", "-o", negativeExe, ".")
+		out, err := h.command("dylib-attached-negative-"+kind+"-run.log", h.root, nil, negativeExe)
+		check(err != nil || !strings.Contains(string(out), "PASS:"), "Darwin dylib with object %s control did not fail: %s", kind, out)
+	}
+	h.results["darwin_dylib_attached"] = map[string]any{"status": "CHECKED_WITH_LIMITATIONS", "checks": "LC_DYLD_INFO dylib with lazy binds; relocatable glue calling a dylib export directly and through a data pointer, reading its data export, pthread_create wrapped in the glue and in the dylib's binds, glue thread-local variables (zero-fill and initialized) beside the dylib's; negative controls drop the wrapped binds and the dylib's TLV offset shift"}
+}
+
+const darwinDylibAttachedConsumer = `package main
+
+import (
+	"fmt"
+	"os"
+	"unsafe"
+
+	"bao-dylib-attached-check/native"
+	"github.com/ebitengine/purego"
+)
+
+func main() {
+	var out [5]int32
+	purego.SyscallN(native.SymbolAddr0(), 8, uintptr(unsafe.Pointer(&out[0])))
+	_, exported := native.SharedObjectExport("dylib_threads")
+	got := fmt.Sprint(out, exported)
+	fmt.Println("attached:", got)
+	if got != "[85 9 14 16 7] true" {
+		os.Exit(1)
+	}
+	fmt.Println("PASS: Darwin dylib with object")
+}
+`
+
 // darwinDylibObjC links testdata/darwin_dylib_objc.m and checks the
 // Objective-C registration; the negative control skips it.
 func (h *harness) darwinDylibObjC(arch, sdk string) {

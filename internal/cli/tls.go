@@ -40,7 +40,7 @@ func probeTLSImage(out, pkg, sdk, container string, metadata bool, symbols []str
 		if !token.IsIdentifier(s) || s == "_" {
 			return fmt.Errorf("invalid symbol name %q", s)
 		}
-		if dylib != nil {
+		if dylib != nil && !dylib.Attached {
 			continue // checked against the dylib's exports
 		}
 		ok, err := translate.HasExport(objects[0], "_"+s)
@@ -52,8 +52,16 @@ func probeTLSImage(out, pkg, sdk, container string, metadata bool, symbols []str
 		}
 	}
 	keep := symbols
-	if dylib != nil {
+	if dylib != nil && !dylib.Attached {
 		keep = nil
+	}
+	if dylib != nil {
+		// A wrapped bind's target must keep its name.
+		for _, b := range dylib.Binds {
+			if b.Wrap != "" {
+				keep = append(keep, b.Wrap)
+			}
+		}
 	}
 	p, err := translate.LowerTLSKeeping(objects[0], keep)
 	if err != nil {
@@ -207,7 +215,7 @@ func darwinSource(p *translate.TLSProbe, pkg string, symbols, unresolved []strin
 		writeAddressTable(&asm, name, symbols)
 		accessor(name, name+"<>")
 	}
-	if p.Dylib == nil {
+	if p.Dylib == nil || p.Dylib.Attached {
 		for i, s := range symbols {
 			accessor(fmt.Sprintf("SymbolAddr%d", i), s)
 		}
@@ -219,9 +227,16 @@ func darwinSource(p *translate.TLSProbe, pkg string, symbols, unresolved []strin
 		accessor("tlsAddress_thunk", p.RuntimeSymbol("tls_thunk"))
 		accessor("nativeDylibConstructorCaller", p.RuntimeSymbol("runtime_call_constructor"))
 		accessor("dylibImageBase", p.Dylib.BaseSymbol())
+		if wraps := dylibWrapTargets(p.Dylib); len(wraps) != 0 {
+			addressTable("dylibWrapTable", wraps)
+		}
 		dylibSource(&goSrc, p)
-		// The dylib's TLS template is built from its fixed-up image.
-		configureArgs = "dylibLoad()"
+		// The dylib's TLS template is built from its fixed-up image, after
+		// an attached object's own.
+		configureArgs = "dylibLoad(0, 0, 1)"
+		if p.Dylib.Attached && p.Descriptors != 0 {
+			configureArgs = fmt.Sprintf("dylibLoad(tlsTemplateAddress(), %d, %d)", p.TemplateSize, p.TemplateAlignment)
+		}
 		dylibInit = "    dylibInitialize()\n"
 	}
 	for _, name := range []string{"configure", "live_blocks", "destroyed_blocks", "finalize_current_thread"} {

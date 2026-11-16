@@ -41,7 +41,10 @@ type DylibImage struct {
 	ObjC          *DylibObjC
 	Swift         *DylibSwift
 	Unwind        *DylibUnwind
-	Image         []byte `json:"-"`
+	// Attached is set when the image is a section of a relocatable object
+	// (see AttachDylib), whose exports -symbol then selects.
+	Attached bool   `json:",omitempty"`
+	Image    []byte `json:"-"`
 }
 
 // DylibSegment is one segment's offset range and VM protection (1 R, 2 W, 4 X).
@@ -55,13 +58,17 @@ type DylibSegment struct {
 type DylibRebase struct{ Slot, Target uint64 }
 
 // DylibBind sets Slot to a symbol's address plus Addend. Self binds name the
-// dylib's own export; others resolve with dlsym.
+// dylib's own export, wrapped binds the attached object's definition; others
+// resolve with dlsym.
 type DylibBind struct {
 	Slot    uint64
 	Name    string
 	Library string `json:",omitempty"`
 	Addend  int64  `json:",omitempty"`
 	Weak    bool   `json:",omitempty"`
+	// Wrap is the attached object's definition that replaces the import,
+	// without Mach-O's leading underscore.
+	Wrap string `json:",omitempty"`
 }
 
 // DylibExport is an exported symbol, without Mach-O's leading underscore.
@@ -797,7 +804,12 @@ func (d *DylibImage) dyldInfo(input, raw, img []byte, segments []*macho.Segment,
 					continue
 				}
 				d.dropFixup(at)
-				d.Binds = append(d.Binds, DylibBind{Slot: at, Name: name, Library: library(ordinal), Addend: addend, Weak: weak})
+				// Only __stub_helper reaches dyld_stub_binder, to bind a lazy
+				// pointer; lazy binds are bound here eagerly, and current
+				// macOS no longer exports it.
+				if name != "dyld_stub_binder" {
+					d.Binds = append(d.Binds, DylibBind{Slot: at, Name: name, Library: library(ordinal), Addend: addend, Weak: weak})
+				}
 				le.PutUint64(img[at:], 0)
 				at += 8 + skip
 			}
@@ -901,6 +913,110 @@ func dylibAnchor(arch string, d *DylibImage) Object {
 		{name: "_" + d.BaseSymbol(), section: 2, global: true},
 	}
 	return Object{Name: "bao-dylib-anchor.o", Data: machoObject(cpu, sections, syms)}
+}
+
+// AttachDylib plans a dylib for loading together with one relocatable object,
+// as a static link of the object against the dylib would. The returned
+// object carries the image as a section after the object's own, as
+// dylibAnchor does, and the object's undefined references to the dylib's
+// exports become local definitions at their image offsets, so they need no
+// import. The object's own thread-local variables are lowered as usual, and
+// the loader places their template before the dylib's. Selected names the object does not define are defined globally the
+// same way for their accessors. Each dylib bind of a name in wrap is resolved
+// to the object's __wrap_ definition instead, as ld --wrap applies to a
+// shared library's references; the object itself is edited separately.
+func AttachDylib(input []byte, o Object, selected, wrap []string) (*DylibImage, Object, error) {
+	d, _, err := parseDylib(input, nil)
+	if err != nil {
+		return nil, Object{}, err
+	}
+	if d.Unwind, err = d.unwindFrames(); err != nil {
+		return nil, Object{}, err
+	}
+	attached, err := d.attach(o, selected, wrap)
+	if err != nil {
+		return nil, Object{}, err
+	}
+	return d, attached, nil
+}
+
+func (d *DylibImage) attach(o Object, selected, wrap []string) (Object, error) {
+	d.Attached = true
+	m, err := readImage(o)
+	if err != nil {
+		return Object{}, err
+	}
+	if cpu := map[string]macho.Cpu{"arm64": macho.CpuArm64, "amd64": macho.CpuAmd64}[d.Arch]; m.cpu != cpu {
+		return Object{}, fmt.Errorf("the object is %v, the dylib %s", m.cpu, d.Arch)
+	}
+	if len(m.sections) >= 255 {
+		return Object{}, fmt.Errorf("too many sections to add the dylib image")
+	}
+	addr := (m.end() + 1<<14 - 1) &^ (1<<14 - 1)
+	m.sections = append(m.sections, imageSection{name: "__bao_image", seg: "__TEXT", addr: addr, size: uint64(len(d.Image)), align: 14, data: d.Image})
+	sect := uint8(len(m.sections))
+	exports := make(map[string]DylibExport, len(d.Exports))
+	for _, e := range d.Exports {
+		exports[e.Name] = e
+	}
+	defined := make(map[string]bool) // global definitions
+	for _, s := range m.symbols {
+		if s.Type&0xe0 == 0 && s.Type&0xf == 0xf {
+			defined[s.Name] = true
+		}
+	}
+	want := make(map[string]bool)
+	for _, name := range selected {
+		if !defined["_"+name] {
+			e, ok := exports[name]
+			if !ok || !e.Function {
+				return Object{}, fmt.Errorf("selected export %q is neither defined by the object nor a function the dylib exports", name)
+			}
+			want["_"+name] = true
+		}
+	}
+	for i := range m.symbols {
+		s := &m.symbols[i]
+		if s.Type&0xe0 != 0 || s.Type&0xe != 0 || s.Sect != 0 || s.Type&1 == 0 {
+			continue
+		}
+		e, ok := exports[cName(s.Name)]
+		if !ok || !strings.HasPrefix(s.Name, "_") {
+			continue
+		}
+		typ := uint8(0xe)
+		if want[s.Name] {
+			typ = 0xf
+			delete(want, s.Name)
+		}
+		*s = macho.Symbol{Name: s.Name, Type: typ, Sect: sect, Value: addr + e.Offset}
+	}
+	for _, name := range selected {
+		if want["_"+name] {
+			m.symbols = append(m.symbols, macho.Symbol{Name: "_" + name, Type: 0xf, Sect: sect, Value: addr + exports[name].Offset})
+			delete(want, "_"+name)
+		}
+	}
+	m.symbols = append(m.symbols, macho.Symbol{Name: "_" + d.BaseSymbol(), Type: 0xf, Sect: sect, Value: addr})
+	wrapped := make(map[string]bool)
+	for _, name := range wrap {
+		wrapped[name] = true
+	}
+	for i := range d.Binds {
+		b := &d.Binds[i]
+		if !wrapped[b.Name] {
+			continue
+		}
+		if !defined["___wrap_"+b.Name] {
+			return Object{}, fmt.Errorf("the dylib imports wrapped %s, but the object does not define __wrap_%s", b.Name, b.Name)
+		}
+		b.Wrap = "__wrap_" + b.Name
+	}
+	data, err := m.encode()
+	if err != nil {
+		return Object{}, err
+	}
+	return Object{Name: o.Name, Data: data}, nil
 }
 
 // BaseSymbol names the image's first byte; the dylib's digest keeps it

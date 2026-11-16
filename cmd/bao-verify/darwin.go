@@ -104,6 +104,7 @@ func checkFinalized() {
 	h.results["darwin_examples"] = results
 	h.results["unwind_negative_control"] = "PASS"
 	h.darwinDylib(arch, sdk)
+	h.darwinDylibAttached(arch, sdk)
 	h.darwinDylibObjC(arch, sdk)
 	h.darwinDylibSwift(arch, sdk)
 	h.darwinSymbolEdits(arch, sdk)

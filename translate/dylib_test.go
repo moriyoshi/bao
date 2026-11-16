@@ -3,6 +3,7 @@ package translate
 import (
 	"bytes"
 	"debug/elf"
+	"debug/macho"
 	"encoding/binary"
 	"testing"
 )
@@ -150,5 +151,92 @@ func TestExportTrie(t *testing.T) {
 	}
 	if got["a"] != 0x10 || got["bc"] != 0x80 {
 		t.Fatalf("exports %+v", d.Exports)
+	}
+}
+
+// An attached object's references to the dylib's exports become definitions
+// in the image section, a selected dylib export gets a global name, and a
+// wrapped bind names the object's __wrap_ definition.
+func TestAttachDylib(t *testing.T) {
+	glue := machoObject(macho.CpuArm64, []anchorSection{
+		{seg: "__TEXT", name: "__text", flags: 0x80000400, data: []byte{0xc0, 0x03, 0x5f, 0xd6}, align: 2},
+		{seg: "__DATA", name: "__data", data: make([]byte, 8), align: 3, relocs: []anchorReloc{{0, 2}}},
+	}, []anchorSymbol{
+		{name: "_glue", section: 1, global: true},
+		{name: "___wrap_pthread_create", section: 1, global: true},
+		{name: "_PyFoo"},
+	})
+	newImage := func() *DylibImage {
+		return &DylibImage{Arch: "arm64", SHA256: "0123456789abcdef0123", Image: make([]byte, 0x8000),
+			Exports: []DylibExport{{"PyBar", 0x200, true}, {"PyFoo", 0x100, true}},
+			Binds:   []DylibBind{{Slot: 0x10, Name: "pthread_create", Library: "/usr/lib/libSystem.B.dylib"}, {Slot: 0x18, Name: "malloc", Library: "/usr/lib/libSystem.B.dylib"}}}
+	}
+	d := newImage()
+	o, err := d.attach(Object{Name: "glue.o", Data: glue}, []string{"glue", "PyBar"}, []string{"pthread_create"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Attached || d.Binds[0].Wrap != "__wrap_pthread_create" || d.Binds[1].Wrap != "" {
+		t.Fatalf("binds: %+v", d.Binds)
+	}
+	p, err := LowerTLSKeeping(o, []string{"glue", "PyBar", "__wrap_pthread_create"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ELFContainer(p.Objects[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := elf.NewFile(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syms, err := f.Symbols()
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := -1
+	byName := map[string]elf.Symbol{}
+	for _, s := range syms {
+		byName[s.Name] = s
+		if s.Name == d.BaseSymbol() {
+			image = int(s.Section)
+			if f.Sections[image].Addralign != 16384 || s.Value != 0 {
+				t.Fatalf("image section: %+v", f.Sections[image])
+			}
+		}
+	}
+	if image < 0 {
+		t.Fatal("no image base symbol")
+	}
+	if s := byName["PyBar"]; int(s.Section) != image || s.Value != 0x200 || elf.ST_BIND(s.Info) != elf.STB_GLOBAL {
+		t.Fatalf("selected dylib export: %+v", s)
+	}
+	if s, ok := byName["__wrap_pthread_create"]; !ok || elf.ST_BIND(s.Info) != elf.STB_GLOBAL {
+		t.Fatal("wrap target lost its global name")
+	}
+	// The data word's relocation targets PyFoo's image offset.
+	found := false
+	for _, s := range f.Sections {
+		if s.Type != elf.SHT_RELA {
+			continue
+		}
+		data, _ := s.Data()
+		for at := 0; at+24 <= len(data); at += 24 {
+			sym := syms[binary.LittleEndian.Uint64(data[at+8:])>>32-1]
+			found = found || int(sym.Section) == image && sym.Value+binary.LittleEndian.Uint64(data[at+16:]) == 0x100
+		}
+	}
+	if !found {
+		t.Fatal("no data relocation to PyFoo's image offset")
+	}
+	if _, ok := byName["PyFoo"]; ok {
+		t.Fatal("a referenced dylib export became a global symbol")
+	}
+	if _, err := newImage().attach(Object{Name: "glue.o", Data: glue}, nil, []string{"malloc"}); err == nil {
+		t.Fatal("wrapping a bind without a __wrap_ definition was accepted")
+	}
+	if _, err := newImage().attach(Object{Name: "glue.o", Data: glue}, []string{"PyBaz"}, nil); err == nil {
+		t.Fatal("a selected name neither the object nor the dylib defines was accepted")
 	}
 }
