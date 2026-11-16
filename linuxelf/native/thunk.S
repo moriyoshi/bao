@@ -104,4 +104,16 @@ bao_tls_thunk:
     ret
     .cfi_endproc
 .size bao_tls_thunk, .-bao_tls_thunk
+
+// With glibc static TLS, bao_tls_use_static repoints every descriptor here
+// and stores the block's constant thread-pointer offset in its argument.
+.p2align 2
+.globl bao_tls_static_resolver
+.type bao_tls_static_resolver, %function
+bao_tls_static_resolver:
+    .cfi_startproc
+    ldr x0, [x0, #8]
+    ret
+    .cfi_endproc
+.size bao_tls_static_resolver, .-bao_tls_static_resolver
 .section .note.GNU-stack,"",%progbits

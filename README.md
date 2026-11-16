@@ -1307,6 +1307,12 @@ list before relying on the cap:
 - bao's own TLS runtime calls `__cxa_thread_atexit_impl`, from glibc 2.18,
   the first time a thread uses native TLS, and aborts if it fails. An image
   that uses native TLS therefore needs glibc 2.18 whatever the cap.
+- glibc 2.34 moved libpthread, libdl, librt, libutil and libanl symbols
+  into libc.so.6. With a sysroot from 2.34 or later, a capped import of such
+  a symbol, such as `pthread_key_create@GLIBC_2.17`, still names libc.so.6.
+  An older glibc defines it only in the original library, so the result
+  fails to start there. Bao's own TLS runtime imports `pthread_key_create`.
+  Until this is fixed, use a sysroot from the oldest glibc you target.
 - An import the inputs declare weak, such as an optional `getentropy` or
   `sem_clockwait`, is listed too. It is optional only if the code checks it
   before calling it.
@@ -1389,12 +1395,51 @@ Each thread's native TLS block is allocated on its first TLS access. Bao then
 records it in a process-wide table indexed by a hash of the thread pointer. A
 TLS access that finds the calling thread's entry costs a few loads, with no
 call and no `pthread_getspecific`. On arm64 and amd64 the TLSDESC thunk then
-saves three scratch registers instead of the full register and vector state. Threads whose hashes collide share a table slot and take the
-slower path in turn; that is still correct, only slower. Entries are removed
-when a thread's TLS is finalized. A forked child removes every entry but the
-forking thread's, because glibc may give a new thread in the child a dead
-thread's stack and so its thread pointer. As before, the child does not
-reclaim those threads' TLS blocks.
+saves three scratch registers instead of the full register and vector state.
+Threads whose hashes collide share a table slot and take the slower path in
+turn; that is still correct, only slower. Entries are removed when a thread's
+TLS is finalized. A forked child removes every entry but the forking thread's,
+because glibc may give a new thread in the child a dead thread's stack and so
+its thread pointer. As before, the child does not reclaim those threads' TLS
+blocks.
+
+`-linux-static-tls` (config key `linux.static_tls`) goes further: the image's
+TLS moves into glibc's static TLS, at one constant offset from every thread
+pointer, as for a library linked at startup. A TLS descriptor then resolves
+with a single load (`ldr x0, [x0, #8]` or `movq 8(%rax), %rax`), and a
+`__tls_get_addr` call adds that offset to the thread pointer. During package
+initialization, after the template's pointer fixups, the generated package:
+
+1. writes a small shared object to a memfd. Its PT_TLS segment is the
+   template, and its one relocation is an initial-exec reference to its own
+   TLS.
+2. dlopens it through `/proc/self/fd`. glibc must then place it in static
+   TLS, copying the template into every existing and future thread, or
+   refuse it.
+3. repoints the image's TLS descriptors at the constant resolver.
+
+glibc looks up a dlopen path among already loaded objects' names before it
+opens the file. So the memfd stays open for the life of the process, one
+file descriptor, and no later memfd gets its number and with it this
+module. If an object with that name is already loaded, the package does
+not use static TLS.
+
+glibc's spare static TLS is small. On glibc 2.41 a 1664-byte template fits by
+default and a 1728-byte one does not, on both arm64 and amd64. That space is
+shared with other libraries loaded later that use initial-exec TLS. It also requires
+the template's alignment to be no larger than its static TLS alignment, 64
+bytes on arm64. If memfd_create, /proc or the dlopen fails, the package keeps
+Bao's per-thread blocks, as without the flag. `TLSStatic()` reports which
+mode is in use. `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=N` raises the
+spare space at process start.
+
+Because the space is shared, the flag is opt-in: a library dlopened later
+that needs static TLS can fail to load once Bao has used it. With static TLS,
+glibc owns each thread's block. `TLSLiveBlocks` and `TLSDestroyedBlocks`
+then count only threads that registered native thread-exit destructors, such
+as C++ `thread_local` objects or Rust TLS with destructors. Finalizing a
+thread runs its destructors and restores the template's values in place,
+just as a new block would start with them.
 
 ### Linux shared objects
 
@@ -1933,7 +1978,7 @@ keys are `target`, `input`, `strip_debug`, `strip_bitcode`, `link_archives`, `li
 `remove_sections`, `only_sections` and `add_symbols`),
 and `cargo` (`manifest_path`, `package`, `offline`,
 `locked`). The `darwin` section takes `sdk`, `min_os` and `ld`; `linux` takes
-`sysroot`, `ld`, `system_libraries`, `max_symbol_versions`, `max_text_alignment` and `shared_object`; `windows` takes `imports`,
+`sysroot`, `ld`, `system_libraries`, `max_symbol_versions`, `max_text_alignment`, `shared_object` and `static_tls`; `windows` takes `imports`,
 `import_libraries`, `cxx_runtime`, `crt` and `max_data_alignment`. Every platform
 section also accepts `link_archives`, `link_notices` and
 `require_static_runtime`.

@@ -348,6 +348,15 @@ func TestSharedObjectTLSAndImportLowering(t *testing.T) {
 	if p.TLSDescriptors != 1 || p.TLSTemplateSize != 16 {
 		t.Fatalf("descriptors %d template %d", p.TLSDescriptors, p.TLSTemplateSize)
 	}
+	// Static TLS repoints the descriptor through a symbol at its slot.
+	if len(p.TLSDescriptorSymbols) != 1 {
+		t.Fatalf("descriptor symbols %v", p.TLSDescriptorSymbols)
+	}
+	for _, s := range m.symbols {
+		if s.name == p.TLSDescriptorSymbols[0] && (s.sect != 1 || s.value != 0x20000+soDesc) {
+			t.Fatalf("descriptor symbol at section %d offset %#x", s.sect, s.value)
+		}
+	}
 	blob := &m.sections[1]
 	if got := binary.LittleEndian.Uint64(blob.data[0x20000+soDesc+8:]); got != 8 {
 		t.Fatalf("descriptor offset %d", got)
