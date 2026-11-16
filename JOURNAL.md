@@ -7373,3 +7373,43 @@ Verification. Host and toolchains as in the static TLS entry.
     requirements, then init panics with "native symbol unavailable:
     close_range". With static TLS on 2.41 it also shows the memfd collision
     fixed in b991cc8.
+
+## 2026-11-16: DT_NEEDED order: libc.so.6 first, the dynamic linker last
+
+Problem, reported by pythago on #35 (54648d6). Shared-mode images aborted
+on glibc 2.28 (debian:buster, arm64 native and under its ld-2.28.so) at
+their second RTLD_GLOBAL dlopen: "Inconsistency detected by ld.so:
+dl-minimal.c: 126: realloc: Assertion `ptr == alloc_last_block' failed!".
+The generated package emitted its `//go:cgo_import_dynamic _ _ LIB`
+requests sorted by name. An image importing from the dynamic linker, such
+as arm64's `__stack_chk_guard`, therefore got DT_NEEDED
+[ld-linux-aarch64.so.1, libc.so.6, ...]. pythago's diagnosis: before glibc
+2.32, rtld rebinds its malloc family by looking those functions up in the
+global scope. With ld.so searched first, it finds its own minimal
+allocator, which then stays in use for the life of the process; the
+allocator is neither thread-safe nor able to realloc anything but its last
+block. pythago confirmed it by hand-moving the ld-linux directive last.
+
+Change. `neededOrder` emits libc.so.6 first, the dynamic linker
+(`ld-` or `ld64.so` prefix) last and the rest by name. libgcc_s.so.1, when
+requested, is now in the same ordered list instead of after it.
+`TestNeededOrder` covers this.
+
+Verification. The fixture gains `global_dlopen`, two RTLD_GLOBAL dlopens
+(libresolv.so.2, libutil.so.1). It used the previous entry's
+buster-linked shared object plus `-fstack-protector-all`, which makes it
+import `__stack_chk_guard` from ld-linux-aarch64.so.1, built with
+`-linux-max-symbol-version GLIBC_2.17`, and ran natively in
+`debian:buster`, three times at each GOMAXPROCS:
+- bao at 54648d6: DT_NEEDED [ld-linux-aarch64.so.1, libc.so.6, libdl.so.2,
+  libpthread.so.0, libgcc_s.so.1]. GOMAXPROCS=1 passed 3/3. GOMAXPROCS=4
+  exited with status 135 (SIGBUS) 3/3, with no message, after the weak
+  probe line, during the dlopen checks. That is not pythago's assertion
+  text; it is consistent with the same allocator used by concurrent
+  threads.
+- This change: DT_NEEDED [libc.so.6, libdl.so.2, libgcc_s.so.1,
+  libpthread.so.0, ld-linux-aarch64.so.1]. Both GOMAXPROCS values passed
+  3/3.
+
+amd64 images rarely import from ld-linux-x86-64.so.2 (its stack
+protector reads %fs), and this was not separately run there.
