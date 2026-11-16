@@ -245,7 +245,7 @@ and [Linux profile](#linux-arm64--elf) for platform limitations.
 
 ### Runtime caveats
 
-#### compatibility and pointer lifetimes
+#### Compatibility and pointer lifetimes
 
 Generated typed bindings bundle a bootstrap that installs process-wide runtime
 hooks when `runtime/cgo` is not linked. Use **one bundled bootstrap per
@@ -1359,9 +1359,9 @@ loads, calls and comparisons through its GOT slot, including
 the relocation by -5, as in zstd's optional trace hooks. Other uses are
 refused with the symbol, section and offset.
 
-This path targets glibc/AArch64 and one combined native image. Other native TLS
-models, native IFUNC definitions, preinit arrays and static musl are not
-supported. A linked shared object is accepted as described in
+Every Linux target expects glibc and one combined native image. On arm64,
+native TLS must use descriptors (TLSDESC); other native TLS models, native IFUNC
+definitions, preinit arrays and static musl are not supported. A linked shared object is accepted as described in
 [Linux shared objects](#linux-shared-objects). Other architectures use their
 separate target profiles.
 
@@ -1383,9 +1383,10 @@ provide. Libraries that call `atexit` need a small wrapper such as
 Code built with AArch64 outline atomics (the default of many Linux GCC and
 Clang toolchains) needs `__aarch64_cas*`/`__aarch64_ldadd*` helpers: pass
 `-link-archive "$(gcc -print-libgcc-file-name)"` or compiler-rt builtins, or
-build with `-mno-outline-atomics`. Missing optional weak imports have NULL address semantics and are
-reported in the manifest; missing strong imports are rejected. Symbol version
-requirements and other glibc/toolchain combinations need separate verification.
+build with `-mno-outline-atomics`. Missing weak imports read as NULL, as described
+above, and `unavailable_weak_symbols` in bao-manifest.json lists them; missing
+strong imports are rejected. Other glibc/toolchain combinations need separate
+verification.
 The [example README](examples/linux_runtime/README.md) records the final
 pthread-destructor-pass boundary and process-lifetime libc bookkeeping after
 explicit main-thread finalization.
@@ -1602,7 +1603,8 @@ TLS-free C/no_std libraries can use the runtime translation path as well.
 translated Rust std runtime images in one executable are not verified.
 
 Unsupported inputs fail explicitly where recognized: arm64e objects, native
-ObjC/Swift image metadata or class registration, indirect/stub sections,
+ObjC/Swift image metadata or class registration in object input (a
+[dylib input](#macos-dylibs) registers it), indirect/stub sections,
 unsupported segments/relocations, tentative common/absolute/indirect symbols,
 TLS template relocations, TLS initializer callbacks, native terminator tables
 without an explicit shutdown policy, compact unwind encodings
@@ -1932,8 +1934,8 @@ execution. The findfunc density is a prediction from object layout.
 
 Findings have stable IDs: `BAO-ELF-SECTIONS`, `BAO-MACHO-SECTIONS`,
 `BAO-COFF-SECTIONS`, `BAO-GO-FINDFUNC`, `BAO-MACHO-ORDINAL`,
-`BAO-MACHO-FLAT-BIND`, `BAO-IMPORT-MISSING`, `BAO-COFF-ALIGNMENT-CAPPED` and
-`BAO-GENERATE`.
+`BAO-MACHO-FLAT-BIND`, `BAO-IMPORT-MISSING`, `BAO-ELF-TEXT-ALIGNMENT-CAPPED`,
+`BAO-COFF-ALIGNMENT-CAPPED` and `BAO-GENERATE`.
 
 `bao inspect -v -manifest bao-manifest.json ./program` reads a built Mach-O
 executable, reports flat-namespace binds, and compares each bind's dylib with
@@ -2107,8 +2109,12 @@ action: `bazel run //:native`; sources, flags and hashes are recorded
 under `translate/native/`.
 Use `bazel run //:native -- -target darwin/amd64` for the Intel helpers.
 
-Regenerate the Linux embedded native helper on Linux arm64 with
-`bazel run //:native`.
+Regenerate the Linux helpers with `bazel run //:native -- -target linux/ARCH`
+for arm64, amd64, loong64 and ppc64le, and the Windows helpers with
+`-target windows/amd64` or `windows/arm64`, which need Clang. Linux cross
+targets need the matching GNU compiler and linker, such as those in the maintained
+[cross image](testdata/toolchains/README.md). Each target writes its blob and
+`manifest.json` under `linuxelf/native/` or `pecoff/native/`.
 
 ### Darwin example verification
 
@@ -2216,9 +2222,12 @@ linker.
 
 #### Linux
 
-Bao lowers Compiler TLSDESC sequences to image-private descriptors, native pthread
-storage/destructors and a resolver that returns offsets relative to the native thread
-pointer. Native DWARF chains are registered with libgcc's `__register_frame`.
+Bao lowers compiler TLS sequences (TLSDESC, and `__tls_get_addr` calls on amd64,
+loong64 and ppc64le) to image-private descriptors and a resolver that returns
+offsets relative to the native thread pointer. Per-thread blocks use native
+pthread storage and destructors and are found through the table described under
+[Linux TLS lookup](#linux-tls-lookup), or live in glibc's static TLS with
+`-linux-static-tls`. Native DWARF chains are registered with libgcc's `__register_frame`.
 Initializers run in numeric priority order with native copies of argv and libc's environ.
 Imported data pointers are fixed up in writable native storage before constructors.
 
