@@ -123,9 +123,13 @@ DLL's prepared image and loads it at initialization into memory from
   `_CxxThrowException` so the DLL's base is reported for its own addresses.
 - **TLS:** implicit TLS uses Bao's helper storage. Each TEB TLS-array load in the
   DLL's code (`mov reg, gs:[0x58]` or `ldr xN, [x18, #0x58]`) is redirected to
-  a thunk. It must be within 64 bytes of a PC-relative reference to the DLL's
-  `_tls_index`, which the compiler's TLS sequence has; otherwise translation
-  fails. TLS callbacks run with the DLL's base.
+  a thunk. Bao must be able to tell that the match is an instruction, not
+  data, or translation fails. Either it is within 64 bytes of a PC-relative
+  reference to the DLL's `_tls_index`, which the compiler's TLS sequence has,
+  or it lies wholly inside a function in the DLL's `.pdata`. MSVC can keep
+  `_tls_index` in a register or a stack slot, kilobytes away from the load, so
+  the second rule covers those loads. The arm64 destination may be any of
+  x0-x30 except x18. TLS callbacks run with the DLL's base.
 
 Not supported:
 - 32-bit DLLs, .NET assemblies, writable executable sections, and DLLs without
