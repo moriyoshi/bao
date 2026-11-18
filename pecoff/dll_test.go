@@ -19,6 +19,11 @@ type dllFixture struct {
 	noRelocs    bool
 	exe         bool
 	badRelocTyp bool
+
+	// arm64: the TLS array load's destination (x9 if 0), and whether a
+	// .pdata entry covers the TLS access.
+	tlsReg      uint32
+	tlsFunction bool
 }
 
 const (
@@ -82,7 +87,11 @@ func (o dllFixture) build() []byte {
 				p += 8
 			}
 		}
-		w(p, 0xf9402e49)   // LDR X9, [X18, #0x58]
+		load := 0xf9402e40 | o.tlsReg
+		if o.tlsReg == 0 {
+			load = 0xf9402e49
+		}
+		w(p, load)         // LDR Xn, [X18, #0x58]
 		w(p+4, 0xd65f03c0) // RET
 		w(fxFn, 0xd65f03c0)
 		w(fxCallback, 0xd65f03c0)
@@ -142,6 +151,10 @@ func (o dllFixture) build() []byte {
 	} else {
 		put32(fxPdata, fxFn)
 		put32(fxPdata+4, 0x00200001) // packed: 1 instruction, no frame
+		if o.tlsFunction {
+			put32(fxPdata+8, fxTLSUse)
+			put32(fxPdata+12, 0x00200001|0x40<<2) // packed: 64 instructions
+		}
 	}
 
 	// Base relocations, one block per page.
@@ -202,6 +215,9 @@ func (o dllFixture) build() []byte {
 	}
 	if o.machine == pe.IMAGE_FILE_MACHINE_ARM64 {
 		dirs[pe.IMAGE_DIRECTORY_ENTRY_EXCEPTION] = [2]uint32{fxPdata, 8}
+		if o.tlsFunction {
+			dirs[pe.IMAGE_DIRECTORY_ENTRY_EXCEPTION] = [2]uint32{fxPdata, 16}
+		}
 	}
 	if o.noRelocs {
 		delete(dirs, pe.IMAGE_DIRECTORY_ENTRY_BASERELOC)
@@ -309,6 +325,47 @@ func TestParseDLLHoistedTLSIndexPage(t *testing.T) {
 	}
 }
 
+// MSVC can keep _tls_index in a callee-saved register or a stack slot, so a TLS array load inside a .pdata function needs no nearby
+// _tls_index reference, and its destination may be callee-saved.
+func TestParseDLLFunctionTLSLoad(t *testing.T) {
+	for _, reg := range []uint32{1, 17, 21, 29, 30} {
+		d, _, err := parseDLL(dllFixture{machine: pe.IMAGE_FILE_MACHINE_ARM64, noEvidence: true, tlsFunction: true, tlsReg: reg}.build(), nil)
+		if err != nil || len(d.Patches) != 1 || d.Patches[0].Site != fxTLSUse {
+			t.Fatalf("x%d: %v %+v", reg, err, d)
+		}
+		body, _, jump := arm64TLSThunkCode(int(reg), true)
+		if !bytes.Equal(d.Patches[0].Body[:jump], body[:jump]) {
+			t.Fatalf("x%d: thunk body", reg)
+		}
+	}
+}
+
+func TestARM64TLSThunkDestination(t *testing.T) {
+	for reg, want := range map[int]uint32{
+		0:  0xf90003e0,          // STR X0, [SP]
+		17: 0xf90003e0 | 17<<10, // STR X0, [SP,#136]
+		19: 0xaa0003f3,          // MOV X19, X0
+		29: 0xaa0003fd,          // MOV X29, X0
+		30: 0xf90003e0 | 18<<10, // STR X0, [SP,#144]: the saved LR
+	} {
+		for _, indirect := range []bool{false, true} {
+			code, call, _ := arm64TLSThunkCode(reg, indirect)
+			at := call + 4
+			if indirect {
+				at += 4
+			}
+			if got := binary.LittleEndian.Uint32(code[at:]); got != want {
+				t.Fatalf("x%d indirect=%v: %#x after the helper call, want %#x", reg, indirect, got, want)
+			}
+		}
+	}
+	for _, reg := range []int{18, 31} {
+		if arm64TLSThunkRegister(reg) {
+			t.Fatalf("x%d accepted as a TLS array destination", reg)
+		}
+	}
+}
+
 func TestParseDLLRejects(t *testing.T) {
 	for name, tc := range map[string]struct {
 		in      []byte
@@ -317,6 +374,7 @@ func TestParseDLLRejects(t *testing.T) {
 	}{
 		"no evidence":   {dllFixture{noEvidence: true}.build(), nil, "no nearby reference to _tls_index"},
 		"arm64 no evid": {dllFixture{machine: pe.IMAGE_FILE_MACHINE_ARM64, noEvidence: true}.build(), nil, "no nearby reference to _tls_index"},
+		"arm64 x18":     {dllFixture{machine: pe.IMAGE_FILE_MACHINE_ARM64, tlsReg: 18}.build(), nil, "unsupported DLL TLS array register x18"},
 		"fixed base":    {dllFixture{noRelocs: true}.build(), nil, "preferred address"},
 		"executable":    {dllFixture{exe: true}.build(), nil, "not a DLL"},
 		"reloc type":    {dllFixture{badRelocTyp: true}.build(), nil, "base relocation type 3"},

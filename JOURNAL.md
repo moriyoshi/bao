@@ -7771,3 +7771,83 @@ Reproduction on dengaku.local (macOS 26.5.2, M1 Max, Apple clang 21.0.0):
 
 Not checked: amd64, plain object input (same runtime code), and an access
 during the last destructor round permitted by `PTHREAD_DESTRUCTOR_ITERATIONS`.
+
+## 2026-11-18: MSVC arm64 DLL TLS loads: callee-saved destinations and far `_tls_index`
+
+pythago reported that `bao build -target windows/arm64 -symbol Py_InitializeEx
+python313.dll` failed with "unsupported DLL TLS array register x21 at 0xc200".
+The DLL is from python-build-standalone 20261110
+(`cpython-3.13.18+20261110-aarch64-pc-windows-msvc-install_only.tar.gz`,
+tarball sha256 `f050f4df...`, DLL sha256 `f4c423bc...`). It has 1178
+`ldr xN, [x18, #0x58]` loads. 45 of them write a callee-saved register
+(x19-x28).
+
+First problem: the arm64 TLS thunk saved only x0-x17 and stored the helper
+result into the saved slot. So it rejected any other destination.
+- `arm64TLSThunkCode` now accepts x0-x30 except x18 (the TEB) and x31 (xzr).
+- For x19-x29 it emits `MOV Xn, X0` after the helper call. The Windows arm64
+  ABI makes the helper preserve those registers, and the thunk's restores
+  never touch them.
+- For x30 it replaces the saved LR.
+- Object input (`patchTLSReads`) shares the same register check.
+
+Second problem: the evidence rule. With the register fix,
+translation stopped at 0xccf4: "no nearby reference to _tls_index". MSVC had
+loaded `_tls_index` into w24 0x114 bytes earlier, or spilled it to the
+stack.
+- A scan of the DLL (`.work/win-py313/scan`) counted the cases:
+  - 922 loads had a `_tls_index` reference within 64 bytes and lay in a
+    `.pdata` function.
+  - 102 had the reference but no `.pdata` entry (leaf functions).
+  - 136 lay in a `.pdata` function with `_tls_index` farther away.
+  - 18 lay in a `.pdata` function whose own range never references
+    `_tls_index`. The nearest reference was 0x230-0x68d8 bytes away.
+- On arm64, `patchDLLTLSReads` now also accepts an aligned match inside a
+  `.pdata` function. That shows it is an instruction, and x18 is reserved for
+  the TEB there.
+- The 64-byte rule still covers leaf functions. amd64 is unchanged, because
+  its byte-level match can start inside another instruction.
+
+Result: the DLL translates with all 1178 loads patched.
+
+Verification:
+- Unit tests:
+  - `TestParseDLLFunctionTLSLoad` covers x1, x17, x21, x29 and x30 with no
+    nearby `_tls_index`, inside `.pdata`.
+  - `TestARM64TLSThunkDestination` checks the instruction after the helper
+    call for both thunk forms, and rejects x18 and x31.
+  - `TestParseDLLRejects` gains x18.
+  - Negative controls: disabling the `.pdata` rule fails the first test, and
+    storing x19 into the frame fails the second. `go test ./...` passes.
+- Native thunk execution on this Linux arm64 host (Cortex-X925, GCC 13.3), in
+  `.work/win-py313/thunk`:
+  - `gen.sh` extracts the current `arm64TLSThunkCode` and emits every
+    destination register in both direct and indirect form.
+  - `harness.S` seeds x0-x30, v0-v31 and NZCV, enters each thunk, and
+    captures the state at its return branch.
+  - The helper clobbers every caller-saved register and the flags and
+    returns a magic value.
+  - 60 runs, 0 failures: only the destination changed; vectors, flags and SP
+    were preserved; one helper call per run, with an aligned stack.
+  - Negative control: replacing the result instruction with NOP failed all 60.
+- Emulated Windows execution: Wine 11.22 arm64, pythago's `pythago-wine:11.22`
+  image, on the same host.
+  - Consumer: Go 1.27.4 `CGO_ENABLED=0`, windows/arm64.
+  - It calls `Py_InitializeEx(0)`, then `PyRun_SimpleString` of a script
+    using 8 threads with `threading.local` and `contextvars`, then
+    `Py_FinalizeEx`.
+  - `PYTHONHOME` is the PBS tree. Two runs printed `3.13.18 win32 (7, 70,
+    3496500, True) -1 True 9ce59f71 69`, which is identical to PBS
+    `python.exe` under the same Wine.
+  - Negative control: the same bao with x19-x29 thunks' `MOV` replaced by
+    NOP. The consumer printed nothing and hung for 10 minutes until killed.
+  - Native Windows was not run.
+
+Limitation found along the way: extension modules (`.pyd`) such as
+`_sqlite3` import `python313.dll` by name. The ordinary loader cannot bind
+them to Bao's in-memory copy: under Wine the import failed with "DLL load
+failed while importing _sqlite3". The check above therefore uses only
+built-in modules. This is an open design question for pythago, not a TLS
+issue.
+
+Scratch: `.work/win-py313/`.

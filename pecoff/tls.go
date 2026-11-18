@@ -27,7 +27,7 @@ func (o *object) patchTLSReads(si int, arch string) (int, error) {
 			width = 4
 			if pos%4 == 0 && pos+4 <= length && binary.LittleEndian.Uint32(data[pos:])&0xffffffe0 == 0xf9402e40 {
 				reg = int(data[pos] & 31)
-				if reg > 17 {
+				if !arm64TLSThunkRegister(reg) {
 					return 0, fmt.Errorf("unsupported native TLS array register x%d", reg)
 				}
 			}
@@ -138,9 +138,18 @@ func arm64TLSThunk(reg int, helper, back uint32) section {
 	return section{name: ".text", flags: pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ | 0x500000, size: uint32(len(code)), data: code, relocs: []pe.Reloc{{VirtualAddress: uint32(call), SymbolTableIndex: helper, Type: 3}, {VirtualAddress: uint32(jump), SymbolTableIndex: back, Type: 3}}}
 }
 
+// arm64TLSThunkRegister reports whether a thunk can stand in for a TLS
+// array load into xreg: x18 holds the TEB and xzr discards the load.
+func arm64TLSThunkRegister(reg int) bool {
+	return reg >= 0 && reg <= 30 && reg != 18
+}
+
 // arm64TLSThunkCode returns the thunk, its helper call and its return branch.
 // An indirect thunk loads the helper from an 8-byte literal after the branch
-// into x16, which the thunk saves and restores with x0-x17.
+// into x16, which the thunk saves and restores with x0-x17. The helper keeps
+// the callee-saved x19-x29 under the Windows arm64 ABI, so a destination
+// among them takes the result directly; one among x0-x17 or LR replaces its
+// saved value instead.
 func arm64TLSThunkCode(reg int, indirect bool) ([]byte, int, int) {
 	var code []byte
 	emit := func(v uint32) { code = binary.LittleEndian.AppendUint32(code, v) }
@@ -168,7 +177,14 @@ func arm64TLSThunkCode(reg int, indirect bool) ([]byte, int, int) {
 	} else {
 		emit(0x94000000)
 	}
-	emit(0xf90003e0 | uint32(reg)<<10) // replace saved destination with helper result
+	switch {
+	case reg < 18:
+		emit(0xf90003e0 | uint32(reg)<<10) // replace saved destination with helper result
+	case reg == 30:
+		emit(0xf90003e0 | 18<<10) // replace saved LR
+	default:
+		emit(0xaa0003e0 | uint32(reg)) // MOV Xreg, X0
+	}
 	for i := 0; i < len(vectors); i += 2 {
 		emit(0xad4003e0 | uint32(10+i)<<15 | vectors[i+1]<<10 | vectors[i])
 	}

@@ -183,7 +183,7 @@ func parseDLL(input []byte, symbols []string) (*DLLImage, string, error) {
 	sum := sha256.Sum256(input)
 	d.SHA256 = fmt.Sprintf("%x", sum)
 	d.Protections = append(d.Protections, DLLRange{0, page(oh.SizeOfHeaders), pageReadOnly})
-	var code []span
+	var code, functions []span
 	for _, s := range f.Sections {
 		size := max(s.VirtualSize, s.Size)
 		if s.VirtualSize != 0 {
@@ -348,6 +348,19 @@ func parseDLL(input []byte, symbols []string) (*DLLImage, string, error) {
 			return nil, "", fmt.Errorf("malformed DLL exception directory")
 		}
 		d.FunctionTable = DLLRange{Start: rva, End: rva + size}
+		if arch == "arm64" {
+			for p := rva; p < rva+size; p += 8 {
+				begin, info := u32(p), u32(p+4)
+				length := info >> 2 & 0x7ff
+				if info&3 == 0 {
+					if !in(info, 4) {
+						return nil, "", fmt.Errorf("DLL unwind data outside the image")
+					}
+					length = u32(info) & 0x3ffff
+				}
+				functions = append(functions, span{begin, begin + length*4})
+			}
+		}
 	}
 
 	// Implicit TLS: the TEB's TLS array load is redirected to Bao's helper.
@@ -404,7 +417,7 @@ func parseDLL(input []byte, symbols []string) (*DLLImage, string, error) {
 		}
 		d.TLS = t
 		for _, c := range code {
-			patches, err := patchDLLTLSReads(img, c.start, min(c.end, oh.SizeOfImage), t.Index, arch, &size)
+			patches, err := patchDLLTLSReads(img, c.start, min(c.end, oh.SizeOfImage), t.Index, arch, functions, &size)
 			if err != nil {
 				return nil, "", err
 			}
@@ -434,13 +447,19 @@ func inSpans(spans []span, rva uint32) bool {
 
 // patchDLLTLSReads finds the TEB ThreadLocalStoragePointer load (amd64
 // MOV r64, GS:[0x58]; arm64 LDR Xn, [X18, #0x58]) in a DLL's code. A linked
-// DLL keeps no relocation marking it, so each match must have a PC-relative
-// reference that decodes to the DLL's _tls_index within 64 bytes, as the
-// compiler's TLS access sequence does. Thunks follow the image, starting at
-// *end, which advances.
-func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, end *uint32) ([]DLLPatch, error) {
+// DLL keeps no relocation marking it, so each match must be shown to be an
+// instruction: a PC-relative reference that decodes to the DLL's _tls_index
+// within 64 bytes, as the compiler's TLS access sequence does, or on arm64
+// an aligned word inside a function of the DLL's .pdata, where x18 is
+// reserved for the TEB. MSVC can keep _tls_index in a register or a stack
+// slot, kilobytes away from the load, so the first test misses some of its
+// loads. Thunks follow the image, starting at *end, which advances.
+func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, functions []span, end *uint32) ([]DLLPatch, error) {
 	var patches []DLLPatch
 	evidence := func(pos uint32) bool {
+		if inSpans(functions, pos) {
+			return true
+		}
 		lo, hi := uint32(0), pos+dllTLSEvidenceWindow
 		if pos > start+dllTLSEvidenceWindow {
 			lo = pos - dllTLSEvidenceWindow
@@ -522,7 +541,7 @@ func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, end *u
 			p.Code = []byte{0xe8, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90}
 			binary.LittleEndian.PutUint32(p.Code[1:], thunk-(pos+5))
 		} else {
-			if reg > 17 {
+			if !arm64TLSThunkRegister(reg) {
 				return nil, fmt.Errorf("unsupported DLL TLS array register x%d at %#x", reg, pos)
 			}
 			body, _, jump := arm64TLSThunkCode(reg, true)
