@@ -126,7 +126,7 @@ DLL's prepared image and loads it at initialization into memory from
   a thunk. Bao must be able to tell that the match is an instruction, not
   data, or translation fails. Either it is within 64 bytes of a PC-relative
   reference to the DLL's `_tls_index`, which the compiler's TLS sequence has,
-  or, on arm64, it lies inside a function in the DLL's `.pdata`. MSVC can keep
+  or it lies wholly inside a function in the DLL's `.pdata`. MSVC can keep
   `_tls_index` in a register or a stack slot, kilobytes away from the load, so
   the second rule covers those loads. The arm64 destination may be any of
   x0-x30 except x18. TLS callbacks run with the DLL's base.

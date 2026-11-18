@@ -7851,3 +7851,65 @@ built-in modules. This is an open design question for pythago, not a TLS
 issue.
 
 Scratch: `.work/win-py313/`.
+
+## 2026-11-18: amd64 DLL TLS loads far from `_tls_index`
+
+This follows the arm64 entry above, after the user asked whether amd64 had the
+same problem. It does.
+
+PBS 20261110's x86_64 `python313.dll`:
+- Tarball `cpython-3.13.18+20261110-x86_64-pc-windows-msvc-install_only.tar.gz`,
+  sha256 `7e93813b...`, which matches the release's `SHA256SUMS`. DLL sha256
+  `c9c15352...`.
+- Translation failed with "DLL TLS array load at 0x29dd7 has no nearby
+  reference to _tls_index". The code there is `mov rax, gs:[0x58]` followed by
+  `mov rax, [rax+rdi*8]`, with `_tls_index` loaded into rdi earlier.
+
+Scan (`.work/win-py313-amd64/scan`): `golang.org/x/arch` decodes each `.pdata`
+function linearly from its start.
+- 1107 `gs:[0x58]` loads in total.
+- 948 lay in a `.pdata` function, had a `_tls_index` reference within 64
+  bytes, and the function references `_tls_index`. 2 more had the nearby
+  reference but the function does not.
+- 90 lay outside `.pdata` and all had the nearby reference.
+- 67 had no reference within 64 bytes: 56 into rax, 10 into rcx, 1 into
+  r14. Of those, 47 lay in a function that references `_tls_index` and 20 in
+  one that does not.
+- Every match inside a function started at an instruction boundary of the
+  linear decode.
+
+Registers were never the problem on amd64: its thunk already handles every
+register except rsp.
+
+Change: `.pdata` evidence now applies to amd64 too.
+- `parseDLL` records amd64 `RUNTIME_FUNCTION` begin/end ranges.
+- `patchDLLTLSReads` requires the whole match (9 bytes on amd64, 4 on arm64)
+  to lie inside one function.
+- Bao still does not decode x86 instructions: it relies on the nine-byte,
+  GS-prefixed sequence not forming across other compiled instructions. The
+  scan found no such case.
+
+Result: the DLL translates with 1107 TLS loads patched. Retranslating the
+arm64 DLL produced a byte-identical image.
+
+Verification:
+- Unit tests: `go test ./...` passes.
+  - New: `TestPatchDLLTLSReadsFunctionEvidence` (both arches). A match is
+    accepted when it is wholly inside a function, and rejected when it
+    straddles two functions, lies outside them, or no table exists.
+  - `TestParseDLLFunctionTLSLoad` gains an amd64 fixture case.
+  - Negative controls: bounding only the start of the match fails the
+    straddle case, and dropping the amd64 `.pdata` collection fails the amd64
+    fixture case.
+- A Go 1.27.4 `CGO_ENABLED=0` windows/amd64 consumer cross-links.
+- Not run on amd64 at all.
+  - pythago's Wine image is arm64-only.
+  - An amd64 Debian container failed at its first exec ("exec /bin/sh: no
+    such file or directory"): the host's `qemu-x86_64` binfmt entry doesn't
+    work inside containers.
+  - Hosted CI's native Windows amd64 legs run only Bao's own DLL fixtures.
+
+The `.pyd` limitation holds on amd64 as well: all 32 `.pyd` files in
+`DLLs/` import `python313.dll` by name.
+
+Scratch: `.work/win-py313-amd64/`.

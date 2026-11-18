@@ -348,8 +348,10 @@ func parseDLL(input []byte, symbols []string) (*DLLImage, string, error) {
 			return nil, "", fmt.Errorf("malformed DLL exception directory")
 		}
 		d.FunctionTable = DLLRange{Start: rva, End: rva + size}
-		if arch == "arm64" {
-			for p := rva; p < rva+size; p += 8 {
+		for p := rva; p < rva+size; p += width {
+			if arch == "amd64" {
+				functions = append(functions, span{u32(p), u32(p + 4)})
+			} else {
 				begin, info := u32(p), u32(p+4)
 				length := info >> 2 & 0x7ff
 				if info&3 == 0 {
@@ -449,16 +451,21 @@ func inSpans(spans []span, rva uint32) bool {
 // MOV r64, GS:[0x58]; arm64 LDR Xn, [X18, #0x58]) in a DLL's code. A linked
 // DLL keeps no relocation marking it, so each match must be shown to be an
 // instruction: a PC-relative reference that decodes to the DLL's _tls_index
-// within 64 bytes, as the compiler's TLS access sequence does, or on arm64
-// an aligned word inside a function of the DLL's .pdata, where x18 is
-// reserved for the TEB. MSVC can keep _tls_index in a register or a stack
-// slot, kilobytes away from the load, so the first test misses some of its
-// loads. Thunks follow the image, starting at *end, which advances.
+// within 64 bytes, as the compiler's TLS access sequence does, or a match
+// wholly inside a function of the DLL's .pdata. MSVC can keep _tls_index in
+// a register or a stack slot, kilobytes away from the load, so the first
+// test misses some of its loads. The second relies on the encodings: on
+// arm64 an aligned word, with x18 reserved for the TEB; on amd64 nine bytes
+// beginning with a GS prefix, which compiled code does not form across
+// other instructions. Thunks follow the image, starting at *end, which
+// advances.
 func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, functions []span, end *uint32) ([]DLLPatch, error) {
 	var patches []DLLPatch
-	evidence := func(pos uint32) bool {
-		if inSpans(functions, pos) {
-			return true
+	evidence := func(pos, width uint32) bool {
+		for _, f := range functions {
+			if pos >= f.start && pos+width <= f.end {
+				return true
+			}
 		}
 		lo, hi := uint32(0), pos+dllTLSEvidenceWindow
 		if pos > start+dllTLSEvidenceWindow {
@@ -522,12 +529,12 @@ func patchDLLTLSReads(img []byte, start, stop, index uint32, arch string, functi
 		if reg < 0 {
 			continue
 		}
-		if !evidence(pos) {
+		if !evidence(pos, width) {
 			lo, hi := start, min(stop, pos+dllTLSEvidenceWindow)
 			if pos > start+dllTLSEvidenceWindow {
 				lo = (pos - dllTLSEvidenceWindow) &^ 3
 			}
-			return nil, fmt.Errorf("DLL TLS array load at %#x has no nearby reference to _tls_index at %#x; code %#x-%#x: % x", pos, index, lo, hi, img[lo:hi])
+			return nil, fmt.Errorf("DLL TLS array load at %#x has no nearby reference to _tls_index at %#x and lies in no .pdata function; code %#x-%#x: % x", pos, index, lo, hi, img[lo:hi])
 		}
 		thunk := (*end + 15) &^ 15
 		p := DLLPatch{Site: pos, Thunk: thunk}
