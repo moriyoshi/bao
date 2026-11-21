@@ -1,8 +1,8 @@
 {
   "compiler": "loongarch64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
   "files": {
-    "../tls.c": "a3a0f96845fbfc16c51b81e546940b0fa58a1e18ac7cef9a9e56b583e39ed0f0",
-    "runtime.bin": "b2cb568e426d61bb9d8862334b631052ca265f75aa8919655df27269d38b2ac3"
+    "../tls.c": "ed323532c32754a4c5ddc7626eb546f37b5fe9638a2be25946ad34b2a3ab9ceb",
+    "runtime.bin": "93ffc1c3aa231f6c1dd3d02445561f38cc1d33c2a2ad936ec86e3bce635d9a8e"
   },
   "flags": [
     "-O2",

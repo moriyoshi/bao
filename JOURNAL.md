@@ -7913,3 +7913,87 @@ The `.pyd` limitation holds on amd64 as well: all 32 `.pyd` files in
 `DLLs/` import `python313.dll` by name.
 
 Scratch: `.work/win-py313-amd64/`.
+
+## 2026-11-21: Linux TLS runtime aborts on a foreign value under its pthread key
+
+Problem. Reported by the pythago session, with the root cause in pythago and
+already fixed there (bao v0.0.8, linux/amd64 under QEMU, shared-object mode,
+dynamic TLS). Its glue called `pthread_setspecific(owned_key, tstate)` before
+`owned_key` was created, so the key was 0, the key `bao_tls_configure` had
+created first. The thread's Bao key then held a `PyThreadState *`. Accesses
+kept working while the thread's `bao_tls_cache` entry was found. After an
+eviction `current_thread` took the value from `pthread_getspecific` as the
+`BaoThread` and used the foreign object's second word as the block pointer:
+TLS lookups returned garbage or another thread's block. No Bao defect; the
+report suggested a check that turns this into an immediate diagnosis.
+
+Change (`linuxelf/native/tls.c`, all four runtime blobs, `docs/linux.md`
+"TLS lookup").
+- `owned(thread)` requires `thread->tp == thread_pointer()` and otherwise
+  writes one line to fd 2 and aborts: "bao: the TLS pthread key holds a value
+  that is not this thread's record; other code stored through Bao's key, for
+  example pthread_setspecific with a key that pthread_key_create never set".
+  The runtime now imports `write`.
+- It is applied wherever a value comes back from the key: the non-NULL branch
+  of `current_thread`, `bao_tls_finalize_current_thread`, and the key
+  destructor's argument in `destroy_thread`.
+- `compiler_tls_exit` (the `__cxa_thread_atexit_impl` hook, which runs before
+  all key destructors) now requires `pthread_getspecific(key)` to be exactly
+  its record. Without that, `run_terminators` stored the record again and the
+  thread exited cleanly, which the first version of this change showed: the
+  control's "exit" mode passed with status 0.
+- The invariant holds on every legitimate path. A record's `tp` is its
+  owner's from `new_record` until `release`, and `release` runs only after
+  the key is set to NULL. During the retained destructor passes `tp` is still
+  the thread's own. The fork child zeroes only other threads' records.
+
+Limitations.
+- The check reads the first word of whatever the key holds. A foreign value
+  that is not a readable pointer faults instead of printing the message.
+- Detection comes at the thread's next slow-path access, destructor
+  registration or exit, not at the foreign store. With `-linux-static-tls`
+  lookups never read the key, so only registration and exit detect it.
+- The opposite order (Bao's record overwritten, then foreign code reading
+  the key back) is not Bao's to detect.
+- The Darwin runtime (`translate/native/tls.c`) has no such check. Its
+  record has no owner field, and its blobs were not rebuilt.
+- amd64 under QEMU user mode: when the abort happens at thread exit the
+  message is printed and the process then stalls instead of dying (no CPU
+  use; killed after 90 s). The same executable flow on native arm64 and on
+  arm64 under `qemu-aarch64` terminates. Native amd64 was not run, so
+  whether this is QEMU's is not known. The two other abort sites terminate
+  under QEMU amd64.
+
+Verification. Host: Linux 7.0.0-1019 aarch64, Docker. Blobs built with Debian
+GCC 14.2.0-19 in `bao-cpp-cross:20261108` (glibc 2.41, QEMU 10.0.13) by
+`cmd/bao-native -target linux/{arm64,amd64,loong64,ppc64le}`. Consumers: Go
+1.26.11, CGO_ENABLED=0. `go test -count=1 ./...` passed with go1.26.11,
+including `TestEmbeddedRuntimeProvenance`.
+- Control (`.work/keycheck/ctl`, `run.sh BAO OUT ARCH`): an archive with one
+  `__thread` counter and `kc_clobber`, which stores a static 128-byte zeroed
+  object through a zero `pthread_key_t`. A locked goroutine thread runs one
+  of three modes; `kc_clobber` reported that key 0 already held a value, so
+  key 0 was Bao's in these processes.
+
+  | Mode | main (6bfae04) | this change |
+  | --- | --- | --- |
+  | first: clobber before the thread's first access | SIGSEGV in `kc_bump` | message, abort, status 2 |
+  | atexit: access, clobber, access, `__cxa_thread_atexit_impl` | no error, status 0 | message, abort, status 2 |
+  | exit: access, clobber, access, thread exits | no error, status 0 | message; arm64 status 133, amd64 stalls (see above) |
+
+  Identical on arm64 (native) and amd64 (QEMU) except as noted. In every mode
+  the access after the clobber still returned the right value through the
+  cache, the masking the report described. main's two silent rows are the
+  negative control.
+- Regression: the `.work/tlsfast` fixture from the 2026-11-16 entries (three
+  waves of 32 exiting threads with destructors, fork check, explicit
+  finalization, GOMAXPROCS 1 and 4) passed with the rebuilt runtime:
+  - archive input, dynamic TLS: arm64 (native), amd64, loong64 and ppc64le
+    (QEMU);
+  - archive input, `-linux-static-tls`: arm64, amd64 and ppc64le;
+  - shared-object input (`SO=1`), dynamic TLS: arm64 and amd64.
+  On loong64 the fixture's later-added `dlopen("libutil.so.1")` probe fails
+  on main as well ("RTLD_GLOBAL dlopen 1"; that sysroot has no such library),
+  so loong64 ran a copy with `libm.so.6` in its place
+  (`.work/keycheck/loongfix`).
+- Not run: the bao-verify suites, pythago itself, and native amd64.
