@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct BaoTerminator {
     void (*function)(void *);
@@ -143,6 +144,26 @@ static intptr_t static_offset;
 static _Atomic uint64_t live_blocks;
 static _Atomic uint64_t destroyed_blocks;
 
+// A value read back from the key must be the calling thread's own record.
+// Bao stores nothing else there, and a record's tp is its owner's thread
+// pointer until release, which happens only after the key is cleared. Any
+// other value was stored by foreign code, typically pthread_setspecific
+// through a pthread_key_t that was never created: a zeroed one is key 0,
+// often this key. The cache would hide that until an eviction, and the
+// foreign object would then be used as a record.
+static _Noreturn void foreign_key_value(void) {
+    static const char message[] = "bao: the TLS pthread key holds a value that is not this thread's record; other code stored through Bao's key, for example pthread_setspecific with a key that pthread_key_create never set\n";
+    ssize_t written = write(2, message, sizeof(message) - 1);
+    (void)written;
+    abort();
+}
+
+static BaoThread *owned(BaoThread *thread) {
+    if (atomic_load_explicit(&thread->tp, memory_order_relaxed) != thread_pointer())
+        foreign_key_value();
+    return thread;
+}
+
 static void run_terminators(BaoThread *thread) {
     // POSIX clears the key before calling us. Keep this same image available
     // while terminators access other TLS or register more terminators.
@@ -162,6 +183,9 @@ static void compiler_tls_exit(void *arg) {
     BaoExitHook *hook = arg;
     BaoThread *thread = hook->thread;
     if (thread != NULL) {
+        // run_terminators stores the record again, which would hide this.
+        if (pthread_getspecific(key) != thread)
+            foreign_key_value();
         thread->hook = NULL;
         run_terminators(thread);
     }
@@ -200,7 +224,7 @@ static void finalize_thread(BaoThread *thread, int explicit_finalization) {
 }
 
 static void destroy_thread(void *arg) {
-    finalize_thread(arg, 0);
+    finalize_thread(owned(arg), 0);
 }
 
 // Called once, before any translated code is entered. The template is native
@@ -249,6 +273,8 @@ static BaoThread *current_thread(void) {
         if (__cxa_thread_atexit_impl(compiler_tls_exit, thread->hook, &bao_dso_handle) != 0)
             abort();
         atomic_fetch_add_explicit(&live_blocks, 1, memory_order_relaxed);
+    } else {
+        owned(thread);
     }
     publish(thread);
     return thread;
@@ -325,7 +351,7 @@ uint64_t bao_tls_destroyed_blocks(void) {
 void bao_tls_finalize_current_thread(void) {
     BaoThread *thread = pthread_getspecific(key);
     if (thread != NULL)
-        finalize_thread(thread, 1);
+        finalize_thread(owned(thread), 1);
 }
 
 void bao_runtime_patch_u32(void *place, uint32_t value) {

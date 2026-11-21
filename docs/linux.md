@@ -201,6 +201,17 @@ because glibc may give a new thread in the child a dead thread's stack and so
 its thread pointer. As before, the child does not reclaim those threads' TLS
 blocks.
 
+Each generated package keeps every thread's record under one pthread key,
+which it creates when it loads; in a Go program that is often key 0. Other
+code must not store through that key. The usual way to do so by accident is
+`pthread_setspecific` with a `pthread_key_t` that `pthread_key_create` has not
+set yet: a zeroed one is key 0. The runtime checks that a value it reads back
+from the key is the calling thread's own record, and otherwise aborts with a
+message that starts `bao: the TLS pthread key holds a value that is not this
+thread's record`. The table hides a foreign value while the thread's entry is
+found, so the abort comes at the thread's next slower-path access, its next
+`thread_local` destructor registration, or its exit, not at the store.
+
 ### Static TLS
 
 `-linux-static-tls` (config key `linux.static_tls`) goes further: the image's
